@@ -6,7 +6,13 @@
 import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
-import type { OecdCode, OecdDataflow, OecdDataStructure } from './types.js';
+import type {
+  OecdCode,
+  OecdDataflow,
+  OecdDataStructure,
+  OecdDimension,
+  OecdTimeDimension,
+} from './types.js';
 
 const STRUCTURE_ACCEPT = 'application/vnd.sdmx.structure+json;version=1.0';
 // OECD's HTTP/2 endpoint requires Accept-Language to avoid HTTP 500 responses
@@ -109,16 +115,14 @@ export class OecdStructureService {
     }
     const url = `${this.baseUrl}/datastructure/${parts.agencyId}/${parts.dsdId}`;
 
-    const retryOptsDs = signal ? { maxRetries: 2, signal } : { maxRetries: 2 };
-    const data = await withRetry(() => fetchJson(url, signal), retryOptsDs).catch(
-      (err: unknown) => {
-        throw serviceUnavailable(
-          `Failed to fetch OECD datastructure for ${flowRef}`,
-          { url },
-          { cause: err },
-        );
-      },
-    );
+    const retryOpts = signal ? { maxRetries: 2, signal } : { maxRetries: 2 };
+    const data = await withRetry(() => fetchJson(url, signal), retryOpts).catch((err: unknown) => {
+      throw serviceUnavailable(
+        `Failed to fetch OECD datastructure for ${flowRef}`,
+        { url },
+        { cause: err },
+      );
+    });
 
     return parseDataStructure(data, flowRef, parts.agencyId, parts.dsdId);
   }
@@ -134,16 +138,14 @@ export class OecdStructureService {
   ): Promise<OecdCode[]> {
     const url = `${this.baseUrl}/codelist/${agencyId}/${codelistId}`;
 
-    const retryOptsCl = signal ? { maxRetries: 2, signal } : { maxRetries: 2 };
-    const data = await withRetry(() => fetchJson(url, signal), retryOptsCl).catch(
-      (err: unknown) => {
-        throw serviceUnavailable(
-          `Failed to fetch OECD codelist ${agencyId}/${codelistId}`,
-          { url },
-          { cause: err },
-        );
-      },
-    );
+    const retryOpts = signal ? { maxRetries: 2, signal } : { maxRetries: 2 };
+    const data = await withRetry(() => fetchJson(url, signal), retryOpts).catch((err: unknown) => {
+      throw serviceUnavailable(
+        `Failed to fetch OECD codelist ${agencyId}/${codelistId}`,
+        { url },
+        { cause: err },
+      );
+    });
 
     return parseCodelist(data);
   }
@@ -250,7 +252,7 @@ function parseDataStructure(
   const nonProduction = annotations.some((a) => String(a.id ?? '') === 'NonProductionDataflow');
 
   const dimensions = rawDims
-    .map((d): import('./types.js').OecdDimension => {
+    .map((d): OecdDimension => {
       const nameProp = d.name as Record<string, string> | string | undefined;
       const name =
         typeof nameProp === 'string'
@@ -289,7 +291,7 @@ function parseDataStructure(
     })
     .sort((a, b) => a.position - b.position);
 
-  let timeDimension: import('./types.js').OecdTimeDimension | undefined;
+  let timeDimension: OecdTimeDimension | undefined;
   if (rawTimeDim) {
     const nameProp = rawTimeDim.name as Record<string, string> | string | undefined;
     const name =
@@ -329,6 +331,19 @@ function parseCodelist(data: unknown): OecdCode[] {
         : (Object.values(nameProp ?? {})[0] ?? String(c.id ?? ''));
     return { id: String(c.id ?? ''), name: String(name) };
   });
+}
+
+/**
+ * Returns true when an error (or its cause chain) signals that a datastructure
+ * or dataflow was not found — matches messages thrown by `parseDataStructure` and
+ * HTTP 404 responses from `fetchJson`. Used by tool handlers to map service errors
+ * to the typed `dataflow_not_found` contract entry.
+ */
+export function isDataflowNotFound(e: Error): boolean {
+  const msg = e.message ?? '';
+  if (msg.includes('DataStructure not found') || msg.includes('HTTP 404')) return true;
+  const cause = (e as NodeJS.ErrnoException).cause;
+  return cause instanceof Error ? isDataflowNotFound(cause) : false;
 }
 
 // Export encode helper for use in tool URL construction

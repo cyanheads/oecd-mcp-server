@@ -7,6 +7,7 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   getStructureService,
+  isDataflowNotFound,
   parseFlowRef,
 } from '@/services/oecd-structure/oecd-structure-service.js';
 import type { OecdDataStructure } from '@/services/oecd-structure/types.js';
@@ -106,15 +107,7 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
     try {
       dsd = await getStructureService().fetchDataStructure(input.flow_ref, ctx.signal);
     } catch (err) {
-      const e = err as Error;
-      // Check top-level message and cause chain for 404 / not-found signals
-      const isNotFound = (e: Error): boolean => {
-        const msg = e.message ?? '';
-        if (msg.includes('DataStructure not found') || msg.includes('HTTP 404')) return true;
-        const cause = (e as NodeJS.ErrnoException).cause;
-        return cause instanceof Error ? isNotFound(cause) : false;
-      };
-      if (isNotFound(e)) {
+      if (isDataflowNotFound(err as Error)) {
         throw ctx.fail('dataflow_not_found', `Dataflow not found: ${input.flow_ref}`, {
           ...ctx.recoveryFor('dataflow_not_found'),
         });
