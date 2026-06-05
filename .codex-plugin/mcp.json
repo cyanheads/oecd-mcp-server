@@ -1,0 +1,9 @@
+{
+  "oecd-mcp-server": {
+    "command": "npx",
+    "args": ["-y", "oecd-mcp-server"],
+    "env": {
+      "MCP_TRANSPORT_TYPE": "stdio"
+    }
+  }
+}
