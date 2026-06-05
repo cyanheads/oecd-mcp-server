@@ -20,6 +20,13 @@ const STRUCTURE_ACCEPT = 'application/vnd.sdmx.structure+json;version=1.0';
 // omits Accept-Language; adding it explicitly fixes the server-side routing bug.
 const ACCEPT_LANGUAGE = 'en';
 
+/**
+ * Allowed characters in SDMX identifier path segments (agencyId, dsdId, dfId).
+ * SDMX IDs use letters, digits, underscores, hyphens, and dots only.
+ * Reject path-traversal sequences (/  \0  ?  #) that could alter the URL structure.
+ */
+const SDMX_ID_SAFE = /^[A-Za-z0-9._-]+$/;
+
 /** Parse the `{agencyID},{dsd_id}@{df_id}` flow ref into its parts. */
 export function parseFlowRef(flowRef: string): {
   agencyId: string;
@@ -36,6 +43,10 @@ export function parseFlowRef(flowRef: string): {
   const dsdId = rest.slice(0, atIdx);
   const dfId = rest.slice(atIdx + 1);
   if (!agencyId || !dsdId || !dfId) return null;
+  // Reject characters that could alter URL path structure
+  if (!SDMX_ID_SAFE.test(agencyId) || !SDMX_ID_SAFE.test(dsdId) || !SDMX_ID_SAFE.test(dfId)) {
+    return null;
+  }
   return { agencyId, dsdId, dfId };
 }
 
@@ -63,11 +74,9 @@ async function fetchJson(url: string, signal?: AbortSignal): Promise<unknown> {
       signal: combinedSignal,
     });
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw serviceUnavailable(
-        `OECD structure API returned HTTP ${res.status}: ${body.slice(0, 200)}`,
-        { url, status: res.status },
-      );
+      throw serviceUnavailable(`OECD structure API returned HTTP ${res.status}`, {
+        status: res.status,
+      });
     }
     return res.json() as Promise<unknown>;
   } finally {
@@ -90,13 +99,16 @@ export class OecdStructureService {
    * Uses `GET /dataflow/{agencyID}` or `GET /dataflow` for all agencies.
    */
   async fetchDataflows(agencyId?: string, signal?: AbortSignal): Promise<OecdDataflow[]> {
+    if (agencyId !== undefined && !SDMX_ID_SAFE.test(agencyId)) {
+      throw serviceUnavailable(`Invalid agency identifier: ${agencyId}`, { agencyId });
+    }
     const url = agencyId ? `${this.baseUrl}/dataflow/${agencyId}` : `${this.baseUrl}/dataflow`;
 
     const retryOpts = signal ? { maxRetries: 2, signal } : { maxRetries: 2 };
     const data = await withRetry(() => fetchJson(url, signal), retryOpts).catch((err: unknown) => {
       throw serviceUnavailable(
         `Failed to fetch OECD dataflows${agencyId ? ` for agency ${agencyId}` : ''}`,
-        { url },
+        {},
         { cause: err },
       );
     });
@@ -119,7 +131,7 @@ export class OecdStructureService {
     const data = await withRetry(() => fetchJson(url, signal), retryOpts).catch((err: unknown) => {
       throw serviceUnavailable(
         `Failed to fetch OECD datastructure for ${flowRef}`,
-        { url },
+        {},
         { cause: err },
       );
     });
@@ -136,13 +148,21 @@ export class OecdStructureService {
     codelistId: string,
     signal?: AbortSignal,
   ): Promise<OecdCode[]> {
+    // Both IDs are derived from upstream DSD responses, but validate as a safety net
+    // before embedding in the URL path.
+    if (!SDMX_ID_SAFE.test(agencyId) || !SDMX_ID_SAFE.test(codelistId)) {
+      throw serviceUnavailable(`Invalid codelist identifier: ${agencyId}/${codelistId}`, {
+        agencyId,
+        codelistId,
+      });
+    }
     const url = `${this.baseUrl}/codelist/${agencyId}/${codelistId}`;
 
     const retryOpts = signal ? { maxRetries: 2, signal } : { maxRetries: 2 };
     const data = await withRetry(() => fetchJson(url, signal), retryOpts).catch((err: unknown) => {
       throw serviceUnavailable(
         `Failed to fetch OECD codelist ${agencyId}/${codelistId}`,
-        { url },
+        {},
         { cause: err },
       );
     });

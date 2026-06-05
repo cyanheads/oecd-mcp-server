@@ -7,6 +7,15 @@ import { notFound, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { parseFlowRef } from '@/services/oecd-structure/oecd-structure-service.js';
+
+/**
+ * Allowed characters in an SDMX dimension key segment value.
+ * Keys are dot-delimited; each segment is alphanumeric/underscore/hyphen or empty (wildcard).
+ * The '+' separator (multi-value) and trailing dots (wildcards) are also permitted.
+ * Reject path-traversal sequences and special chars that could alter the URL structure.
+ */
+const SDMX_KEY_SAFE = /^[A-Za-z0-9._+%-]*$/;
+
 import type { DecodedRow, OecdDataResult } from './types.js';
 
 const DATA_ACCEPT = 'application/vnd.sdmx.data+json;version=2.0';
@@ -74,6 +83,13 @@ export class OecdDataService {
       throw new Error(`Invalid flow_ref format: ${flowRef}`);
     }
 
+    // Validate the key before inserting it into the URL path.
+    // SDMX keys use dots as dimension separators, '+' for multi-value, and alphanumerics/underscores.
+    // Reject any characters that could alter the URL path structure (e.g. '/', '\0', '?', '#').
+    if (!SDMX_KEY_SAFE.test(key)) {
+      throw new Error(`Invalid dimension key format: key contains disallowed characters`);
+    }
+
     // URL-encode `@` in the combined flowId
     const encodedFlowId = `${parts.dsdId}%40${parts.dfId}`;
     let url = `${this.baseUrl}/data/${parts.agencyId},${encodedFlowId}/${key}?dimensionAtObservation=AllDimensions`;
@@ -83,11 +99,7 @@ export class OecdDataService {
     const retryOpts = signal ? { maxRetries: 2, signal } : { maxRetries: 2 };
     const { status, body } = await withRetry(() => fetchDataRaw(url, signal), retryOpts).catch(
       (err: unknown) => {
-        throw serviceUnavailable(
-          `Failed to fetch OECD data for ${flowRef}`,
-          { url },
-          { cause: err },
-        );
+        throw serviceUnavailable(`Failed to fetch OECD data for ${flowRef}`, {}, { cause: err });
       },
     );
 
@@ -99,10 +111,10 @@ export class OecdDataService {
       throw notFound(`Dataflow not found: ${flowRef}`, { flowRef, status });
     }
     if (status === 400) {
-      throw new Error(`Invalid key or query parameter: ${body.slice(0, 200)}`);
+      throw new Error('Invalid key or query parameter');
     }
     if (status >= 500) {
-      throw serviceUnavailable(`OECD data API returned HTTP ${status}`, { url, status });
+      throw serviceUnavailable(`OECD data API returned HTTP ${status}`, { status });
     }
 
     // Parse JSON
@@ -110,10 +122,7 @@ export class OecdDataService {
     try {
       parsed = JSON.parse(body);
     } catch {
-      throw serviceUnavailable('OECD data API returned non-JSON response', {
-        url,
-        preview: body.slice(0, 200),
-      });
+      throw serviceUnavailable('OECD data API returned non-JSON response', { status });
     }
 
     return decodeObservations(parsed);
