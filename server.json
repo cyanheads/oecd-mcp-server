@@ -1,9 +1,9 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "oecd-mcp-server",
-  "description": "",
+  "name": "io.github.cyanheads/oecd-mcp-server",
+  "description": "Search and query 1,500+ OECD statistical datasets via SDMX. Keyless.",
   "repository": {
-    "url": "",
+    "url": "https://github.com/cyanheads/oecd-mcp-server",
     "source": "github"
   },
   "version": "0.1.0",
@@ -11,8 +11,8 @@
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "oecd-mcp-server",
-      "runtimeHint": "node",
+      "identifier": "@cyanheads/oecd-mcp-server",
+      "runtimeHint": "bun",
       "version": "0.1.0",
       "packageArguments": [
         {
@@ -40,8 +40,8 @@
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "oecd-mcp-server",
-      "runtimeHint": "node",
+      "identifier": "@cyanheads/oecd-mcp-server",
+      "runtimeHint": "bun",
       "version": "0.1.0",
       "packageArguments": [
         {
