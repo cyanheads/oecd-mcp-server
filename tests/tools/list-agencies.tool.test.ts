@@ -23,27 +23,30 @@ function setupMockFetch(responseBody: unknown, ok = true, status = 200) {
   );
 }
 
+// Real API format: id is "DSD_XXX@DF_YYY" (combined), structure is a string URN.
 const DATAFLOWS_RESPONSE = {
   data: {
     dataflows: [
       {
         agencyID: 'OECD.SDD.NAD',
-        id: 'DF_NAAG_I',
-        structure: { id: 'DSD_NAAG' },
+        id: 'DSD_NAAG@DF_NAAG_I',
+        structure:
+          'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=OECD.SDD.NAD:DSD_NAAG(1.0)',
         name: 'National Accounts',
         annotations: [],
       },
       {
         agencyID: 'OECD.SDD.NAD',
-        id: 'DF_NAAG_II',
-        structure: { id: 'DSD_NAAG' },
+        id: 'DSD_NAAG@DF_NAAG_II',
+        structure:
+          'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=OECD.SDD.NAD:DSD_NAAG(1.0)',
         name: 'National Accounts II',
         annotations: [],
       },
       {
         agencyID: 'OECD.EDU',
-        id: 'DF_PISA',
-        structure: { id: 'DSD_PISA' },
+        id: 'DSD_PISA@DF_PISA',
+        structure: 'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=OECD.EDU:DSD_PISA(1.0)',
         name: 'PISA',
         annotations: [],
       },

@@ -10,6 +10,10 @@ import { parseFlowRef } from '@/services/oecd-structure/oecd-structure-service.j
 import type { DecodedRow, OecdDataResult } from './types.js';
 
 const DATA_ACCEPT = 'application/vnd.sdmx.data+json;version=2.0';
+// OECD's HTTP/2 endpoint requires Accept-Language to avoid HTTP 500 responses
+// when a structured Accept header is sent. Node.js fetch defaults to HTTP/2 and
+// omits Accept-Language; adding it explicitly fixes the server-side routing bug.
+const ACCEPT_LANGUAGE = 'en';
 
 async function fetchDataRaw(
   url: string,
@@ -29,7 +33,7 @@ async function fetchDataRaw(
 
   try {
     const res = await fetch(url, {
-      headers: { Accept: DATA_ACCEPT },
+      headers: { Accept: DATA_ACCEPT, 'Accept-Language': ACCEPT_LANGUAGE },
       signal: combinedSignal,
     });
     const body = await res.text();

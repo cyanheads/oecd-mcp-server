@@ -81,7 +81,14 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
     try {
       dsd = await getStructureService().fetchDataStructure(flowRef, ctx.signal);
     } catch (err) {
-      if ((err as Error).message?.includes('DataStructure not found')) {
+      // Check top-level message and cause chain for 404 / not-found signals
+      const isNotFound = (e: Error): boolean => {
+        const msg = e.message ?? '';
+        if (msg.includes('DataStructure not found') || msg.includes('HTTP 404')) return true;
+        const cause = (e as NodeJS.ErrnoException).cause;
+        return cause instanceof Error ? isNotFound(cause) : false;
+      };
+      if (isNotFound(err as Error)) {
         throw notFound(`Dataflow not found: ${flowRef}`, { flowRef }, { cause: err as Error });
       }
       throw err;

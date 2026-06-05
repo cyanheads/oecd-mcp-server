@@ -9,6 +9,10 @@ import { getServerConfig } from '@/config/server-config.js';
 import type { OecdCode, OecdDataflow, OecdDataStructure } from './types.js';
 
 const STRUCTURE_ACCEPT = 'application/vnd.sdmx.structure+json;version=1.0';
+// OECD's HTTP/2 endpoint requires Accept-Language to avoid HTTP 500 responses
+// when a structured Accept header is sent. Node.js fetch defaults to HTTP/2 and
+// omits Accept-Language; adding it explicitly fixes the server-side routing bug.
+const ACCEPT_LANGUAGE = 'en';
 
 /** Parse the `{agencyID},{dsd_id}@{df_id}` flow ref into its parts. */
 export function parseFlowRef(flowRef: string): {
@@ -49,7 +53,7 @@ async function fetchJson(url: string, signal?: AbortSignal): Promise<unknown> {
 
   try {
     const res = await fetch(url, {
-      headers: { Accept: STRUCTURE_ACCEPT },
+      headers: { Accept: STRUCTURE_ACCEPT, 'Accept-Language': ACCEPT_LANGUAGE },
       signal: combinedSignal,
     });
     if (!res.ok) {
@@ -157,6 +161,23 @@ export function getStructureService(): OecdStructureService {
 
 // ── Parsers ──────────────────────────────────────────────────────────────────
 
+/**
+ * Extract the DSD identifier from the structure URN.
+ * URN format: `urn:sdmx:...=AGENCY:DSD_ID(version)` or `urn:sdmx:...=AGENCY:DSD_ID`.
+ * Returns undefined when the URN cannot be parsed.
+ */
+function dsdIdFromStructureUrn(urn: string): string | undefined {
+  // Match the part after the last '=' and before any '(' or end
+  const eq = urn.lastIndexOf('=');
+  if (eq < 0) return;
+  const rest = urn.slice(eq + 1); // "AGENCY:DSD_ID(version)" or "AGENCY:DSD_ID"
+  const colon = rest.indexOf(':');
+  if (colon < 0) return;
+  const dsdPart = rest.slice(colon + 1); // "DSD_ID(version)" or "DSD_ID"
+  const paren = dsdPart.indexOf('(');
+  return paren >= 0 ? dsdPart.slice(0, paren) : dsdPart;
+}
+
 function parseDataflows(data: unknown): OecdDataflow[] {
   const root = data as Record<string, unknown>;
   const structures = root?.data as Record<string, unknown> | undefined;
@@ -164,23 +185,36 @@ function parseDataflows(data: unknown): OecdDataflow[] {
 
   return rawFlows.map((f): OecdDataflow => {
     const agencyId = String(f.agencyID ?? '');
-    const dfId = String(f.id ?? '');
-    // Structure includes `structure` reference pointing to the DSD
-    const structureRef = f.structure as Record<string, unknown> | undefined;
-    const dsdId = String(structureRef?.id ?? dfId.replace(/^DF_/, 'DSD_'));
+    const rawId = String(f.id ?? '');
+
+    // f.id is either "DSD_XXX@DF_YYY" (most flows) or just "DF_YYY" (a few non-OECD flows).
+    // The structure field is a string URN — not an object — so we extract the DSD id from it.
+    const atIdx = rawId.indexOf('@');
+    let dsdId: string;
+    let flowId: string;
+    if (atIdx >= 0) {
+      // Combined format: split into DSD and DF parts
+      dsdId = rawId.slice(0, atIdx);
+      flowId = rawId.slice(atIdx + 1);
+    } else {
+      // DF-only id: extract DSD from the structure URN; fall back to replacing DF_ prefix
+      const structureUrn = typeof f.structure === 'string' ? f.structure : '';
+      dsdId = dsdIdFromStructureUrn(structureUrn) ?? rawId.replace(/^DF_/, 'DSD_');
+      flowId = rawId;
+    }
 
     const nameProp = f.name as Record<string, string> | string | undefined;
     const name =
-      typeof nameProp === 'string' ? nameProp : (Object.values(nameProp ?? {})[0] ?? dfId);
+      typeof nameProp === 'string' ? nameProp : (Object.values(nameProp ?? {})[0] ?? rawId);
 
     // Check for NonProductionDataflow annotation
     const annotations = (f.annotations ?? []) as Array<Record<string, unknown>>;
     const nonProduction = annotations.some((a) => String(a.id ?? '') === 'NonProductionDataflow');
 
     return {
-      flowRef: `${agencyId},${dsdId}@${dfId}`,
+      flowRef: `${agencyId},${dsdId}@${flowId}`,
       agencyId,
-      flowId: dfId,
+      flowId,
       dsdId,
       name: String(name),
       nonProduction,
@@ -207,7 +241,9 @@ function parseDataStructure(
   const dimList = components?.dimensionList as Record<string, unknown> | undefined;
 
   const rawDims = (dimList?.dimensions ?? []) as Array<Record<string, unknown>>;
-  const rawTimeDim = dimList?.timeDimension as Record<string, unknown> | undefined;
+  // API uses "timeDimensions" (plural, array) — not "timeDimension" (singular)
+  const rawTimeDims = (dimList?.timeDimensions ?? []) as Array<Record<string, unknown>>;
+  const rawTimeDim = rawTimeDims[0];
 
   // Check NonProductionDataflow annotation
   const annotations = (dsd.annotations ?? []) as Array<Record<string, unknown>>;
@@ -221,17 +257,33 @@ function parseDataStructure(
           ? nameProp
           : (Object.values(nameProp ?? {})[0] ?? String(d.id ?? ''));
 
-      // Codelist reference sits inside localRepresentation.enumeration
+      // Codelist reference sits inside localRepresentation.enumeration, which
+      // is a string URN: "urn:sdmx:...=AGENCY:CL_ID(version)".
+      // Parse the AGENCY:CL_ID portion from the URN.
       const localRep = d.localRepresentation as Record<string, unknown> | undefined;
-      const enumRef = localRep?.enumeration as Record<string, unknown> | undefined;
-      const clAgency = String(enumRef?.agencyID ?? agencyId);
-      const clId = enumRef?.id ? String(enumRef.id) : undefined;
-      const codelistRef = clId ? `${clAgency},${clId}` : undefined;
+      const enumUrn = localRep?.enumeration;
+      let codelistRef: string | undefined;
+      if (typeof enumUrn === 'string') {
+        // Extract "AGENCY:CL_ID" from "urn:sdmx:...=AGENCY:CL_ID(version)"
+        const eq = enumUrn.lastIndexOf('=');
+        if (eq >= 0) {
+          const rest = enumUrn.slice(eq + 1); // "AGENCY:CL_ID(version)"
+          const paren = rest.indexOf('(');
+          const agencyCl = paren >= 0 ? rest.slice(0, paren) : rest; // "AGENCY:CL_ID"
+          const colon = agencyCl.indexOf(':');
+          if (colon >= 0) {
+            const clAgency = agencyCl.slice(0, colon);
+            const clId = agencyCl.slice(colon + 1);
+            if (clAgency && clId) codelistRef = `${clAgency},${clId}`;
+          }
+        }
+      }
 
+      // API positions are 0-based; expose as 1-based for user-facing key construction
       return {
         id: String(d.id ?? ''),
         name: String(name),
-        position: Number(d.position ?? 0),
+        position: Number(d.position ?? 0) + 1,
         codelistRef,
       };
     })

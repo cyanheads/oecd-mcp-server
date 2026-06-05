@@ -107,7 +107,14 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
       dsd = await getStructureService().fetchDataStructure(input.flow_ref, ctx.signal);
     } catch (err) {
       const e = err as Error;
-      if (e.message?.includes('DataStructure not found')) {
+      // Check top-level message and cause chain for 404 / not-found signals
+      const isNotFound = (e: Error): boolean => {
+        const msg = e.message ?? '';
+        if (msg.includes('DataStructure not found') || msg.includes('HTTP 404')) return true;
+        const cause = (e as NodeJS.ErrnoException).cause;
+        return cause instanceof Error ? isNotFound(cause) : false;
+      };
+      if (isNotFound(e)) {
         throw ctx.fail('dataflow_not_found', `Dataflow not found: ${input.flow_ref}`, {
           ...ctx.recoveryFor('dataflow_not_found'),
         });

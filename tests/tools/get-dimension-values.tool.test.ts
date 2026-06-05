@@ -11,6 +11,7 @@ import { initStructureService } from '@/services/oecd-structure/oecd-structure-s
 
 const FAKE_BASE = 'https://fake.oecd.test';
 
+// Real API format: positions are 0-based, enumeration is a string URN, timeDimensions is an array.
 // DSD with one dimension that has a codelist and one that doesn't
 const DSD_RESPONSE = {
   data: {
@@ -22,23 +23,25 @@ const DSD_RESPONSE = {
             dimensions: [
               {
                 id: 'FREQ',
-                position: 1,
+                position: 0,
                 name: 'Frequency',
                 localRepresentation: {
-                  enumeration: { agencyID: 'OECD', id: 'CL_FREQ' },
+                  enumeration: 'urn:sdmx:org.sdmx.infomodel.codelist.Codelist=OECD:CL_FREQ(1.0)',
                 },
               },
               {
                 id: 'MEASURE',
-                position: 2,
+                position: 1,
                 name: 'Measure',
                 localRepresentation: {},
               },
             ],
-            timeDimension: {
-              id: 'TIME_PERIOD',
-              name: 'Time Period',
-            },
+            timeDimensions: [
+              {
+                id: 'TIME_PERIOD',
+                name: 'Time Period',
+              },
+            ],
           },
         },
       },

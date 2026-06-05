@@ -11,27 +11,30 @@ import { initStructureService } from '@/services/oecd-structure/oecd-structure-s
 
 const FAKE_BASE = 'https://fake.oecd.test';
 
+// Real API format: id is "DSD_XXX@DF_YYY" (combined), structure is a string URN.
 const DATAFLOWS_RESPONSE = {
   data: {
     dataflows: [
       {
         agencyID: 'OECD.SDD.NAD',
-        id: 'DF_NAAG_I',
-        structure: { id: 'DSD_NAAG' },
+        id: 'DSD_NAAG@DF_NAAG_I',
+        structure:
+          'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=OECD.SDD.NAD:DSD_NAAG(1.0)',
         name: 'National Accounts at a Glance',
         annotations: [],
       },
       {
         agencyID: 'OECD.EDU',
-        id: 'DF_PISA',
-        structure: { id: 'DSD_PISA' },
+        id: 'DSD_PISA@DF_PISA',
+        structure: 'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=OECD.EDU:DSD_PISA(1.0)',
         name: 'PISA Student Performance',
         annotations: [{ id: 'NonProductionDataflow' }],
       },
       {
         agencyID: 'OECD.SDD',
-        id: 'DF_HEALTH',
-        structure: { id: 'DSD_HEALTH' },
+        id: 'DSD_HEALTH@DF_HEALTH',
+        structure:
+          'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=OECD.SDD:DSD_HEALTH(1.0)',
         name: 'Health Statistics',
         annotations: [],
       },

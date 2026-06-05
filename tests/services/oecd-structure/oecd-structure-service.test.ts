@@ -45,22 +45,33 @@ describe('parseFlowRef', () => {
 
 // ── fetchDataflows ─────────────────────────────────────────────────────────────
 
+// Real API format: f.id is "DSD_XXX@DF_YYY" (combined), structure is a string URN.
+// Also cover the DF-only case (no '@' in id) for the 8 non-OECD flows.
 const MOCK_DATAFLOWS_RESPONSE = {
   data: {
     dataflows: [
       {
         agencyID: 'OECD.SDD.NAD',
-        id: 'DF_NAAG_I',
-        structure: { id: 'DSD_NAAG' },
+        id: 'DSD_NAAG@DF_NAAG_I',
+        structure:
+          'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=OECD.SDD.NAD:DSD_NAAG(1.0)',
         name: { en: 'National Accounts at a Glance' },
         annotations: [],
       },
       {
         agencyID: 'OECD.SDD.NAD',
-        id: 'DF_NAAG_II',
-        structure: { id: 'DSD_NAAG' },
+        id: 'DSD_NAAG@DF_NAAG_II',
+        structure:
+          'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=OECD.SDD.NAD:DSD_NAAG(1.0)',
         name: 'National Accounts II',
         annotations: [{ id: 'NonProductionDataflow' }],
+      },
+      {
+        agencyID: 'ESTAT',
+        id: 'DF_SDG_GLC',
+        structure: 'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=ESTAT:SDG_DSD(1.0)',
+        name: 'SDG Global',
+        annotations: [],
       },
     ],
   },
@@ -84,15 +95,28 @@ describe('OecdStructureService.fetchDataflows', () => {
     const svc = new OecdStructureService('https://fake.oecd.test');
     const flows = await svc.fetchDataflows();
 
-    expect(flows).toHaveLength(2);
+    expect(flows).toHaveLength(3);
     expect(flows[0]).toMatchObject({
       agencyId: 'OECD.SDD.NAD',
+      dsdId: 'DSD_NAAG',
+      flowId: 'DF_NAAG_I',
       flowRef: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
       name: 'National Accounts at a Glance',
       nonProduction: false,
     });
     expect(flows[1]).toMatchObject({
+      dsdId: 'DSD_NAAG',
+      flowId: 'DF_NAAG_II',
+      flowRef: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_II',
       nonProduction: true,
+    });
+    // DF-only id case: DSD extracted from structure URN
+    expect(flows[2]).toMatchObject({
+      agencyId: 'ESTAT',
+      dsdId: 'SDG_DSD',
+      flowId: 'DF_SDG_GLC',
+      flowRef: 'ESTAT,SDG_DSD@DF_SDG_GLC',
+      nonProduction: false,
     });
   });
 
@@ -113,6 +137,7 @@ describe('OecdStructureService.fetchDataflows', () => {
 
 // ── fetchDataStructure ─────────────────────────────────────────────────────────
 
+// Real API format: positions are 0-based, enumeration is a string URN, timeDimensions is an array.
 const MOCK_DATASTRUCTURE_RESPONSE = {
   data: {
     dataStructures: [
@@ -123,25 +148,28 @@ const MOCK_DATASTRUCTURE_RESPONSE = {
             dimensions: [
               {
                 id: 'FREQ',
-                position: 1,
+                position: 0,
                 name: { en: 'Frequency' },
                 localRepresentation: {
-                  enumeration: { agencyID: 'OECD', id: 'CL_FREQ' },
+                  enumeration: 'urn:sdmx:org.sdmx.infomodel.codelist.Codelist=OECD:CL_FREQ(1.0)',
                 },
               },
               {
                 id: 'REF_AREA',
-                position: 2,
+                position: 1,
                 name: 'Reference Area',
                 localRepresentation: {
-                  enumeration: { agencyID: 'OECD.SDD.NAD', id: 'CL_AREA' },
+                  enumeration:
+                    'urn:sdmx:org.sdmx.infomodel.codelist.Codelist=OECD.SDD.NAD:CL_AREA(1.0)',
                 },
               },
             ],
-            timeDimension: {
-              id: 'TIME_PERIOD',
-              name: { en: 'Time Period' },
-            },
+            timeDimensions: [
+              {
+                id: 'TIME_PERIOD',
+                name: { en: 'Time Period' },
+              },
+            ],
           },
         },
       },
