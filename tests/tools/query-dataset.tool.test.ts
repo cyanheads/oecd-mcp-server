@@ -98,6 +98,11 @@ describe('oecdQueryDataset', () => {
     expect(result.rows).toHaveLength(2);
     expect(result.truncated).toBeUndefined();
     expect(result.canvas_id).toBeUndefined();
+    // Query echo
+    expect(result.query_flow_ref).toBe('OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I');
+    expect(result.query_key).toBe('A.USA..');
+    expect(result.query_start_period).toBe('2021');
+    expect(result.query_end_period).toBe('2022');
     // Each row should have dimension labels
     expect(result.rows[0]).toHaveProperty('FREQ');
     expect(result.rows[0]).toHaveProperty('value');
@@ -252,24 +257,32 @@ describe('oecdQueryDataset', () => {
     expect(result.row_count).toBe(2);
   });
 
-  it('formats inline result with observation table', () => {
+  it('formats inline result with observation table and query echo', () => {
     const output = {
       rows: [{ FREQ: 'Annual', REF_AREA: 'United States', value: 26054.614, source: 'OECD' }],
       row_count: 1,
+      query_flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+      query_key: 'A.USA..',
+      query_start_period: '2020',
+      query_end_period: '2022',
       source: 'OECD' as const,
     };
     const blocks = oecdQueryDataset.format!(output);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('OECD Dataset Query');
     expect(text).toContain('1 observations');
+    expect(text).toContain('OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I');
+    expect(text).toContain('A.USA..');
     expect(text).toContain('FREQ');
     expect(text).toContain('Source: OECD');
   });
 
-  it('formats spilled result with canvas_id note', () => {
+  it('formats spilled result with canvas_id note and query echo', () => {
     const output = {
       rows: [{ FREQ: 'Annual', value: 26054.614, source: 'OECD' }],
       row_count: 500,
+      query_flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+      query_key: 'A.USA..',
       canvas_id: 'canvas-001',
       table_name: 'spilled_abc',
       truncated: true as const,
@@ -280,5 +293,6 @@ describe('oecdQueryDataset', () => {
     expect(text).toContain('canvas-001');
     expect(text).toContain('oecd_dataframe_query');
     expect(text).toContain('500 observations');
+    expect(text).toContain('OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I');
   });
 });

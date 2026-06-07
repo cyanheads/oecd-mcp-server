@@ -75,6 +75,16 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
         'Inline preview rows. When truncated is true, this is a subset — use oecd_dataframe_query for the full result.',
       ),
     row_count: z.number().describe('Total rows in the result (or on the canvas when truncated).'),
+    query_flow_ref: z.string().describe('Flow reference used in this query.'),
+    query_key: z.string().describe('Dimension key used in this query.'),
+    query_start_period: z
+      .string()
+      .optional()
+      .describe('Start period filter applied in this query, if any.'),
+    query_end_period: z
+      .string()
+      .optional()
+      .describe('End period filter applied in this query, if any.'),
     canvas_id: z
       .string()
       .optional()
@@ -207,6 +217,10 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
         return {
           rows: result.previewRows as Array<Record<string, string | number | null>>,
           row_count: result.handle.rowCount,
+          query_flow_ref: input.flow_ref,
+          query_key: input.key,
+          query_start_period: input.start_period,
+          query_end_period: input.end_period,
           canvas_id: instance.canvasId,
           table_name: result.handle.tableName,
           truncated: true,
@@ -219,6 +233,10 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     return {
       rows: dataResult.rows as Array<Record<string, string | number | null>>,
       row_count: dataResult.rows.length,
+      query_flow_ref: input.flow_ref,
+      query_key: input.key,
+      query_start_period: input.start_period,
+      query_end_period: input.end_period,
       source: 'OECD' as const,
     };
   },
@@ -233,8 +251,14 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       (r) => `| ${allKeys.map((k) => String(r[k] ?? '')).join(' | ')} |`,
     );
 
+    const periodRange =
+      result.query_start_period || result.query_end_period
+        ? ` | Period: ${result.query_start_period ?? '…'} – ${result.query_end_period ?? '…'}`
+        : '';
+
     const lines = [
       `**OECD Dataset Query** — ${result.row_count} observations`,
+      `Query: \`${result.query_flow_ref}\` key=\`${result.query_key}\`${periodRange}`,
       result.truncated && result.canvas_id
         ? `\n> Result truncated — full data on DataCanvas (canvas_id: \`${result.canvas_id}\`, table: \`${result.table_name}\`). ` +
           'Use **oecd_dataframe_query** for analytics over the full set.\n'
