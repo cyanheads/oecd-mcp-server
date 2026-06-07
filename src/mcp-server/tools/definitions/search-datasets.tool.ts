@@ -11,8 +11,7 @@ import type { OecdDataflow } from '@/services/oecd-structure/types.js';
 export const oecdSearchDatasets = tool('oecd_search_datasets', {
   description:
     'Search OECD dataflows by keyword or theme. ' +
-    'Returns flow_ref identifiers, names, and agency IDs for use with oecd_get_dataset_info. ' +
-    'The first call fetches the full catalog of 1,500+ dataflows from the OECD API — subsequent calls are fast.',
+    'Returns flow_ref identifiers, names, and agency IDs for use with oecd_get_dataset_info.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
