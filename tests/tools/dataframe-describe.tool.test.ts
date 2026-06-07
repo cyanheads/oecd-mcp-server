@@ -28,11 +28,14 @@ describe('oecdDataframeDescribe', () => {
     setCanvas(undefined);
   });
 
-  it('throws a plain Error when canvas is not configured', async () => {
+  it('throws ctx.fail(canvas_disabled) when canvas is not configured', async () => {
     setCanvas(undefined);
     const ctx = createMockContext({ errors: oecdDataframeDescribe.errors });
     const input = oecdDataframeDescribe.input.parse({ canvas_id: 'canvas-001' });
-    await expect(oecdDataframeDescribe.handler(input, ctx)).rejects.toThrow('not enabled');
+    await expect(oecdDataframeDescribe.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'canvas_disabled' },
+    });
   });
 
   it('returns table list for a valid canvas_id', async () => {

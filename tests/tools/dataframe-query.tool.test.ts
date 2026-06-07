@@ -28,14 +28,17 @@ describe('oecdDataframeQuery', () => {
     setCanvas(undefined);
   });
 
-  it('throws a plain Error when canvas is not configured', async () => {
+  it('throws ctx.fail(canvas_disabled) when canvas is not configured', async () => {
     setCanvas(undefined);
     const ctx = createMockContext({ errors: oecdDataframeQuery.errors });
     const input = oecdDataframeQuery.input.parse({
       canvas_id: 'canvas-001',
       sql: 'SELECT * FROM spilled_abc',
     });
-    await expect(oecdDataframeQuery.handler(input, ctx)).rejects.toThrow('not enabled');
+    await expect(oecdDataframeQuery.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'canvas_disabled' },
+    });
   });
 
   it('returns query rows, count, and column names', async () => {

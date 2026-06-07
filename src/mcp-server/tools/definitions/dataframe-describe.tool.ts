@@ -5,7 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import type { CanvasInstance } from '@cyanheads/mcp-ts-core/canvas';
-import { JsonRpcErrorCode, serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 
 export const oecdDataframeDescribe = tool('oecd_dataframe_describe', {
@@ -53,6 +53,12 @@ export const oecdDataframeDescribe = tool('oecd_dataframe_describe', {
   }),
   errors: [
     {
+      reason: 'canvas_disabled',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'DataCanvas is not configured — CANVAS_PROVIDER_TYPE is unset.',
+      recovery: 'Set CANVAS_PROVIDER_TYPE=duckdb to enable DataCanvas, then retry.',
+    },
+    {
       reason: 'canvas_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'The canvas_id has expired or was never created.',
@@ -64,8 +70,10 @@ export const oecdDataframeDescribe = tool('oecd_dataframe_describe', {
   async handler(input, ctx) {
     const canvas = getCanvas();
     if (!canvas) {
-      throw serviceUnavailable(
+      throw ctx.fail(
+        'canvas_disabled',
         'DataCanvas is not enabled. Set CANVAS_PROVIDER_TYPE=duckdb to use oecd_dataframe_describe.',
+        { ...ctx.recoveryFor('canvas_disabled') },
       );
     }
 
