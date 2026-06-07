@@ -105,7 +105,7 @@ describe('oecdGetDimensionValues', () => {
     ]);
   });
 
-  it('returns empty codes for a dimension with no codelist reference', async () => {
+  it('returns empty codes with notice for a dimension with no codelist reference', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValueOnce({
@@ -124,6 +124,8 @@ describe('oecdGetDimensionValues', () => {
 
     expect(result.code_count).toBe(0);
     expect(result.codes).toHaveLength(0);
+    expect(result.notice).toMatch(/no fixed codelist/i);
+    expect(result.notice).toMatch(/free-form/i);
   });
 
   it('throws ctx.fail(dataflow_not_found) for malformed flow_ref', async () => {
@@ -197,6 +199,24 @@ describe('oecdGetDimensionValues', () => {
     expect(text).toContain('FREQ');
     expect(text).toContain('Annual');
     expect(text).toContain('Quarterly');
+    expect(text).toContain('Source: OECD');
+  });
+
+  it('formats output with notice when dimension has no codelist', () => {
+    const output = {
+      flow_ref: 'OECD.CFE.EDS,DSD_LA_LABOUR_DDOWN@DF_EMPLOYMENT_DDOWN',
+      dimension_id: 'DD_ID',
+      codes: [],
+      code_count: 0,
+      notice:
+        'This dimension has no fixed codelist — it accepts dynamic or free-form values. ' +
+        'Inspect actual data observations with oecd_query_dataset to discover valid values.',
+      source: 'OECD' as const,
+    };
+    const blocks = oecdGetDimensionValues.format!(output);
+    const text = (blocks[0] as { text: string }).text;
+    expect(text).toContain('DD_ID');
+    expect(text).toContain('no fixed codelist');
     expect(text).toContain('Source: OECD');
   });
 });
