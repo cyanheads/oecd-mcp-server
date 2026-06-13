@@ -55,7 +55,7 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
     },
     {
       reason: 'invalid_sql',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'The SQL is not a valid SELECT statement or contains disallowed operations.',
       recovery:
         'Provide a read-only SELECT statement. Only SELECT is allowed — ' +
@@ -93,7 +93,10 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
 
     let queryResult: QueryResult;
     try {
-      queryResult = await instance.query(input.sql, { signal: ctx.signal });
+      queryResult = await instance.query(input.sql, {
+        signal: ctx.signal,
+        denySystemCatalogs: true,
+      });
     } catch (err) {
       const e = err as Error;
       // Canvas enforces read-only — classification is a ValidationError from the 4-layer gate

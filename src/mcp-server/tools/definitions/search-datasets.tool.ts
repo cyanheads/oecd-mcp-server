@@ -63,6 +63,11 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
     total_matches: z.number().describe('Total dataflows matching the query before applying limit.'),
     source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
   }),
+  enrichment: {
+    totalCount: z
+      .number()
+      .describe('Total dataflows matching the query, disclosed when the limit capped the list.'),
+  },
   errors: [
     {
       reason: 'no_match',
@@ -127,6 +132,11 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       totalMatches: matches.length,
       returned: limited.length,
     });
+
+    // Disclose the full match count when the limit capped the returned list.
+    if (matches.length > limited.length) {
+      ctx.enrich.total(matches.length);
+    }
 
     return {
       dataflows: limited.map((df) => ({

@@ -102,7 +102,7 @@ describe('oecdDataframeQuery', () => {
       sql: 'INVALID SQL',
     });
     await expect(oecdDataframeQuery.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'invalid_sql' },
     });
   });
@@ -123,7 +123,7 @@ describe('oecdDataframeQuery', () => {
       sql: 'DROP TABLE spilled_abc',
     });
     await expect(oecdDataframeQuery.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'invalid_sql' },
     });
   });

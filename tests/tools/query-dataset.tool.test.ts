@@ -112,7 +112,7 @@ describe('oecdQueryDataset', () => {
     const ctx = createMockContext({ errors: oecdQueryDataset.errors });
     const input = oecdQueryDataset.input.parse({ flow_ref: 'BAD', key: '.' });
     await expect(oecdQueryDataset.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'invalid_flow_ref' },
     });
   });
@@ -173,7 +173,7 @@ describe('oecdQueryDataset', () => {
       key: 'GARBAGE_KEY',
     });
     await expect(oecdQueryDataset.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'invalid_key' },
     });
   });

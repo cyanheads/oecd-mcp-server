@@ -13,6 +13,8 @@ import { initDataService } from './services/oecd-data/oecd-data-service.js';
 import { initStructureService } from './services/oecd-structure/oecd-structure-service.js';
 
 await createApp({
+  name: 'oecd-mcp-server',
+  title: 'oecd-mcp-server',
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
   prompts: allPromptDefinitions,

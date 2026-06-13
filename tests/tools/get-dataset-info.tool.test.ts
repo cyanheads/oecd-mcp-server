@@ -99,7 +99,7 @@ describe('oecdGetDatasetInfo', () => {
     const ctx = createMockContext({ errors: oecdGetDatasetInfo.errors });
     const input = oecdGetDatasetInfo.input.parse({ flow_ref: 'BAD_FORMAT' });
     await expect(oecdGetDatasetInfo.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'invalid_flow_ref' },
     });
   });

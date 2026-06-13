@@ -108,7 +108,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
   errors: [
     {
       reason: 'invalid_flow_ref',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'The flow_ref is not in the expected format.',
       recovery:
         'Obtain valid flow_ref values from oecd_search_datasets. ' +
@@ -130,7 +130,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     },
     {
       reason: 'invalid_key',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'The dimension key is malformed or contains an unsupported format.',
       recovery:
         'Use oecd_get_dataset_info to check dimension order and count, ' +

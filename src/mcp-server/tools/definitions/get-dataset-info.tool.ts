@@ -75,7 +75,7 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
   errors: [
     {
       reason: 'invalid_flow_ref',
-      code: JsonRpcErrorCode.InvalidParams,
+      code: JsonRpcErrorCode.ValidationError,
       when: 'The flow_ref parameter does not match the expected {agencyID},{dsd_id}@{df_id} format.',
       recovery:
         'Obtain valid flow_ref values from oecd_search_datasets. ' +
