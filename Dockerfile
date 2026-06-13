@@ -42,9 +42,11 @@ WORKDIR /usr/src/app
 ENV NODE_ENV=production
 
 # OCI image metadata (https://github.com/opencontainers/image-spec/blob/main/annotations.md)
+ARG APP_VERSION
 LABEL org.opencontainers.image.title="@cyanheads/oecd-mcp-server"
 LABEL org.opencontainers.image.description="Search and query 1,500+ OECD statistical datasets via SDMX. Keyless."
 LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.version="${APP_VERSION}"
 LABEL org.opencontainers.image.source="https://github.com/cyanheads/oecd-mcp-server"
 
 # Copy dependency manifests
@@ -81,6 +83,11 @@ COPY --from=build /usr/src/app/dist ./dist
 # Create and set permissions for the log directory, assigning ownership to the 'bun' user.
 RUN mkdir -p /var/log/oecd-mcp-server && chown -R bun:bun /var/log/oecd-mcp-server
 
+# Writable data dirs for on-disk SQLite stores (catalog index / observations
+# mirror), owned by the runtime user. Mount a volume over either in production.
+RUN mkdir -p /usr/src/app/.cache /usr/src/app/.mirror \
+  && chown -R bun:bun /usr/src/app/.cache /usr/src/app/.mirror
+
 # Switch to the non-root user
 USER bun
 
@@ -100,6 +107,9 @@ ENV MCP_FORCE_CONSOLE_LOGGING="true"
 
 # Expose the port the server listens on
 EXPOSE ${MCP_HTTP_PORT}
+
+# Health check using a bun-native fetch (slim image ships no curl/wget)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD bun -e "fetch('http://localhost:'+(process.env.MCP_HTTP_PORT??'3010')+'/healthz').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 # The command to start the server
 CMD ["bun", "run", "dist/index.js"]
