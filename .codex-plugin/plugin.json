@@ -1,6 +1,6 @@
 {
   "name": "oecd-mcp-server",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Search and query 1,500+ OECD statistical datasets via SDMX. Keyless.",
   "author": {
     "name": "cyanheads",

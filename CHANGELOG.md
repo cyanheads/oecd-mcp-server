@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-08-09
+
+UNIT_MULT value scaling correction, full inline rendering, typed upstream-failure classification
+
 ## [0.1.4](changelog/0.1.x/0.1.4.md) — 2026-08-09
 
 oecd_search_datasets description matching + offset paging, agency-not-found and retry fixes, mcp-ts-core ^0.11.1
