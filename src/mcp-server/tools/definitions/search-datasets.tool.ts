@@ -5,12 +5,32 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { getStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
+import {
+  getStructureService,
+  isDataflowNotFound,
+} from '@/services/oecd-structure/oecd-structure-service.js';
 import type { OecdDataflow } from '@/services/oecd-structure/types.js';
+
+/**
+ * Character budget for a returned description. OECD abstracts run to a median of
+ * ~840 characters, so nearly every one is cut; 240 completes the opening summary
+ * sentence for ~84% of the abstracts published while holding a full 100-result
+ * response to roughly 2.4x its description-free size.
+ */
+const DESCRIPTION_MAX_CHARS = 240;
+
+/** Cut to the budget on a word boundary when one is close enough to the end. */
+function truncateDescription(text: string): string {
+  if (text.length <= DESCRIPTION_MAX_CHARS) return text;
+  const cut = text.slice(0, DESCRIPTION_MAX_CHARS);
+  const lastSpace = cut.lastIndexOf(' ');
+  const body = lastSpace > DESCRIPTION_MAX_CHARS * 0.6 ? cut.slice(0, lastSpace) : cut;
+  return `${body.trimEnd()}…`;
+}
 
 export const oecdSearchDatasets = tool('oecd_search_datasets', {
   description:
-    'Search OECD dataflows by keyword or theme. ' +
+    'Search OECD dataflows by keyword or theme, matching against dataflow names and descriptions. ' +
     'Returns flow_ref identifiers, names, and agency IDs for use with oecd_get_dataset_info.',
   annotations: {
     readOnlyHint: true,
@@ -21,7 +41,8 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
     query: z
       .string()
       .describe(
-        'Keyword or phrase to search for in dataflow names — e.g. "GDP", "employment", "education".',
+        'Keyword or phrase to search for in dataflow names and descriptions — e.g. "GDP", "employment", "education". ' +
+          'Every whitespace-separated token must appear somewhere in the name or description.',
       ),
     agency_id: z
       .string()
@@ -37,6 +58,15 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       .max(100)
       .default(20)
       .describe('Maximum number of results to return (1–100, default 20).'),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .default(0)
+      .describe(
+        'Zero-based index of the first match to return, applied before limit. ' +
+          'Page through results past the limit by advancing it; an offset at or past total_matches returns an empty list.',
+      ),
   }),
   output: z.object({
     dataflows: z
@@ -50,23 +80,45 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
               ),
             agency_id: z.string().describe('Publishing agency identifier.'),
             name: z.string().describe('Human-readable dataflow name.'),
+            description: z
+              .string()
+              .optional()
+              .describe(
+                `Plain-text abstract of what the dataset covers, truncated to ${DESCRIPTION_MAX_CHARS} characters. ` +
+                  'Matching runs against the full abstract, so a term reported in matched_in may sit past the cut. ' +
+                  'Absent when OECD publishes no description for the dataflow.',
+              ),
+            matched_in: z
+              .enum(['name', 'description', 'both'])
+              .describe(
+                'Which field carried every query token — "name" or "description" when only that one did, ' +
+                  '"both" when each did on its own or the tokens were split across the two.',
+              ),
             non_production: z
               .boolean()
               .describe('True if flagged as experimental or deprecated by OECD.'),
           })
           .describe('A matching OECD dataflow entry.'),
       )
-      .describe('Matching dataflows, up to the requested limit.'),
+      .describe('Matching dataflows for the requested page, up to the requested limit.'),
     result_count: z
       .number()
       .describe('Number of results returned (may be less than total_matches).'),
-    total_matches: z.number().describe('Total dataflows matching the query before applying limit.'),
+    total_matches: z
+      .number()
+      .describe('Total dataflows matching the query before applying offset and limit.'),
+    offset: z
+      .number()
+      .describe('Zero-based index of the first returned result within the full match list.'),
     source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
   }),
   enrichment: {
     totalCount: z
       .number()
-      .describe('Total dataflows matching the query, disclosed when the limit capped the list.'),
+      .optional()
+      .describe(
+        'Total dataflows matching the query, disclosed when matches remain beyond the returned page.',
+      ),
   },
   errors: [
     {
@@ -76,6 +128,14 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       recovery:
         'Try broader search terms or use oecd_list_agencies to discover agency IDs, ' +
         'then search within a specific agency.',
+    },
+    {
+      reason: 'agency_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'The supplied agency_id does not exist in the OECD SDMX catalog.',
+      recovery:
+        'Call oecd_list_agencies for the valid agency IDs and retry with one of them, ' +
+        'or omit agency_id to search the whole catalog.',
     },
     {
       reason: 'upstream_error',
@@ -91,6 +151,7 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       query: input.query,
       agencyId: input.agency_id,
       limit: input.limit,
+      offset: input.offset,
     });
 
     let dataflows: OecdDataflow[];
@@ -100,6 +161,14 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
         ctx.signal,
       );
     } catch (err) {
+      if (input.agency_id && isDataflowNotFound(err as Error)) {
+        throw ctx.fail(
+          'agency_not_found',
+          `No OECD agency is published under the identifier "${input.agency_id}"`,
+          { ...ctx.recoveryFor('agency_not_found') },
+          { cause: err as Error },
+        );
+      }
       throw ctx.fail(
         'upstream_error',
         'Failed to fetch OECD dataflows',
@@ -108,17 +177,28 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       );
     }
 
-    // Filter by query tokens (case-insensitive, all tokens must match)
+    // Filter by query tokens (case-insensitive, all tokens must match name or description)
     const tokens = input.query
       .toLowerCase()
       .split(/\s+/)
       .filter((t) => t.length > 0);
 
-    const matches = dataflows.filter((df) => {
-      const hay = df.name.toLowerCase();
-      return tokens.every((t) => hay.includes(t));
-    });
+    const matches: Array<{ df: OecdDataflow; matchedIn: 'name' | 'description' | 'both' }> = [];
+    for (const df of dataflows) {
+      const name = df.name.toLowerCase();
+      const description = df.description?.toLowerCase() ?? '';
+      if (!tokens.every((t) => name.includes(t) || description.includes(t))) continue;
+      const inName = tokens.every((t) => name.includes(t));
+      const inDescription = tokens.every((t) => description.includes(t));
+      // 'both' covers two shapes: each field carries every token on its own, and
+      // neither does because the tokens are split across them.
+      const matchedIn =
+        inName && !inDescription ? 'name' : inDescription && !inName ? 'description' : 'both';
+      matches.push({ df, matchedIn });
+    }
 
+    // Keyed to the raw match count, before offset — an offset past the end is an
+    // empty page, not an absent dataset.
     if (matches.length === 0) {
       throw ctx.fail(
         'no_match',
@@ -127,41 +207,48 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       );
     }
 
-    const limited = matches.slice(0, input.limit);
+    const page = matches.slice(input.offset, input.offset + input.limit);
     ctx.log.info('Dataflow search complete', {
       totalMatches: matches.length,
-      returned: limited.length,
+      returned: page.length,
+      offset: input.offset,
     });
 
-    // Disclose the full match count when the limit capped the returned list.
-    if (matches.length > limited.length) {
+    // Disclose the full match count when matches remain beyond the returned page.
+    if (input.offset + page.length < matches.length) {
       ctx.enrich.total(matches.length);
     }
 
     return {
-      dataflows: limited.map((df) => ({
+      dataflows: page.map(({ df, matchedIn }) => ({
         flow_ref: df.flowRef,
         agency_id: df.agencyId,
         name: df.name,
+        ...(df.description ? { description: truncateDescription(df.description) } : {}),
+        matched_in: matchedIn,
         non_production: df.nonProduction,
       })),
-      result_count: limited.length,
+      result_count: page.length,
       total_matches: matches.length,
+      offset: input.offset,
       source: 'OECD' as const,
     };
   },
 
   format: (result) => {
     const lines = [
-      `**OECD Dataflow Search** — ${result.result_count} results` +
-        (result.total_matches > result.result_count
-          ? ` (${result.total_matches} total matches, showing first ${result.result_count})`
-          : ''),
+      `**OECD Dataflow Search** — ${result.result_count} of ${result.total_matches} matches, ` +
+        `starting at offset ${result.offset}`,
       '',
-      ...result.dataflows.map(
-        (df) =>
-          `- **${df.flow_ref}** (non_production: ${df.non_production})\n  ${df.name}\n  Agency: ${df.agency_id}`,
-      ),
+      ...result.dataflows.map((df) => {
+        const entry = [
+          `- **${df.flow_ref}** (non_production: ${df.non_production}, matched_in: ${df.matched_in})`,
+          `  ${df.name}`,
+          `  Agency: ${df.agency_id}`,
+        ];
+        if (df.description) entry.push(`  ${df.description}`);
+        return entry.join('\n');
+      }),
       '',
       `Source: ${result.source}`,
     ];

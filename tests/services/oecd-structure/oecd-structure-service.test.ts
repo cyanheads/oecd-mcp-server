@@ -3,10 +3,13 @@
  * @module tests/services/oecd-structure/oecd-structure-service.test
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { JsonRpcErrorCode, McpError, notFound } from '@cyanheads/mcp-ts-core/errors';
+import { createFetchMock } from '@cyanheads/mcp-ts-core/testing';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   getStructureService,
   initStructureService,
+  isDataflowNotFound,
   OecdStructureService,
   parseFlowRef,
 } from '@/services/oecd-structure/oecd-structure-service.js';
@@ -77,6 +80,36 @@ const MOCK_DATAFLOWS_RESPONSE = {
   },
 };
 
+// OECD ships `description` as authored HTML, either as a plain string or a
+// `{lang: text}` map, and omits it entirely for part of the catalog.
+const MOCK_DESCRIBED_DATAFLOWS_RESPONSE = {
+  data: {
+    dataflows: [
+      {
+        agencyID: 'OECD.SDD.NAD',
+        id: 'DSD_QNA@DF_QNA',
+        name: 'Quarterly National Accounts',
+        description:
+          '<p>Quarterly national accounts.</p><br><p>See the <a href="https://oecd.org">OECD methodology</a>&nbsp;&amp; notes&nbsp;&ndash; updated 2026.</p>',
+        annotations: [],
+      },
+      {
+        agencyID: 'OECD.ELS.SPD',
+        id: 'DSD_EMP@DF_EMP',
+        name: { en: 'Employment' },
+        description: { en: '<strong>Employment</strong> indicators by region.' },
+        annotations: [],
+      },
+      {
+        agencyID: 'OECD.SDD',
+        id: 'DSD_BARE@DF_BARE',
+        name: 'Undocumented flow',
+        annotations: [],
+      },
+    ],
+  },
+};
+
 describe('OecdStructureService.fetchDataflows', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -123,15 +156,201 @@ describe('OecdStructureService.fetchDataflows', () => {
   it('throws ServiceUnavailable when fetch fails', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue({
-        ok: false,
-        status: 503,
-        text: () => Promise.resolve('Service Unavailable'),
-      }),
+      vi.fn().mockResolvedValue(new Response('Service Unavailable', { status: 503 })),
     );
 
     const svc = new OecdStructureService('https://fake.oecd.test');
-    await expect(svc.fetchDataflows()).rejects.toThrow();
+    await expect(svc.fetchDataflows()).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+    });
+  });
+
+  it('carries the dataflow description through as plain text', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(Response.json(MOCK_DESCRIBED_DATAFLOWS_RESPONSE)),
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const flows = await svc.fetchDataflows();
+
+    // HTML tags become whitespace and named entities are decoded.
+    expect(flows[0]?.description).toBe(
+      'Quarterly national accounts. See the OECD methodology & notes – updated 2026.',
+    );
+    // Localized-map form is read the same way as the plain-string form.
+    expect(flows[1]?.description).toBe('Employment indicators by region.');
+    // A dataflow OECD publishes without a description carries none.
+    expect(flows[2]).not.toHaveProperty('description');
+  });
+});
+
+// ── Retry classification ──────────────────────────────────────────────────────
+
+describe('OecdStructureService retry classification', () => {
+  const http = createFetchMock();
+
+  beforeEach(() => {
+    http.reset();
+    http.install();
+  });
+
+  afterEach(() => {
+    http.restore();
+  });
+
+  it('does not retry a 404 and surfaces it as a not-found error', async () => {
+    http.route({
+      match: 'https://fake.oecd.test/dataflow/OECD.ELS',
+      respond: () => new Response('Could not find requested structures', { status: 404 }),
+    });
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const error = await svc.fetchDataflows('OECD.ELS').catch((e: Error) => e);
+
+    expect(http.calls).toHaveLength(1);
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.NotFound });
+    expect(isDataflowNotFound(error as Error)).toBe(true);
+  });
+
+  it('retries a 5xx and succeeds when the upstream recovers', async () => {
+    http.route(
+      {
+        match: 'https://fake.oecd.test/dataflow',
+        once: true,
+        respond: () => new Response('upstream boom', { status: 503 }),
+      },
+      {
+        match: 'https://fake.oecd.test/dataflow',
+        respond: () => Response.json(MOCK_DATAFLOWS_RESPONSE),
+      },
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const flows = await svc.fetchDataflows();
+
+    expect(http.calls).toHaveLength(2);
+    expect(flows).toHaveLength(3);
+  });
+
+  it('does not retry a 404 on the codelist endpoint either', async () => {
+    http.route({
+      match: 'https://fake.oecd.test/codelist/OECD/CL_MISSING',
+      respond: () => new Response('Could not find requested structures', { status: 404 }),
+    });
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    await expect(svc.fetchCodelist('OECD', 'CL_MISSING')).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+    });
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it('retries a 500 instead of reporting it as an internal fault', async () => {
+    http.route(
+      {
+        match: 'https://fake.oecd.test/dataflow',
+        once: true,
+        respond: () => new Response('upstream boom', { status: 500 }),
+      },
+      {
+        match: 'https://fake.oecd.test/dataflow',
+        respond: () => Response.json(MOCK_DATAFLOWS_RESPONSE),
+      },
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const flows = await svc.fetchDataflows();
+
+    expect(http.calls).toHaveLength(2);
+    expect(flows).toHaveLength(3);
+  });
+
+  it('surfaces a persistent 500 as an upstream outage', async () => {
+    http.route({
+      match: 'https://fake.oecd.test/dataflow',
+      respond: () => new Response('upstream boom', { status: 500 }),
+    });
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    await expect(svc.fetchDataflows()).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+    });
+    expect(http.calls).toHaveLength(3);
+  });
+
+  it('waits before retrying a throttled request that asks to retry immediately', async () => {
+    // OECD answers a throttled request with `Retry-After: 0`. Taken at face
+    // value the retry lands within a millisecond and is refused again, so the
+    // attempt is spent before the seconds-long throttle window can clear.
+    http.route(
+      {
+        match: 'https://fake.oecd.test/dataflow',
+        once: true,
+        respond: () =>
+          new Response('You have exceeded the number of requests currently permitted', {
+            status: 429,
+            headers: { 'retry-after': '0' },
+          }),
+      },
+      {
+        match: 'https://fake.oecd.test/dataflow',
+        respond: () => Response.json(MOCK_DATAFLOWS_RESPONSE),
+      },
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const started = performance.now();
+    const flows = await svc.fetchDataflows();
+
+    expect(http.calls).toHaveLength(2);
+    expect(flows).toHaveLength(3);
+    expect(performance.now() - started).toBeGreaterThan(500);
+  }, 10_000);
+
+  it('still honors a Retry-After that names a real wait', async () => {
+    http.route({
+      match: 'https://fake.oecd.test/dataflow',
+      respond: () =>
+        new Response('slow down', { status: 429, headers: { 'retry-after': '99999' } }),
+    });
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    // A wait past the retry budget is surfaced at once rather than burning attempts.
+    await expect(svc.fetchDataflows()).rejects.toMatchObject({
+      code: JsonRpcErrorCode.RateLimited,
+    });
+    expect(http.calls).toHaveLength(1);
+  });
+});
+
+// ── isDataflowNotFound ────────────────────────────────────────────────────────
+
+describe('isDataflowNotFound', () => {
+  it('finds a not-found buried under a wrapper that carries a different code', () => {
+    const wrapped = new McpError(
+      JsonRpcErrorCode.ServiceUnavailable,
+      'Failed to fetch OECD datastructure for OECD.SDD.NAD,DSD_GONE@DF_GONE',
+      {},
+      { cause: notFound('DataStructure not found') },
+    );
+
+    expect(isDataflowNotFound(wrapped)).toBe(true);
+  });
+
+  it('does not claim a not-found for an unrelated failure', () => {
+    expect(
+      isDataflowNotFound(
+        new McpError(
+          JsonRpcErrorCode.ServiceUnavailable,
+          'upstream boom',
+          {},
+          {
+            cause: new Error('socket hang up'),
+          },
+        ),
+      ),
+    ).toBe(false);
   });
 });
 

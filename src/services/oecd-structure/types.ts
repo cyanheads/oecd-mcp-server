@@ -7,6 +7,11 @@
 export interface OecdDataflow {
   /** Agency identifier — e.g. `OECD.SDD.NAD`. */
   agencyId: string;
+  /**
+   * Full abstract as plain text. OECD publishes it as HTML; tags and entities are
+   * resolved at parse time. Absent for the dataflows OECD ships without one.
+   */
+  description?: string | undefined;
   /** Datastructure identifier — e.g. `DSD_NAAG`. */
   dsdId: string;
   /** Dataflow identifier — e.g. `DF_NAAG_I`. */

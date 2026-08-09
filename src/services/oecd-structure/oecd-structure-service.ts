@@ -3,8 +3,13 @@
  * @module services/oecd-structure/oecd-structure-service
  */
 
-import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
-import { withRetry } from '@cyanheads/mcp-ts-core/utils';
+import {
+  JsonRpcErrorCode,
+  McpError,
+  notFound,
+  serviceUnavailable,
+} from '@cyanheads/mcp-ts-core/errors';
+import { fetchWithTimeout, requestContextService, withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import type {
   OecdCode,
@@ -50,38 +55,73 @@ export function parseFlowRef(flowRef: string): {
   return { agencyId, dsdId, dfId };
 }
 
-/** Percent-encode `@` in flow ID for use in URL path segments. */
-function encodeFlowId(dfId: string): string {
-  return dfId.replace('@', '%40');
+/**
+ * Reconcile an upstream HTTP failure with what `withRetry` treats as transient.
+ *
+ * Two of OECD's responses are otherwise taken at face value and shouldn't be:
+ * a throttled request comes back `429 Retry-After: 0`, and the honored hint
+ * collapses the backoff so all three attempts fire inside a few milliseconds
+ * and every one is refused; and HTTP 500 maps to `InternalError`, which is
+ * terminal, so a server-side fault fails without a single retry. Dropping the
+ * empty hint and restating a 5xx as `ServiceUnavailable` puts both back on the
+ * exponential backoff, which is what clears OECD's seconds-long throttle window.
+ */
+function retryableUpstreamFailure(err: unknown): unknown {
+  if (!(err instanceof McpError)) return err;
+  const { retryAfter, ...withoutHint } = err.data ?? {};
+  const emptyHint = typeof retryAfter === 'string' && /^0+$/.test(retryAfter.trim());
+  const status = err.data?.status;
+  const code =
+    err.code === JsonRpcErrorCode.InternalError && typeof status === 'number' && status >= 500
+      ? JsonRpcErrorCode.ServiceUnavailable
+      : err.code;
+  if (!emptyHint && code === err.code) return err;
+  return new McpError(code, err.message, emptyHint ? withoutHint : err.data, { cause: err });
 }
 
+/**
+ * Fetch and decode one structure endpoint.
+ *
+ * `fetchWithTimeout` maps the HTTP status onto the error code, and only
+ * `ServiceUnavailable`, `Timeout`, and `RateLimited` are transient — so 404
+ * becomes a terminal `NotFound` and a typo'd identifier never enters the retry
+ * loop, while 408, 429, and 5xx still get their attempts.
+ */
 async function fetchJson(url: string, signal?: AbortSignal): Promise<unknown> {
   const config = getServerConfig();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
-  const combinedSignal = signal
-    ? (() => {
-        const ac = new AbortController();
-        signal.addEventListener('abort', () => ac.abort());
-        controller.signal.addEventListener('abort', () => ac.abort());
-        return ac.signal;
-      })()
-    : controller.signal;
-
-  try {
-    const res = await fetch(url, {
+  const res = await fetchWithTimeout(
+    url,
+    config.timeoutMs,
+    requestContextService.createRequestContext({ operation: 'oecdStructureFetch' }),
+    {
       headers: { Accept: STRUCTURE_ACCEPT, 'Accept-Language': ACCEPT_LANGUAGE },
-      signal: combinedSignal,
-    });
-    if (!res.ok) {
-      throw serviceUnavailable(`OECD structure API returned HTTP ${res.status}`, {
-        status: res.status,
-      });
+      // An unknown agency or dataflow is a caller mistake, not a server fault.
+      expectedStatuses: [404],
+      ...(signal ? { signal } : {}),
+    },
+  ).catch((err: unknown) => {
+    throw retryableUpstreamFailure(err);
+  });
+  return res.json() as Promise<unknown>;
+}
+
+/**
+ * Retry a structure fetch and label the failure with the call that produced it,
+ * preserving the upstream classification so a terminal 4xx does not resurface as
+ * a transient outage.
+ */
+function fetchStructureJson(
+  url: string,
+  failureMessage: string,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  const retryOpts = { maxRetries: 2, ...(signal ? { signal } : {}) };
+  return withRetry(() => fetchJson(url, signal), retryOpts).catch((err: unknown) => {
+    if (err instanceof McpError) {
+      throw new McpError(err.code, failureMessage, err.data, { cause: err });
     }
-    return res.json() as Promise<unknown>;
-  } finally {
-    clearTimeout(timeout);
-  }
+    throw serviceUnavailable(failureMessage, {}, { cause: err });
+  });
 }
 
 let _instance: OecdStructureService | undefined;
@@ -99,19 +139,19 @@ export class OecdStructureService {
    * Uses `GET /dataflow/{agencyID}` or `GET /dataflow` for all agencies.
    */
   async fetchDataflows(agencyId?: string, signal?: AbortSignal): Promise<OecdDataflow[]> {
+    // agencyId comes straight from caller input. A value outside the SDMX
+    // character set cannot name any agency, so it is a not-found — never a
+    // transient failure the caller should retry.
     if (agencyId !== undefined && !SDMX_ID_SAFE.test(agencyId)) {
-      throw serviceUnavailable(`Invalid agency identifier: ${agencyId}`, { agencyId });
+      throw notFound(`Invalid agency identifier: ${agencyId}`, { agencyId });
     }
     const url = agencyId ? `${this.baseUrl}/dataflow/${agencyId}` : `${this.baseUrl}/dataflow`;
 
-    const retryOpts = signal ? { maxRetries: 2, signal } : { maxRetries: 2 };
-    const data = await withRetry(() => fetchJson(url, signal), retryOpts).catch((err: unknown) => {
-      throw serviceUnavailable(
-        `Failed to fetch OECD dataflows${agencyId ? ` for agency ${agencyId}` : ''}`,
-        {},
-        { cause: err },
-      );
-    });
+    const data = await fetchStructureJson(
+      url,
+      `Failed to fetch OECD dataflows${agencyId ? ` for agency ${agencyId}` : ''}`,
+      signal,
+    );
 
     return parseDataflows(data);
   }
@@ -127,14 +167,11 @@ export class OecdStructureService {
     }
     const url = `${this.baseUrl}/datastructure/${parts.agencyId}/${parts.dsdId}`;
 
-    const retryOpts = signal ? { maxRetries: 2, signal } : { maxRetries: 2 };
-    const data = await withRetry(() => fetchJson(url, signal), retryOpts).catch((err: unknown) => {
-      throw serviceUnavailable(
-        `Failed to fetch OECD datastructure for ${flowRef}`,
-        {},
-        { cause: err },
-      );
-    });
+    const data = await fetchStructureJson(
+      url,
+      `Failed to fetch OECD datastructure for ${flowRef}`,
+      signal,
+    );
 
     return parseDataStructure(data, flowRef, parts.agencyId, parts.dsdId);
   }
@@ -158,14 +195,11 @@ export class OecdStructureService {
     }
     const url = `${this.baseUrl}/codelist/${agencyId}/${codelistId}`;
 
-    const retryOpts = signal ? { maxRetries: 2, signal } : { maxRetries: 2 };
-    const data = await withRetry(() => fetchJson(url, signal), retryOpts).catch((err: unknown) => {
-      throw serviceUnavailable(
-        `Failed to fetch OECD codelist ${agencyId}/${codelistId}`,
-        {},
-        { cause: err },
-      );
-    });
+    const data = await fetchStructureJson(
+      url,
+      `Failed to fetch OECD codelist ${agencyId}/${codelistId}`,
+      signal,
+    );
 
     return parseCodelist(data);
   }
@@ -182,6 +216,54 @@ export function getStructureService(): OecdStructureService {
 }
 
 // ── Parsers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Named character references that appear in OECD dataflow descriptions, plus the
+ * partners of the ones that do (`lt`, `mdash`). Numeric references do not occur
+ * in the catalog and are left alone.
+ */
+const HTML_ENTITIES: Record<string, string> = {
+  amp: '&',
+  apos: "'",
+  bull: '•',
+  deg: '°',
+  eacute: 'é',
+  gt: '>',
+  laquo: '«',
+  ldquo: '“',
+  lsquo: '‘',
+  lt: '<',
+  mdash: '—',
+  nbsp: ' ',
+  ndash: '–',
+  ocirc: 'ô',
+  quot: '"',
+  raquo: '»',
+  rdquo: '”',
+  rsquo: '’',
+  uuml: 'ü',
+};
+
+/**
+ * Reduce an OECD description to plain text. The catalog copy is authored HTML —
+ * paragraphs, lists, anchors, and headings — so tags become whitespace and the
+ * named entities OECD uses are resolved. Tags are removed before entities are
+ * decoded so a decoded `&lt;` can never form a new tag.
+ */
+function stripHtml(html: string): string {
+  return html
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&([a-zA-Z]+);/g, (match, name: string) => HTML_ENTITIES[name.toLowerCase()] ?? match)
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Read an OECD localized string field, which is either a plain string or a `{lang: text}` map. */
+function localizedString(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  if (value && typeof value === 'object') return Object.values(value as Record<string, string>)[0];
+  return;
+}
 
 /**
  * Extract the DSD identifier from the structure URN.
@@ -225,9 +307,12 @@ function parseDataflows(data: unknown): OecdDataflow[] {
       flowId = rawId;
     }
 
-    const nameProp = f.name as Record<string, string> | string | undefined;
-    const name =
-      typeof nameProp === 'string' ? nameProp : (Object.values(nameProp ?? {})[0] ?? rawId);
+    const name = localizedString(f.name) ?? rawId;
+
+    // OECD ships the abstract as HTML; store it as plain text so search and
+    // rendering both work on the same value.
+    const rawDescription = localizedString(f.description);
+    const description = rawDescription ? stripHtml(rawDescription) : undefined;
 
     // Check for NonProductionDataflow annotation
     const annotations = (f.annotations ?? []) as Array<Record<string, unknown>>;
@@ -239,6 +324,7 @@ function parseDataflows(data: unknown): OecdDataflow[] {
       flowId,
       dsdId,
       name: String(name),
+      ...(description ? { description } : {}),
       nonProduction,
     };
   });
@@ -256,7 +342,7 @@ function parseDataStructure(
 
   const dsd = rawDsds[0];
   if (!dsd) {
-    throw new Error(`DataStructure not found for ${flowRef}`);
+    throw notFound(`DataStructure not found for ${flowRef}`, { flowRef });
   }
 
   const components = dsd.dataStructureComponents as Record<string, unknown> | undefined;
@@ -273,11 +359,7 @@ function parseDataStructure(
 
   const dimensions = rawDims
     .map((d): OecdDimension => {
-      const nameProp = d.name as Record<string, string> | string | undefined;
-      const name =
-        typeof nameProp === 'string'
-          ? nameProp
-          : (Object.values(nameProp ?? {})[0] ?? String(d.id ?? ''));
+      const name = localizedString(d.name) ?? String(d.id ?? '');
 
       // Codelist reference sits inside localRepresentation.enumeration, which
       // is a string URN: "urn:sdmx:...=AGENCY:CL_ID(version)".
@@ -313,11 +395,7 @@ function parseDataStructure(
 
   let timeDimension: OecdTimeDimension | undefined;
   if (rawTimeDim) {
-    const nameProp = rawTimeDim.name as Record<string, string> | string | undefined;
-    const name =
-      typeof nameProp === 'string'
-        ? nameProp
-        : (Object.values(nameProp ?? {})[0] ?? String(rawTimeDim.id ?? 'TIME_PERIOD'));
+    const name = localizedString(rawTimeDim.name) ?? String(rawTimeDim.id ?? 'TIME_PERIOD');
     timeDimension = {
       id: String(rawTimeDim.id ?? 'TIME_PERIOD'),
       name: String(name),
@@ -343,28 +421,23 @@ function parseCodelist(data: unknown): OecdCode[] {
   if (!cl) return [];
 
   const rawCodes = (cl.codes ?? []) as Array<Record<string, unknown>>;
-  return rawCodes.map((c): OecdCode => {
-    const nameProp = c.name as Record<string, string> | string | undefined;
-    const name =
-      typeof nameProp === 'string'
-        ? nameProp
-        : (Object.values(nameProp ?? {})[0] ?? String(c.id ?? ''));
-    return { id: String(c.id ?? ''), name: String(name) };
-  });
+  return rawCodes.map(
+    (c): OecdCode => ({
+      id: String(c.id ?? ''),
+      name: localizedString(c.name) ?? String(c.id ?? ''),
+    }),
+  );
 }
 
 /**
- * Returns true when an error (or its cause chain) signals that a datastructure
- * or dataflow was not found — matches messages thrown by `parseDataStructure` and
- * HTTP 404 responses from `fetchJson`. Used by tool handlers to map service errors
- * to the typed `dataflow_not_found` contract entry.
+ * Returns true when an error (or its cause chain) signals that an agency,
+ * dataflow, or datastructure was not found. Both sources are structural: an
+ * upstream HTTP 404 arrives as `NotFound` from `fetchWithTimeout`, and an empty
+ * `dataStructures` array is thrown as `notFound()` by `parseDataStructure`. Tool
+ * handlers use it to map service errors onto their typed not-found contract entry.
  */
 export function isDataflowNotFound(e: Error): boolean {
-  const msg = e.message ?? '';
-  if (msg.includes('DataStructure not found') || msg.includes('HTTP 404')) return true;
-  const cause = (e as NodeJS.ErrnoException).cause;
+  if (e instanceof McpError && e.code === JsonRpcErrorCode.NotFound) return true;
+  const cause = (e as { cause?: unknown }).cause;
   return cause instanceof Error ? isDataflowNotFound(cause) : false;
 }
-
-// Export encode helper for use in tool URL construction
-export { encodeFlowId };
