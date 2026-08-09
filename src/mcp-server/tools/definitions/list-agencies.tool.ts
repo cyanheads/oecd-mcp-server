@@ -1,16 +1,19 @@
 /**
- * @fileoverview oecd_list_agencies — list OECD SDMX agencies and their dataflow counts.
+ * @fileoverview oecd_list_agencies — list OECD SDMX agencies with their directorate and dataflow count.
  * @module mcp-server/tools/definitions/list-agencies.tool
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { getStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
+import {
+  directorateCode,
+  getStructureService,
+} from '@/services/oecd-structure/oecd-structure-service.js';
 import type { OecdDataflow } from '@/services/oecd-structure/types.js';
 
 export const oecdListAgencies = tool('oecd_list_agencies', {
   description:
-    'List OECD SDMX agencies and the number of dataflows each publishes. ' +
+    'List OECD SDMX agencies, the directorate each belongs to, and the number of dataflows each publishes. ' +
     'Use to discover agency IDs before filtering oecd_search_datasets by department.',
   annotations: {
     readOnlyHint: true,
@@ -24,9 +27,18 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
         z
           .object({
             agency_id: z.string().describe('Agency identifier — e.g. OECD.SDD.NAD.'),
+            directorate: z
+              .string()
+              .optional()
+              .describe(
+                'Name of the OECD directorate the agency sits in, resolved from the ' +
+                  'directorate segment of the identifier — OECD.SDD.NAD is "Statistics and Data ' +
+                  'Directorate". Absent for a publisher outside OECD and when the agency scheme ' +
+                  'could not be reached.',
+              ),
             dataflow_count: z.number().describe('Number of dataflows published by this agency.'),
           })
-          .describe('An agency and its dataflow count.'),
+          .describe('An agency, its directorate, and its dataflow count.'),
       )
       .describe('Agencies and their dataflow counts, sorted descending by count.'),
     total_agencies: z.number().describe('Total number of distinct agencies.'),
@@ -45,6 +57,19 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
 
   async handler(_input, ctx) {
     ctx.log.info('Fetching all OECD dataflows to tally agencies');
+
+    // Independent of the catalog fetch, and not load-bearing: the agency list
+    // stands on its own, so a degraded scheme costs the directorate labels
+    // rather than the whole call.
+    const directoratesPromise = getStructureService()
+      .fetchDirectorates(ctx.signal)
+      .catch((err: unknown) => {
+        ctx.log.warning('OECD agency scheme unavailable — listing agencies without directorates', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return new Map<string, string>();
+      });
+
     let dataflows: OecdDataflow[];
     try {
       dataflows = await getStructureService().fetchDataflows(undefined, ctx.signal);
@@ -57,6 +82,8 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
       );
     }
 
+    const directorates = await directoratesPromise;
+
     // Aggregate by agency
     const counts = new Map<string, number>();
     for (const df of dataflows) {
@@ -64,7 +91,11 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
     }
 
     const agencies = [...counts.entries()]
-      .map(([agency_id, dataflow_count]) => ({ agency_id, dataflow_count }))
+      .map(([agency_id, dataflow_count]) => {
+        const code = directorateCode(agency_id);
+        const directorate = code ? directorates.get(code) : undefined;
+        return { agency_id, ...(directorate ? { directorate } : {}), dataflow_count };
+      })
       .sort((a, b) => b.dataflow_count - a.dataflow_count);
 
     ctx.log.info('Agency list built', {
@@ -84,9 +115,11 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
     const lines = [
       `**OECD Agencies** (${result.total_agencies} agencies, ${result.total_dataflows} total dataflows)`,
       '',
-      '| Agency | Dataflows |',
-      '|--------|-----------|',
-      ...result.agencies.map((a) => `| ${a.agency_id} | ${a.dataflow_count} |`),
+      '| Agency | Directorate | Dataflows |',
+      '|--------|-------------|-----------|',
+      ...result.agencies.map(
+        (a) => `| ${a.agency_id} | ${a.directorate ?? '—'} | ${a.dataflow_count} |`,
+      ),
       '',
       `Source: ${result.source}`,
     ];

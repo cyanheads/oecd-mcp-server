@@ -4,8 +4,8 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createFetchMock, createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdListAgencies } from '@/mcp-server/tools/definitions/list-agencies.tool.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
 
@@ -88,8 +88,12 @@ describe('oecdListAgencies', () => {
   it('formats output with agency table and totals', () => {
     const output = {
       agencies: [
-        { agency_id: 'OECD.SDD.NAD', dataflow_count: 500 },
-        { agency_id: 'OECD.EDU.IMEP', dataflow_count: 100 },
+        {
+          agency_id: 'OECD.SDD.NAD',
+          directorate: 'Statistics and Data Directorate',
+          dataflow_count: 500,
+        },
+        { agency_id: 'ESTAT', dataflow_count: 100 },
       ],
       total_agencies: 2,
       total_dataflows: 600,
@@ -99,9 +103,110 @@ describe('oecdListAgencies', () => {
     expect(blocks).toHaveLength(1);
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('OECD.SDD.NAD');
+    expect(text).toContain('Statistics and Data Directorate');
     expect(text).toContain('500');
-    expect(text).toContain('OECD.EDU.IMEP');
+    expect(text).toContain('ESTAT');
     expect(text).toContain('600');
     expect(text).toContain('Source: OECD');
+  });
+});
+
+// ── Directorates ──────────────────────────────────────────────────────────────
+
+const AGENCY_SCHEME_RESPONSE = {
+  data: {
+    agencySchemes: [
+      {
+        agencies: [
+          { id: 'SDD', name: { en: 'Statistics and Data Directorate' } },
+          { id: 'EDU', name: 'Directorate for Education and Skills' },
+        ],
+      },
+    ],
+  },
+};
+
+/** `ESTAT` ships dataflows through the same catalog but is not an OECD agency. */
+const MIXED_PUBLISHER_DATAFLOWS = {
+  data: {
+    dataflows: [
+      { agencyID: 'OECD.SDD.NAD', id: 'DSD_NAAG@DF_NAAG_I', name: 'National Accounts' },
+      { agencyID: 'OECD.EDU.IMEP', id: 'DSD_SPI@DF_SPI', name: 'SPI' },
+      { agencyID: 'ESTAT', id: 'SEEA_AEA_A', name: 'Air emissions accounts' },
+    ],
+  },
+};
+
+describe('oecdListAgencies directorates', () => {
+  const http = createFetchMock();
+
+  beforeEach(() => {
+    http.reset();
+    http.install();
+    process.env.OECD_BASE_URL = FAKE_BASE;
+    process.env.OECD_TIMEOUT_MS = '5000';
+    initStructureService();
+  });
+
+  afterEach(() => {
+    http.restore();
+  });
+
+  function routeDataflows(): void {
+    http.route({
+      match: `${FAKE_BASE}/dataflow`,
+      respond: () => Response.json(MIXED_PUBLISHER_DATAFLOWS),
+    });
+  }
+
+  it('names the directorate each agency reports to', async () => {
+    http.route({
+      match: `${FAKE_BASE}/agencyscheme/OECD`,
+      respond: () => Response.json(AGENCY_SCHEME_RESPONSE),
+    });
+    routeDataflows();
+
+    const ctx = createMockContext({ errors: oecdListAgencies.errors });
+    const result = await oecdListAgencies.handler({}, ctx);
+
+    expect(result.agencies).toContainEqual({
+      agency_id: 'OECD.SDD.NAD',
+      directorate: 'Statistics and Data Directorate',
+      dataflow_count: 1,
+    });
+    expect(result.agencies).toContainEqual({
+      agency_id: 'OECD.EDU.IMEP',
+      directorate: 'Directorate for Education and Skills',
+      dataflow_count: 1,
+    });
+  });
+
+  it('leaves a publisher with no directorate segment unlabelled rather than wrong or blank', async () => {
+    http.route({
+      match: `${FAKE_BASE}/agencyscheme/OECD`,
+      respond: () => Response.json(AGENCY_SCHEME_RESPONSE),
+    });
+    routeDataflows();
+
+    const ctx = createMockContext({ errors: oecdListAgencies.errors });
+    const result = await oecdListAgencies.handler({}, ctx);
+
+    const estat = result.agencies.find((a) => a.agency_id === 'ESTAT');
+    expect(estat).toEqual({ agency_id: 'ESTAT', dataflow_count: 1 });
+    expect(estat).not.toHaveProperty('directorate');
+  });
+
+  it('still returns the agency list when the agency scheme is unreachable', async () => {
+    http.route({
+      match: `${FAKE_BASE}/agencyscheme/OECD`,
+      respond: () => new Response('upstream boom', { status: 503 }),
+    });
+    routeDataflows();
+
+    const ctx = createMockContext({ errors: oecdListAgencies.errors });
+    const result = await oecdListAgencies.handler({}, ctx);
+
+    expect(result.total_agencies).toBe(3);
+    expect(result.agencies.every((a) => a.directorate === undefined)).toBe(true);
   });
 });
