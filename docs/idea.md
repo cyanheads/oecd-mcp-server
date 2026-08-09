@@ -32,7 +32,7 @@ composes-with: worldbank-mcp-server, eurostat-mcp-server, imf-mcp-server, un-com
 
 # oecd-mcp-server
 
-OECD statistics as a workflow server over the OECD's SDMX REST API. The OECD publishes thousands of dataflows — GDP and national accounts, employment, inflation (CPI/PPI), trade, education (PISA), health, environment, productivity, taxation, inequality — across its member and partner economies, **keyless** via the SDMX 2.1 API that backs the OECD Data Explorer.
+OECD statistics as a workflow server over the OECD's SDMX REST API. The OECD publishes thousands of dataflows — GDP and national accounts, employment, inflation (CPI/PPI), trade, education, health, environment, productivity, taxation, inequality — across its member and partner economies, **keyless** via the SDMX 2.1 API that backs the OECD Data Explorer.
 
 The fleet's international-statistics coverage spans `worldbank` (development indicators), `eurostat` (EU), `imf` (idea — macro/financial), `un-comtrade` (trade flows), and `who-gho` (health) — but the **OECD**, the canonical source for comparative data across advanced economies (and the home of PISA, the Better Life Index, and standardized productivity/tax/inequality series), has no coverage. It's the missing peer to `worldbank`/`eurostat`.
 
@@ -42,7 +42,7 @@ The fleet's international-statistics coverage spans `worldbank` (development ind
 
 | Concept | What it is |
 |:--------|:-----------|
-| **Dataflow** | A dataset (national accounts, PISA, etc.), addressed by an agency-qualified ID. Primary discovery target. |
+| **Dataflow** | A dataset (national accounts, air emissions, etc.), addressed by an agency-qualified ID. Primary discovery target. |
 | **Dimensions** | The axes of a dataflow (reference area, measure, unit, time) — they define the query key. |
 | **Codelists** | Valid values per dimension (country codes, measure codes) — resolve human terms to codes before querying. |
 | **Observations** | The actual data points returned for a dimension key + time range. |

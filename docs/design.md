@@ -30,7 +30,7 @@ None. The server is data-oriented; workflow guidance belongs in tool description
 
 OECD statistics as a workflow server over the OECD SDMX 2.1 REST API (`sdmx.oecd.org/public/rest`). The API is keyless and returns SDMX-JSON (`application/vnd.sdmx.data+json;version=2.0` for data, `application/vnd.sdmx.structure+json;version=1.0` for structural metadata).
 
-The OECD publishes 1,510+ dataflows across 20+ statistical departments — national accounts, employment, inflation, trade, education (PISA), health, environment, taxation, inequality — for its 38 member economies and dozens of partner countries. This server exposes the full discovery-to-data workflow: find a dataset, inspect its dimensions, resolve codes, and pull observations.
+The OECD publishes 1,510+ dataflows across 20+ statistical departments — national accounts, employment, inflation, trade, education, health, environment, taxation, inequality — for its 38 member economies and dozens of partner countries. This server exposes the full discovery-to-data workflow: find a dataset, inspect its dimensions, resolve codes, and pull observations.
 
 Target audience: economists, policy researchers, data journalists, and agents answering comparative questions across OECD economies.
 

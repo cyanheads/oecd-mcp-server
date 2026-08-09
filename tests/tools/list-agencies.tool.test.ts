@@ -44,10 +44,11 @@ const DATAFLOWS_RESPONSE = {
         annotations: [],
       },
       {
-        agencyID: 'OECD.EDU',
-        id: 'DSD_PISA@DF_PISA',
-        structure: 'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=OECD.EDU:DSD_PISA(1.0)',
-        name: 'PISA',
+        agencyID: 'OECD.EDU.IMEP',
+        id: 'DSD_SPI@DF_SPI',
+        structure:
+          'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=OECD.EDU.IMEP:DSD_SPI(1.0)',
+        name: 'SPI',
         annotations: [],
       },
     ],
@@ -70,9 +71,9 @@ describe('oecdListAgencies', () => {
     expect(result.source).toBe('OECD');
     expect(result.total_dataflows).toBe(3);
     expect(result.total_agencies).toBe(2);
-    // NAD has 2, EDU has 1 — sorted descending
+    // NAD has 2, EDU.IMEP has 1 — sorted descending
     expect(result.agencies[0]).toMatchObject({ agency_id: 'OECD.SDD.NAD', dataflow_count: 2 });
-    expect(result.agencies[1]).toMatchObject({ agency_id: 'OECD.EDU', dataflow_count: 1 });
+    expect(result.agencies[1]).toMatchObject({ agency_id: 'OECD.EDU.IMEP', dataflow_count: 1 });
   });
 
   it('throws ctx.fail(upstream_error) when fetch fails', async () => {
@@ -88,7 +89,7 @@ describe('oecdListAgencies', () => {
     const output = {
       agencies: [
         { agency_id: 'OECD.SDD.NAD', dataflow_count: 500 },
-        { agency_id: 'OECD.EDU', dataflow_count: 100 },
+        { agency_id: 'OECD.EDU.IMEP', dataflow_count: 100 },
       ],
       total_agencies: 2,
       total_dataflows: 600,
@@ -99,7 +100,7 @@ describe('oecdListAgencies', () => {
     const text = (blocks[0] as { text: string }).text;
     expect(text).toContain('OECD.SDD.NAD');
     expect(text).toContain('500');
-    expect(text).toContain('OECD.EDU');
+    expect(text).toContain('OECD.EDU.IMEP');
     expect(text).toContain('600');
     expect(text).toContain('Source: OECD');
   });

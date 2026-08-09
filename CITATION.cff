@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 title: oecd-mcp-server
-abstract: "Search, explore, and query 1,500+ OECD statistical datasets (national accounts, employment, trade, PISA, health) via SDMX via MCP. STDIO or Streamable HTTP."
+abstract: "Search, explore, and query 1,500+ OECD statistical datasets (national accounts, employment, trade, education, health) via SDMX via MCP. STDIO or Streamable HTTP."
 type: software
 authors:
   - family-names: Hand
