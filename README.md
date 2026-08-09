@@ -27,7 +27,7 @@ Five discovery and data tools plus two SQL analytics tools for large query resul
 
 | Tool | Description |
 |:-----|:------------|
-| `oecd_list_agencies` | List OECD SDMX agencies and the number of dataflows each publishes |
+| `oecd_list_agencies` | List OECD SDMX agencies with their directorate and the number of dataflows each publishes |
 | `oecd_search_datasets` | Search 1,500+ OECD dataflows by keyword or theme |
 | `oecd_get_dataset_info` | Fetch a dataflow's dimensions, key order, and codelist references |
 | `oecd_get_dimension_values` | Fetch valid codes and labels for one dimension (countries, measures, frequencies) |
@@ -40,6 +40,8 @@ Five discovery and data tools plus two SQL analytics tools for large query resul
 Entry point for discovery — enumerate OECD's statistical departments before searching.
 
 - Returns agency IDs (e.g. `OECD.SDD.NAD`, `OECD.ELS.SPD`, `OECD.EDU.IMEP`) and dataflow counts
+- Each agency carries the name of its directorate — `OECD.CTP.TPS` is the Centre for Tax Policy and Administration, `OECD.SDD.NAD` the Statistics and Data Directorate — so a department can be picked without decoding the identifier
+- Publishers outside OECD that ship dataflows through the same catalog (`ESTAT`, `IAEG-SDGs`) carry no directorate
 - Useful for scoping `oecd_search_datasets` by department (national accounts, labour, education, etc.)
 
 ---
@@ -52,8 +54,8 @@ Search the full catalog of 1,500+ OECD dataflows by keyword or department.
 - Each result reports `matched_in` (`name`, `description`, or `both`) and a plain-text description trimmed to 240 characters
 - Optional `agency_id` filter scopes results to a specific statistical department
 - `limit` (1–100) and `offset` page through the match list; `total_matches` reports the full count
-- Returns `flow_ref` values (e.g. `OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I`) — pass directly to `oecd_get_dataset_info` or `oecd_query_dataset`
-- Fetches and filters in-memory; the full catalog is ~800 KB and bounded (OECD adds datasets weekly, not continuously)
+- Returns `flow_ref` values (e.g. `OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I`) — pass directly to `oecd_get_dataset_info` or `oecd_query_dataset`. A handful of dataflows are catalogued without a datastructure prefix and come back in the bare `{agencyID},{df_id}` form (`OECD.TAD.ARP,DF_AEI2024_DASHBOARD`); both forms are accepted everywhere a `flow_ref` is
+- Fetches and filters in-memory; the full catalog is ~5.9 MB and bounded (OECD adds datasets weekly, not continuously)
 
 ---
 
@@ -62,8 +64,10 @@ Search the full catalog of 1,500+ OECD dataflows by keyword or department.
 Inspect a dataflow's structure before querying.
 
 - Returns all dimensions in key order (position 1, 2, 3 …) — dimension order is required to construct the dot-delimited key for `oecd_query_dataset`
+- Each dimension carries its concept name from the datastructure's concept scheme, so `INSTR_ASSET` reads as "Financial instruments and non-financial assets" rather than repeating the id. A dimension the scheme does not cover keeps the id
 - Shows codelist references for each dimension — pass to `oecd_get_dimension_values` to resolve human-readable names to SDMX codes
 - Surfaces `NonProductionDataflow` flag — marks experimental or deprecated dataflows
+- Resolves a `flow_ref` whose id prefix names no datastructure of its own by asking the dataflow for its structure — `OECD.CFE.EDS,DSD_REG_LAB@DF_RATES` is backed by `DSD_REG_LABOUR`, and answers here rather than reporting the dataflow as missing
 - Required before calling `oecd_query_dataset` on an unfamiliar dataflow
 
 ---
@@ -72,9 +76,10 @@ Inspect a dataflow's structure before querying.
 
 Resolve human-readable names (countries, measures) to SDMX codes.
 
-- Returns all valid code + label pairs for a single dimension (e.g. `REF_AREA` → `USA`/`United States`, `DEU`/`Germany`)
-- Large codelists are returned in full — the `REF_AREA` list runs to 570 entries — in `structuredContent`; the rendered text block lists the first 50 and states the total
-- Use substring matching on the returned list to find the right code before building a key
+- Returns code + label pairs for a single dimension (e.g. `REF_AREA` → `USA`/`United States`, `DEU`/`Germany`)
+- `query` matches a case-insensitive substring against both the code and its label, so `PA` and `percent` each reach `PA` / `Percent per annum`
+- `limit` (1–500, default 50) and `offset` page the matching list. Both client surfaces carry the same page, so a 1,164-code dimension like `UNIT_MEASURE` no longer ships 66 KB of pairs to `structuredContent` to find one code
+- When matches remain beyond the page, the response reports the full match count and how to reach the rest
 
 ---
 
@@ -119,7 +124,7 @@ oecd_query_dataset → { canvas_id, table_name, truncated: true, rows: [preview.
 |:-----|:-----|:------------|
 | Resource | `oecd://dataflow/{agency_id}/{flow_id}` | Dimension metadata for a single OECD dataflow — same content as `oecd_get_dataset_info` |
 
-`{flow_id}` is the combined `{dsd_id}@{df_id}` string with `@` percent-encoded as `%40`. Example: `oecd://dataflow/OECD.SDD.NAD/DSD_NAAG%40DF_NAAG_I`.
+`{flow_id}` is the combined `{dsd_id}@{df_id}` string with `@` percent-encoded as `%40`, or the bare `{df_id}` for a dataflow catalogued without a datastructure prefix. Example: `oecd://dataflow/OECD.SDD.NAD/DSD_NAAG%40DF_NAAG_I`.
 
 All resource data is also reachable via tools. Use `oecd_get_dataset_info` for the same content.
 
