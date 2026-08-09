@@ -5,7 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import type { CanvasInstance, QueryResult } from '@cyanheads/mcp-ts-core/canvas';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 
 export const oecdDataframeQuery = tool('oecd_dataframe_query', {
@@ -54,6 +54,14 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
         'Re-run oecd_query_dataset to create a fresh canvas, then pass the returned canvas_id here.',
     },
     {
+      reason: 'table_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'The SQL names a table this canvas does not hold — it expired, was dropped, or the name is wrong.',
+      recovery:
+        'Call oecd_dataframe_describe with this canvas_id for the tables it currently holds, ' +
+        'then retry with one of those names — or re-run oecd_query_dataset to stage a fresh canvas.',
+    },
+    {
       reason: 'invalid_sql',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The SQL is not a valid SELECT statement or contains disallowed operations.',
@@ -98,22 +106,32 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
         denySystemCatalogs: true,
       });
     } catch (err) {
-      const e = err as Error;
-      // Canvas enforces read-only — classification is a ValidationError from the 4-layer gate
-      if (
-        e.message?.toLowerCase().includes('select') ||
-        e.message?.toLowerCase().includes('not allowed') ||
-        e.message?.toLowerCase().includes('ddl') ||
-        e.message?.toLowerCase().includes('invalid') ||
-        e.message?.toLowerCase().includes('parse') ||
-        (e as { code?: number }).code === JsonRpcErrorCode.ValidationError
-      ) {
-        throw ctx.fail(
-          'invalid_sql',
-          `SQL rejected: ${e.message}`,
-          { ...ctx.recoveryFor('invalid_sql') },
-          { cause: e },
-        );
+      /**
+       * Canvas rejections are structured, so dispatch on the reason and the code
+       * rather than on message text. A missing table is a NotFound carrying
+       * `reason: 'missing_table'`; every other gate rejection is a
+       * ValidationError. Anything else — a DuckDB execution fault, a cancelled
+       * query — is not the caller's SQL and is left to the framework.
+       */
+      if (err instanceof McpError) {
+        if (err.data?.reason === 'missing_table') {
+          const table = err.data.tableName;
+          throw ctx.fail(
+            'table_not_found',
+            `Canvas "${input.canvas_id}" holds no table` +
+              (typeof table === 'string' ? ` named "${table}"` : ' matching the query'),
+            { ...ctx.recoveryFor('table_not_found') },
+            { cause: err },
+          );
+        }
+        if (err.code === JsonRpcErrorCode.ValidationError) {
+          throw ctx.fail(
+            'invalid_sql',
+            `SQL rejected: ${err.message}`,
+            { ...ctx.recoveryFor('invalid_sql') },
+            { cause: err },
+          );
+        }
       }
       throw err;
     }
