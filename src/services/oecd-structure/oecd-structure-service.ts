@@ -9,8 +9,9 @@ import {
   notFound,
   serviceUnavailable,
 } from '@cyanheads/mcp-ts-core/errors';
-import { fetchWithTimeout, requestContextService, withRetry } from '@cyanheads/mcp-ts-core/utils';
+import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { fetchOecd } from '@/services/oecd-http/oecd-http.js';
 import type {
   OecdCode,
   OecdDataflow,
@@ -20,10 +21,6 @@ import type {
 } from './types.js';
 
 const STRUCTURE_ACCEPT = 'application/vnd.sdmx.structure+json;version=1.0';
-// OECD's HTTP/2 endpoint requires Accept-Language to avoid HTTP 500 responses
-// when a structured Accept header is sent. Node.js fetch defaults to HTTP/2 and
-// omits Accept-Language; adding it explicitly fixes the server-side routing bug.
-const ACCEPT_LANGUAGE = 'en';
 
 /**
  * Allowed characters in SDMX identifier path segments (agencyId, dsdId, dfId).
@@ -55,52 +52,14 @@ export function parseFlowRef(flowRef: string): {
   return { agencyId, dsdId, dfId };
 }
 
-/**
- * Reconcile an upstream HTTP failure with what `withRetry` treats as transient.
- *
- * Two of OECD's responses are otherwise taken at face value and shouldn't be:
- * a throttled request comes back `429 Retry-After: 0`, and the honored hint
- * collapses the backoff so all three attempts fire inside a few milliseconds
- * and every one is refused; and HTTP 500 maps to `InternalError`, which is
- * terminal, so a server-side fault fails without a single retry. Dropping the
- * empty hint and restating a 5xx as `ServiceUnavailable` puts both back on the
- * exponential backoff, which is what clears OECD's seconds-long throttle window.
- */
-function retryableUpstreamFailure(err: unknown): unknown {
-  if (!(err instanceof McpError)) return err;
-  const { retryAfter, ...withoutHint } = err.data ?? {};
-  const emptyHint = typeof retryAfter === 'string' && /^0+$/.test(retryAfter.trim());
-  const status = err.data?.status;
-  const code =
-    err.code === JsonRpcErrorCode.InternalError && typeof status === 'number' && status >= 500
-      ? JsonRpcErrorCode.ServiceUnavailable
-      : err.code;
-  if (!emptyHint && code === err.code) return err;
-  return new McpError(code, err.message, emptyHint ? withoutHint : err.data, { cause: err });
-}
-
-/**
- * Fetch and decode one structure endpoint.
- *
- * `fetchWithTimeout` maps the HTTP status onto the error code, and only
- * `ServiceUnavailable`, `Timeout`, and `RateLimited` are transient — so 404
- * becomes a terminal `NotFound` and a typo'd identifier never enters the retry
- * loop, while 408, 429, and 5xx still get their attempts.
- */
+/** Fetch and decode one structure endpoint. */
 async function fetchJson(url: string, signal?: AbortSignal): Promise<unknown> {
-  const config = getServerConfig();
-  const res = await fetchWithTimeout(
-    url,
-    config.timeoutMs,
-    requestContextService.createRequestContext({ operation: 'oecdStructureFetch' }),
-    {
-      headers: { Accept: STRUCTURE_ACCEPT, 'Accept-Language': ACCEPT_LANGUAGE },
-      // An unknown agency or dataflow is a caller mistake, not a server fault.
-      expectedStatuses: [404],
-      ...(signal ? { signal } : {}),
-    },
-  ).catch((err: unknown) => {
-    throw retryableUpstreamFailure(err);
+  const res = await fetchOecd(url, {
+    accept: STRUCTURE_ACCEPT,
+    // An unknown agency or dataflow is a caller mistake, not a server fault.
+    expectedStatuses: [404],
+    operation: 'oecdStructureFetch',
+    ...(signal ? { signal } : {}),
   });
   return res.json() as Promise<unknown>;
 }
