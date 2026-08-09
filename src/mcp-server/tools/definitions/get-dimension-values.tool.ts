@@ -49,6 +49,9 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       )
       .describe('All valid codes for this dimension.'),
     code_count: z.number().describe('Total number of valid codes.'),
+    source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
+  }),
+  enrichment: {
     notice: z
       .string()
       .optional()
@@ -56,8 +59,7 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
         'Present when the dimension has no associated codelist — explains that the dimension ' +
           'accepts dynamic or free-form values rather than a fixed enumerated set.',
       ),
-    source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
-  }),
+  },
   errors: [
     {
       reason: 'dataflow_not_found',
@@ -118,14 +120,15 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
         flowRef: input.flow_ref,
         dimensionId: input.dimension_id,
       });
+      ctx.enrich.notice(
+        'This dimension has no fixed codelist — it accepts dynamic or free-form values. ' +
+          'Inspect actual data observations with oecd_query_dataset to discover valid values.',
+      );
       return {
         flow_ref: input.flow_ref,
         dimension_id: input.dimension_id,
         codes: [],
         code_count: 0,
-        notice:
-          'This dimension has no fixed codelist — it accepts dynamic or free-form values. ' +
-          'Inspect actual data observations with oecd_query_dataset to discover valid values.',
         source: 'OECD' as const,
       };
     }
@@ -164,7 +167,6 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
     const lines = [
       `**Dimension: ${result.dimension_id}** (flow: ${result.flow_ref})`,
       `${result.code_count} valid codes`,
-      result.notice ? `\n> ${result.notice}\n` : '',
       '| Code | Name |',
       '|------|------|',
       ...rows,

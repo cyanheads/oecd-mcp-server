@@ -4,7 +4,7 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdGetDimensionValues } from '@/mcp-server/tools/definitions/get-dimension-values.tool.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
@@ -105,7 +105,7 @@ describe('oecdGetDimensionValues', () => {
     ]);
   });
 
-  it('returns empty codes with notice for a dimension with no codelist reference', async () => {
+  it('enriches with a notice for a dimension with no codelist reference', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValueOnce({
@@ -124,8 +124,37 @@ describe('oecdGetDimensionValues', () => {
 
     expect(result.code_count).toBe(0);
     expect(result.codes).toHaveLength(0);
-    expect(result.notice).toMatch(/no fixed codelist/i);
-    expect(result.notice).toMatch(/free-form/i);
+
+    const notice = getEnrichment(ctx).notice as string;
+    expect(notice).toMatch(/no fixed codelist/i);
+    expect(notice).toMatch(/free-form/i);
+  });
+
+  it('leaves the notice unset when the dimension has a codelist', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve(DSD_RESPONSE),
+          text: () => Promise.resolve(''),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: () => Promise.resolve(CODELIST_RESPONSE),
+          text: () => Promise.resolve(''),
+        }),
+    );
+
+    const ctx = createMockContext({ errors: oecdGetDimensionValues.errors });
+    const input = oecdGetDimensionValues.input.parse({
+      flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+      dimension_id: 'FREQ',
+    });
+    await oecdGetDimensionValues.handler(input, ctx);
+
+    expect(getEnrichment(ctx).notice).toBeUndefined();
   });
 
   it('throws ctx.fail(dataflow_not_found) for malformed flow_ref', async () => {
@@ -141,8 +170,8 @@ describe('oecdGetDimensionValues', () => {
   });
 
   it('throws ctx.fail(dataflow_not_found) when 200 response has empty dataStructures', async () => {
-    // parseDataStructure throws "DataStructure not found" for an empty array in a 200 response.
-    // The tool catches that message and maps to the dataflow_not_found contract entry.
+    // parseDataStructure throws a NotFound for an empty array in a 200 response;
+    // the tool maps it to the dataflow_not_found contract entry.
     vi.stubGlobal(
       'fetch',
       vi.fn().mockResolvedValue({
@@ -202,20 +231,30 @@ describe('oecdGetDimensionValues', () => {
     expect(text).toContain('Source: OECD');
   });
 
-  it('formats output with notice when dimension has no codelist', () => {
-    const output = {
-      flow_ref: 'OECD.CFE.EDS,DSD_LA_LABOUR_DDOWN@DF_EMPLOYMENT_DDOWN',
-      dimension_id: 'DD_ID',
-      codes: [],
+  it('carries the notice on both client surfaces when the dimension has no codelist', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve(DSD_RESPONSE),
+        text: () => Promise.resolve(''),
+      }),
+    );
+
+    const result = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+      dimension_id: 'MEASURE',
+    });
+
+    // structuredContent clients (Claude Code) read the merged output object.
+    expect(result.structuredContent).toMatchObject({
+      dimension_id: 'MEASURE',
       code_count: 0,
-      notice:
-        'This dimension has no fixed codelist — it accepts dynamic or free-form values. ' +
-        'Inspect actual data observations with oecd_query_dataset to discover valid values.',
-      source: 'OECD' as const,
-    };
-    const blocks = oecdGetDimensionValues.format!(output);
-    const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('DD_ID');
+      notice: expect.stringContaining('no fixed codelist'),
+    });
+    // content[] clients (Claude Desktop) read the enrichment trailer.
+    const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    expect(text).toContain('MEASURE');
     expect(text).toContain('no fixed codelist');
     expect(text).toContain('Source: OECD');
   });
