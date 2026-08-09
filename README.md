@@ -85,9 +85,12 @@ Fetch observations from an OECD dataflow filtered by dimension key and time rang
 - Accepts a dot-delimited key (e.g. `A.USA+DEU.B1GQ_R.PC.`) where empty segments are wildcards and `+` separates multiple values
 - Optional `start_period` / `end_period` bound the time range (ISO format: `2010`, `2010-Q1`)
 - Decodes SDMX-JSON index notation (`0:0:2:3:0`) into human-readable row objects with dimension labels
+- Observation attributes (`UNIT_MULT`, `OBS_STATUS`, `PRICE_BASE`, `DECIMALS`, …) each become their own column, so an estimated or break-flagged point is distinguishable from a confirmed one
+- `value` arrives already multiplied by the observation's `UNIT_MULT` — a GDP figure OECD publishes as `26054.614` billions comes back as `26054614000000`. Every row carries `value_scale`, the power of ten applied; divide by it for the figure as OECD published it
 - Every response row includes `source: "OECD"` per OECD terms of use
-- **Small results** (few countries, narrow time range): all observations returned inline
-- **Large results** (multi-country, multi-year time-series): returns a `canvas_id` + `truncated: true` — use `oecd_dataframe_describe` to list tables, then `oecd_dataframe_query` for SQL analytics
+- **Small results** (few countries, narrow time range): every observation is returned inline, in `structuredContent` and in the rendered table alike — no `canvas_id`, and `truncated` is omitted rather than set to `false`
+- **Large results** (multi-country, multi-year time-series) with `CANVAS_PROVIDER_TYPE=duckdb`: a leading preview slice plus `canvas_id` + `truncated: true` — use `oecd_dataframe_describe` to list tables, then `oecd_dataframe_query` for SQL analytics
+- **Large results** without DataCanvas: there is nowhere to stage the remainder, so every observation still comes back in `structuredContent`, while the rendered table stops at the same preview budget a canvas would have used — the response reports `content_table_capped` and the number of rows it showed. Narrow the key or the `start_period` / `end_period` range to shrink the result itself
 
 ---
 
@@ -105,9 +108,9 @@ Requires `CANVAS_PROVIDER_TYPE=duckdb`. Read-only: writes, DDL, and system catal
 **Typical workflow for a large query:**
 
 ```text
-oecd_query_dataset → { canvas_id, truncated: true, rows: [preview...] }
+oecd_query_dataset → { canvas_id, table_name, truncated: true, rows: [preview...] }
   → oecd_dataframe_describe(canvas_id) → table/column names
-  → oecd_dataframe_query(canvas_id, "SELECT ref_area, AVG(obs_value) FROM df_... GROUP BY ref_area")
+  → oecd_dataframe_query(canvas_id, "SELECT REF_AREA, AVG(value) FROM spilled_... GROUP BY REF_AREA")
 ```
 
 ## Resources
@@ -143,7 +146,7 @@ Agent-friendly output:
 
 - Workflow-aware tool surface — `flow_ref` from search flows directly into info, values, and query tools without reconstruction
 - Spill signaling — `truncated: true` + `canvas_id` tells the agent to switch to SQL instead of parsing a truncated inline list
-- Full SDMX decoding server-side — agents see `{ ref_area: "United States", measure: "Gross domestic product", obs_value: 26054 }`, not raw index arrays
+- Full SDMX decoding server-side — agents see `{ REF_AREA: "United States", MEASURE: "Gross domestic product", UNIT_MULT: "Billions", value: 26054614000000, value_scale: 1000000000 }`, not raw index arrays
 
 ## Getting started
 
@@ -266,7 +269,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 |:---------|:------------|:--------|
 | `OECD_BASE_URL` | OECD SDMX REST API base URL. | `https://sdmx.oecd.org/public/rest` |
 | `OECD_TIMEOUT_MS` | Per-request timeout in milliseconds. | `30000` |
-| `CANVAS_PROVIDER_TYPE` | Canvas engine. Set to `duckdb` to enable DataCanvas for large `oecd_query_dataset` results. | `none` |
+| `CANVAS_PROVIDER_TYPE` | Canvas engine. Set to `duckdb` so a large `oecd_query_dataset` result spills to a queryable table instead of just capping the rendered preview — unset, every row still comes back in `structuredContent`, only the rendered table is capped. | `none` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
@@ -317,6 +320,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/config/` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools/definitions/` | Tool definitions (`*.tool.ts`) — seven tools for OECD data discovery and retrieval. |
 | `src/mcp-server/resources/definitions/` | Resource definitions (`*.resource.ts`) — the `oecd://dataflow` resource. |
+| `src/services/oecd-http/` | Shared OECD fetch boundary — timeout and retry-classification corrections used by both services below. |
 | `src/services/oecd-structure/` | OECD SDMX structure service — dataflows, data structures, codelists. |
 | `src/services/oecd-data/` | OECD SDMX data service — observations, SDMX-JSON decoding, DataCanvas spillover. |
 | `src/services/canvas-accessor/` | DataCanvas accessor — registers and exposes the framework canvas instance to tools. |

@@ -217,6 +217,8 @@ src/
   config/
     server-config.ts                    # Server-specific env vars (OECD_BASE_URL, OECD_TIMEOUT_MS)
   services/
+    oecd-http/
+      oecd-http.ts                      # Shared OECD fetch boundary (timeout, retry classification)
     oecd-structure/
       oecd-structure-service.ts         # OECD SDMX structure API (dataflows, data structures, codelists)
       types.ts                          # Structure domain types

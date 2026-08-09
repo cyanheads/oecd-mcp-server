@@ -10,7 +10,7 @@
 | `oecd_list_agencies` | List the OECD SDMX agencies and the number of dataflows each publishes. Use to discover agency IDs before filtering `oecd_search_datasets` by department. | — | `readOnlyHint: true, idempotentHint: true, openWorldHint: false` | `upstream_error` (ServiceUnavailable) — structure API fetch failed |
 | `oecd_get_dataset_info` | Fetch a dataflow's dimensions, their order, and how to construct a query key. Returns per-dimension names, codelist references, and position in the dot-delimited key. Required before calling `oecd_query_dataset`. | `flow_ref` (e.g. `OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I`) | `readOnlyHint: true, idempotentHint: true` | `dataflow_not_found` (NotFound) — `flow_ref` does not exist; `invalid_flow_ref` (InvalidParams) — malformed `flow_ref` format |
 | `oecd_get_dimension_values` | Fetch the valid codes and labels for one dimension of a dataflow. Use to resolve human-readable names (countries, measures) to SDMX codes before querying. | `flow_ref`, `dimension_id` | `readOnlyHint: true, idempotentHint: true` | `dataflow_not_found` (NotFound) — `flow_ref` does not exist; `dimension_not_found` (NotFound) — `dimension_id` not in this dataflow's structure |
-| `oecd_query_dataset` | Fetch observations from an OECD dataflow filtered by a dimension key and time range. Returns decoded rows (one per observation) with dimension labels, plus `canvas_id` and `truncated: true` when the result spills to DataCanvas. Large multi-country time-series spill to a DataCanvas table for follow-up SQL via `oecd_dataframe_query`. | `flow_ref`, `key` (dot-delimited), `start_period`, `end_period`, `canvas_id` (optional) | `readOnlyHint: true, idempotentHint: true` | `dataflow_not_found` (NotFound) — `flow_ref` does not exist; `no_results` (NotFound) — valid flow but no observations match the key/time range; `invalid_key` (InvalidParams) — malformed dimension key |
+| `oecd_query_dataset` | Fetch observations from an OECD dataflow filtered by a dimension key and time range. Returns decoded rows (one per observation) with dimension labels, plus `canvas_id` and `truncated: true` when the result spills to DataCanvas. Large multi-country time-series spill to a DataCanvas table for follow-up SQL via `oecd_dataframe_query`. | `flow_ref`, `key` (dot-delimited), `start_period`, `end_period`, `canvas_id` (optional) | `readOnlyHint: true, idempotentHint: true` | `invalid_flow_ref` (ValidationError) — malformed `flow_ref` format; `dataflow_not_found` (NotFound) — `flow_ref` does not exist; `no_results` (NotFound) — valid flow but no observations match the key/time range; `invalid_key` (ValidationError) — OECD rejected the dimension key; `invalid_period` (ValidationError) — OECD could not parse the period; `rate_limited` (RateLimited) — request-rate throttle; `download_limit` (RateLimited) — download/data-range throttle, only clears if the query shrinks; `upstream_timeout` (Timeout) — no response within `OECD_TIMEOUT_MS`; `upstream_unavailable` (ServiceUnavailable) — server fault or unreachable after retries |
 | `oecd_dataframe_describe` | List DataCanvas tables and their columns from a prior `oecd_query_dataset` spill. Lets the agent discover staged table and column names before writing SQL. | `canvas_id` | `readOnlyHint: true, idempotentHint: true, openWorldHint: false` | `canvas_not_found` (NotFound) — `canvas_id` has expired or was never created |
 | `oecd_dataframe_query` | Run a read-only SQL SELECT against tables staged on a DataCanvas by `oecd_query_dataset`. Requires `CANVAS_PROVIDER_TYPE=duckdb`. | `canvas_id`, `sql` | `readOnlyHint: true, idempotentHint: true, openWorldHint: false` | `canvas_not_found` (NotFound) — `canvas_id` has expired or was never created; `invalid_sql` (InvalidParams) — SQL is not a valid SELECT statement |
 
@@ -58,7 +58,7 @@ Target audience: economists, policy researchers, data journalists, and agents an
 | `OecdStructureService` | OECD SDMX structure API — dataflows, datastructures, codelists | `oecd_search_datasets`, `oecd_list_agencies`, `oecd_get_dataset_info`, `oecd_get_dimension_values`, `oecd_dataflow` resource |
 | `OecdDataService` | OECD SDMX data API — observations, dimension decoding | `oecd_query_dataset` |
 
-Both services use `fetchWithTimeout` + `withRetry`, parse SDMX-JSON responses, and map HTTP errors to appropriate MCP error codes.
+Both services call `fetchWithTimeout` + `withRetry` through a shared `fetchOecd` HTTP boundary (`src/services/oecd-http/oecd-http.ts`), which also corrects two retry-classification gaps OECD's own responses hit — an honored `Retry-After: 0` collapsing the backoff on a throttle, and a 500/501 landing on a terminal `InternalError` instead of a retryable `ServiceUnavailable`. Both services parse SDMX-JSON responses and map HTTP errors to appropriate MCP error codes.
 
 ---
 
@@ -68,7 +68,7 @@ Both services use `fetchWithTimeout` + `withRetry`, parse SDMX-JSON responses, a
 |:--------|:---------|:--------|:------------|
 | `OECD_BASE_URL` | No | `https://sdmx.oecd.org/public/rest` | SDMX REST base URL |
 | `OECD_TIMEOUT_MS` | No | `30000` | Per-request timeout in milliseconds |
-| `CANVAS_PROVIDER_TYPE` | No | `none` | Set to `duckdb` to enable DataCanvas for large query results |
+| `CANVAS_PROVIDER_TYPE` | No | `none` | Set to `duckdb` so a large `oecd_query_dataset` result spills to a queryable table instead of just capping the rendered preview |
 
 ---
 
@@ -113,20 +113,25 @@ Dataflow IDs in the OECD API follow the format `{DSD_ID}@{DF_ID}` (e.g. `DSD_NAA
 | 2 | `GET /data/{flow_ref}/{key}?startPeriod=...&endPeriod=...&dimensionAtObservation=AllDimensions` | Fetch observations as flat key→value map |
 | 3 | `canvas.acquire()` + `spillover()` | Stage full result on DataCanvas if row count exceeds preview threshold (omitted for small results) |
 
-Call 1 can be cached per `flow_ref` within the session (TTL matches request lifetime). The key decoding step converts the `0:9:0:0:0` SDMX index notation into `{ REF_AREA: "USA", MEASURE: "B1GQ", ... }` row objects.
+Call 1 can be cached per `flow_ref` within the session (TTL matches request lifetime). The key decoding step converts the `0:9:0:0:0` SDMX index notation into row objects carrying each dimension and each observation-level attribute as its own column, resolved to labels — `{ REF_AREA: "United States", MEASURE: "Gross domestic product", UNIT_MULT: "Billions", value: 26054614000000, value_scale: 1000000000 }`.
 
-**Output schema — dual path:**
+**Output schema — three paths:**
 
 - **Inline (small result):** `{ rows: DecodedRow[], row_count: number, source: "OECD" }` — all observations in response
-- **Spill (large result):** `{ rows: DecodedRow[], row_count: number, canvas_id: string, truncated: true, source: "OECD" }` — `rows` holds the inline preview, `canvas_id` addresses the full table, `truncated: true` signals the agent to use `oecd_dataframe_query` for analytics
+- **Spill (large result, canvas configured):** `{ rows: DecodedRow[], row_count: number, canvas_id: string, table_name: string, truncated: true, source: "OECD" }` — `rows` holds the inline preview, `canvas_id` + `table_name` address the full table, `truncated: true` signals the agent to use `oecd_dataframe_query` for analytics
+- **Large result, no canvas:** `rows` holds every observation, and the enrichment fields `content_table_capped` + `content_table_rows` disclose that the rendered table stopped short of it. `truncated` stays absent — it promises a `canvas_id`, and there is none to give
 
-`format()` must render the inline `rows` preview in both paths — it should include the `canvas_id` and a note to use `oecd_dataframe_query` when `truncated: true`, so `content[]`-only clients (Claude Desktop) see the same signal as `structuredContent` clients.
+`format()` must render the inline `rows` in both paths — it should include the `canvas_id` and a note to use `oecd_dataframe_query` when `truncated: true`, so `content[]`-only clients (Claude Desktop) see the same signal as `structuredContent` clients.
+
+**One preview budget, two fates for the remainder.** `spillover()`'s `previewChars` only bounds the response when a canvas exists, and `CANVAS_PROVIDER_TYPE` defaults to `none` (the `.mcpb` bundle ships without the DuckDB native, so that is the common configuration). The same budget therefore also caps the rendered table on the no-canvas path, counted the same way — accumulated `JSON.stringify` length, first row over the line excluded — so the preview is identical either way and only the destination of the omitted rows differs: a canvas table, or `structuredContent.rows`.
 
 ---
 
 ## Design Decisions
 
 **DataCanvas adopted.** OECD observations are the canonical example of analytical tabular data: country × measure × time rows that agents aggregate, compare, and filter. A query for GDP across all 38 OECD members for 10 years produces 380+ rows — clearly crosses the `previewChars` threshold for typical queries. Both gates pass: shape is analytical (GROUP BY country, year) AND size exceeds inline. `oecd_query_dataset` uses `spillover()` and is paired with mandatory `oecd_dataframe_describe` + `oecd_dataframe_query` tools.
+
+**`UNIT_MULT` is applied, not just labelled.** A dataflow publishes GDP as `26054.614` with `UNIT_MULT = Billions`; two dataflows publishing the same figure disagree on magnitude by a factor of a thousand (`Millions` vs `Billions`), so a raw value is not comparable across flows and an agent that sums or ranks them silently gets the wrong answer. The decoder multiplies by `10 ** id` — the code id is the base-10 exponent in `SDMX,CL_UNIT_MULT` and in the three OECD-local variants of it — and every row carries `value_scale`, the divisor that recovers the published figure. Codes outside the codelist range (`9999`, meaning ".") are not exponents and leave the value alone.
 
 **`AllDimensions` observation mode.** Instead of the default SDMX-JSON `series`-grouped format (which requires two-pass decoding of series key + observation time index), we request `?dimensionAtObservation=AllDimensions`. This returns a flat `observations` map keyed by a full dimension index tuple. One-pass decoding: split key string on `:`, look up each index in the corresponding dimension's `values` array. Simpler implementation and cleaner row output for the canvas.
 
