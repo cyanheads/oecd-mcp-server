@@ -16,7 +16,8 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
   name: 'oecd-dataflow',
   description:
     'Dimension metadata for a single OECD dataflow — same content as oecd_get_dataset_info. ' +
-    '{flow_id} is the combined {dsd_id}@{df_id} string with @ percent-encoded as %40 in the URI. ' +
+    '{flow_id} is the combined {dsd_id}@{df_id} string with @ percent-encoded as %40 in the URI, ' +
+    'or the bare {df_id} for the few dataflows OECD publishes without a datastructure prefix. ' +
     'Example: oecd://dataflow/OECD.SDD.NAD/DSD_NAAG%40DF_NAAG_I',
   mimeType: 'application/json',
   params: z.object({
@@ -24,8 +25,8 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
     flow_id: z
       .string()
       .describe(
-        'Combined dsd_id@df_id URL-encoded — e.g. DSD_NAAG%40DF_NAAG_I. ' +
-          'The @ is percent-encoded as %40 in the URI.',
+        'Combined dsd_id@df_id URL-encoded — e.g. DSD_NAAG%40DF_NAAG_I, where @ is percent-encoded ' +
+          'as %40 — or a bare df_id such as DF_AEI2024_DASHBOARD.',
       ),
   }),
   output: z.object({
@@ -35,7 +36,12 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
         z
           .object({
             id: z.string().describe('Dimension identifier.'),
-            name: z.string().describe('Human-readable dimension name.'),
+            name: z
+              .string()
+              .describe(
+                'Concept name for the dimension — e.g. "Reference area" for REF_AREA. ' +
+                  'Repeats the id when OECD publishes no concept for it.',
+              ),
             position: z.number().describe('1-based position in the dot-delimited key.'),
             codelist_ref: z.string().optional().describe('Codelist reference, if any.'),
           })
@@ -45,7 +51,11 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
     time_dimension: z
       .object({
         id: z.string().describe('Time dimension identifier — typically TIME_PERIOD.'),
-        name: z.string().describe('Human-readable time dimension name.'),
+        name: z
+          .string()
+          .describe(
+            'Concept name for the time dimension, repeating the id when none is published.',
+          ),
         position: z.number().describe('Position in the key after all regular dimensions.'),
       })
       .optional()

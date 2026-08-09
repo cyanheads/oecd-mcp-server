@@ -16,7 +16,12 @@ export interface OecdDataflow {
   dsdId: string;
   /** Dataflow identifier — e.g. `DF_NAAG_I`. */
   flowId: string;
-  /** Full flow reference: `{agencyID},{dsd_id}@{df_id}` — e.g. `OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I`. */
+  /**
+   * Full flow reference as OECD catalogues it — `{agencyID},{dsd_id}@{df_id}`
+   * for nearly every dataflow (`OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I`), and the bare
+   * `{agencyID},{df_id}` for the handful published without a datastructure
+   * prefix (`OECD.TAD.ARP,DF_AEI2024_DASHBOARD`).
+   */
   flowRef: string;
   /** Human-readable name. */
   name: string;
@@ -30,7 +35,11 @@ export interface OecdDimension {
   codelistRef?: string | undefined;
   /** Dimension identifier — e.g. `REF_AREA`. */
   id: string;
-  /** Human-readable name. */
+  /**
+   * Concept name resolved from the datastructure's concept scheme — e.g.
+   * `Reference area`. Falls back to the id when the scheme is unreachable or
+   * does not cover the dimension.
+   */
   name: string;
   /** 1-based position in the dot-delimited key. */
   position: number;
@@ -39,6 +48,7 @@ export interface OecdDimension {
 /** A time dimension — always the last position. */
 export interface OecdTimeDimension {
   id: string;
+  /** Concept name, falling back to the id — see {@link OecdDimension.name}. */
   name: string;
   position: number;
 }

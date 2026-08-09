@@ -1,5 +1,6 @@
 /**
- * @fileoverview OECD SDMX structure service — wraps dataflow, datastructure, and codelist endpoints.
+ * @fileoverview OECD SDMX structure service — wraps the dataflow, datastructure,
+ * codelist, concept-scheme, and agency-scheme endpoints.
  * @module services/oecd-structure/oecd-structure-service
  */
 
@@ -24,32 +25,57 @@ const STRUCTURE_ACCEPT = 'application/vnd.sdmx.structure+json;version=1.0';
 
 /**
  * Allowed characters in SDMX identifier path segments (agencyId, dsdId, dfId).
- * SDMX IDs use letters, digits, underscores, hyphens, and dots only.
- * Reject path-traversal sequences (/  \0  ?  #) that could alter the URL structure.
+ * SDMX IDs use letters, digits, underscores, hyphens, and dots only, and always
+ * open on a letter or digit — every identifier the catalog publishes does.
+ *
+ * Both halves of that carry weight. The character class rejects `/`, `\0`, `?`,
+ * `#`, and `%`, which would alter the URL structure or smuggle an encoded
+ * separator. The leading alphanumeric rejects an identifier that is nothing but
+ * dots: an identifier occupies one path segment, so `.` or `..` is read as a
+ * relative path reference and resolved away, walking the request out of the
+ * endpoint it was addressed to.
  */
-const SDMX_ID_SAFE = /^[A-Za-z0-9._-]+$/;
+const SDMX_ID_SAFE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-/** Parse the `{agencyID},{dsd_id}@{df_id}` flow ref into its parts. */
+/**
+ * Parse a flow ref into its parts.
+ *
+ * Two forms are published. Nearly every OECD dataflow carries the combined
+ * `{agencyID},{dsd_id}@{df_id}`, but a handful are catalogued under a bare
+ * `DF_*` id with no datastructure prefix, and for those `{agencyID},{df_id}` is
+ * the only reference the data endpoint answers — the combined form built by
+ * pairing the URN's datastructure with the dataflow id is rejected. Both forms
+ * are accepted here; `dsdId` is absent for the bare one.
+ */
 export function parseFlowRef(flowRef: string): {
   agencyId: string;
-  dsdId: string;
+  dsdId?: string;
   dfId: string;
 } | null {
-  // Expected: OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I
+  // Expected: OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I or OECD.TAD.ARP,DF_AEI2024_DASHBOARD
   const commaIdx = flowRef.indexOf(',');
   if (commaIdx < 0) return null;
   const agencyId = flowRef.slice(0, commaIdx);
-  const rest = flowRef.slice(commaIdx + 1); // DSD_NAAG@DF_NAAG_I
+  const rest = flowRef.slice(commaIdx + 1); // DSD_NAAG@DF_NAAG_I or DF_AEI2024_DASHBOARD
   const atIdx = rest.indexOf('@');
-  if (atIdx < 0) return null;
-  const dsdId = rest.slice(0, atIdx);
-  const dfId = rest.slice(atIdx + 1);
-  if (!agencyId || !dsdId || !dfId) return null;
+  const dsdId = atIdx < 0 ? undefined : rest.slice(0, atIdx);
+  const dfId = atIdx < 0 ? rest : rest.slice(atIdx + 1);
+  // An empty segment on either side of a present '@' is malformed, not bare.
+  if (!agencyId || !dfId || dsdId === '') return null;
   // Reject characters that could alter URL path structure
-  if (!SDMX_ID_SAFE.test(agencyId) || !SDMX_ID_SAFE.test(dsdId) || !SDMX_ID_SAFE.test(dfId)) {
-    return null;
-  }
-  return { agencyId, dsdId, dfId };
+  if (!SDMX_ID_SAFE.test(agencyId) || !SDMX_ID_SAFE.test(dfId)) return null;
+  if (dsdId !== undefined && !SDMX_ID_SAFE.test(dsdId)) return null;
+  return { agencyId, ...(dsdId ? { dsdId } : {}), dfId };
+}
+
+/**
+ * The directorate segment of a dotted OECD agency identifier — `OECD.SDD.NAD`
+ * and `OECD.SDD.NAD.SEEA` both resolve to `SDD`, and `OECD.ITF` to `ITF`.
+ * Undefined for the non-OECD publishers that ship dataflows through the same
+ * catalog (`ESTAT`, `IAEG-SDGs`), which carry no directorate segment.
+ */
+export function directorateCode(agencyId: string): string | undefined {
+  return agencyId.split('.')[1] || undefined;
 }
 
 /** Fetch and decode one structure endpoint. */
@@ -116,23 +142,174 @@ export class OecdStructureService {
   }
 
   /**
-   * Fetch the datastructure for a flow ref.
-   * Uses `GET /datastructure/{agencyID}/{dsdID}`.
+   * Fetch the datastructure for a flow ref, with each dimension's name resolved
+   * from its concept scheme.
+   *
+   * Two routes, because neither covers the catalog alone.
+   *
+   * A combined `{dsd_id}@{df_id}` ref names a datastructure directly, so
+   * `GET /datastructure/{agencyID}/{dsd_id}` answers in one request and stays
+   * the first attempt. But the `{dsd_id}` half is a label OECD does not keep in
+   * step with the real datastructure — for part of the catalog it names one
+   * that does not exist (`DSD_REG_LAB@DF_RATES` is backed by `DSD_REG_LABOUR`),
+   * and that route answers 404 for a dataflow the data endpoint serves happily.
+   *
+   * So a not-found falls back to asking the dataflow for its own datastructure:
+   * `GET /dataflow/{agencyID}/{id}?references=datastructure` returns the same
+   * `dataStructures` payload keyed to the id OECD actually catalogues. That is
+   * also the only route for a bare `{agencyID},{df_id}` ref, which carries no
+   * datastructure id to address at all.
+   *
+   * The fallback is second rather than first because the reference route is not
+   * a superset: a dataflow OECD publishes as an external reference carries no
+   * inline datastructure, and for several of those the datastructure is
+   * nonetheless reachable on its own endpoint. Trying the direct route first
+   * keeps them working; falling back covers the mismatched prefixes. Only the
+   * refs the first route cannot resolve pay the second request.
    */
   async fetchDataStructure(flowRef: string, signal?: AbortSignal): Promise<OecdDataStructure> {
     const parts = parseFlowRef(flowRef);
     if (!parts) {
       throw new Error(`Invalid flow_ref format: ${flowRef}`);
     }
-    const url = `${this.baseUrl}/datastructure/${parts.agencyId}/${parts.dsdId}`;
 
+    let parsed: ParsedDataStructure | undefined;
+    if (parts.dsdId) {
+      parsed = await this.loadDataStructure(
+        `${this.baseUrl}/datastructure/${parts.agencyId}/${parts.dsdId}`,
+        flowRef,
+        parts.agencyId,
+        signal,
+      ).catch((err: unknown): ParsedDataStructure | undefined => {
+        // Only a missing datastructure earns the second request; an outage or a
+        // timeout is reported as itself rather than retried down another path.
+        if (err instanceof Error && isDataflowNotFound(err)) return;
+        throw err;
+      });
+    }
+
+    // The dataflow is catalogued under the id as published — combined or bare.
+    const dataflowId = parts.dsdId ? `${parts.dsdId}@${parts.dfId}` : parts.dfId;
+    parsed ??= await this.loadDataStructure(
+      `${this.baseUrl}/dataflow/${parts.agencyId}/${dataflowId}?references=datastructure`,
+      flowRef,
+      parts.agencyId,
+      signal,
+    );
+
+    return this.applyConceptNames(parsed.structure, parsed.conceptRefs, signal);
+  }
+
+  /** Fetch one structure endpoint and read the datastructure out of it. */
+  private async loadDataStructure(
+    url: string,
+    flowRef: string,
+    agencyId: string,
+    signal?: AbortSignal,
+  ): Promise<ParsedDataStructure> {
     const data = await fetchStructureJson(
       url,
       `Failed to fetch OECD datastructure for ${flowRef}`,
       signal,
     );
+    return parseDataStructure(data, flowRef, agencyId);
+  }
 
-    return parseDataStructure(data, flowRef, parts.agencyId, parts.dsdId);
+  /**
+   * Fetch one concept scheme as a `concept id → name` map.
+   * Uses `GET /conceptscheme/{agencyID}/{conceptSchemeID}`.
+   */
+  async fetchConceptScheme(
+    agencyId: string,
+    schemeId: string,
+    signal?: AbortSignal,
+  ): Promise<Map<string, string>> {
+    // Both IDs come from a datastructure URN, but validate as a safety net
+    // before embedding in the URL path.
+    if (!SDMX_ID_SAFE.test(agencyId) || !SDMX_ID_SAFE.test(schemeId)) {
+      throw serviceUnavailable(`Invalid concept scheme identifier: ${agencyId}/${schemeId}`, {
+        agencyId,
+        schemeId,
+      });
+    }
+    const url = `${this.baseUrl}/conceptscheme/${agencyId}/${schemeId}`;
+
+    const data = await fetchStructureJson(
+      url,
+      `Failed to fetch OECD concept scheme ${agencyId}/${schemeId}`,
+      signal,
+    );
+
+    return parseConceptScheme(data);
+  }
+
+  /**
+   * Fetch the OECD directorate codes and their names as a `code → name` map.
+   * Uses `GET /agencyscheme/OECD`, whose entries are keyed by the directorate
+   * segment of a dotted agency identifier — see {@link directorateCode}.
+   */
+  async fetchDirectorates(signal?: AbortSignal): Promise<Map<string, string>> {
+    const data = await fetchStructureJson(
+      `${this.baseUrl}/agencyscheme/OECD`,
+      'Failed to fetch the OECD agency scheme',
+      signal,
+    );
+
+    return parseAgencyScheme(data);
+  }
+
+  /**
+   * Replace each dimension's id-shaped placeholder name with the concept name
+   * its `conceptIdentity` URN points at.
+   *
+   * Best-effort by design: OECD's datastructure response carries no name on a
+   * dimension, so the names live one request away in the concept scheme. A
+   * scheme that fails to fetch, or one that omits a concept, leaves the
+   * dimension on its id. A missing label is a tolerable gap; failing the whole
+   * dataset-info call over one is not. A datastructure whose dimensions carry
+   * no parseable `conceptIdentity` issues no request at all.
+   */
+  private async applyConceptNames(
+    structure: OecdDataStructure,
+    conceptRefs: ConceptRef[],
+    signal?: AbortSignal,
+  ): Promise<OecdDataStructure> {
+    // Every dimension of a datastructure shares one scheme in practice; keying
+    // by scheme collapses them to the single request that fact implies.
+    const schemes = new Map(conceptRefs.map((ref) => [schemeKey(ref), ref] as const));
+    const bySchemeKey = new Map(
+      await Promise.all(
+        [...schemes].map(
+          async ([key, ref]) =>
+            [
+              key,
+              await this.fetchConceptScheme(ref.agencyId, ref.schemeId, signal).catch(
+                () => new Map<string, string>(),
+              ),
+            ] as const,
+        ),
+      ),
+    );
+
+    const names = new Map<string, string>();
+    for (const ref of conceptRefs) {
+      const name = bySchemeKey.get(schemeKey(ref))?.get(ref.conceptId);
+      if (name) names.set(ref.dimensionId, name);
+    }
+    if (names.size === 0) return structure;
+
+    return {
+      ...structure,
+      dimensions: structure.dimensions.map((d) => ({ ...d, name: names.get(d.id) ?? d.name })),
+      ...(structure.timeDimension
+        ? {
+            timeDimension: {
+              ...structure.timeDimension,
+              name: names.get(structure.timeDimension.id) ?? structure.timeDimension.name,
+            },
+          }
+        : {}),
+    };
   }
 
   /**
@@ -224,6 +401,47 @@ function localizedString(value: unknown): string | undefined {
   return;
 }
 
+/** A dimension's concept, as named by its `conceptIdentity` URN. */
+interface ConceptRef {
+  /** Agency owning the concept scheme — e.g. `OECD.SDD.NAD`. */
+  agencyId: string;
+  /** Concept identifier within the scheme — e.g. `FREQ`. */
+  conceptId: string;
+  /** Dimension the concept names, which is not always the concept id. */
+  dimensionId: string;
+  /** Concept scheme identifier — e.g. `CS_NA`. */
+  schemeId: string;
+}
+
+/** Identity of the concept scheme a ref points at, for de-duplicating fetches. */
+function schemeKey(ref: ConceptRef): string {
+  return `${ref.agencyId}/${ref.schemeId}`;
+}
+
+/**
+ * Resolve the concept scheme and concept a `conceptIdentity` URN names.
+ * URN format: `urn:sdmx:...Concept=AGENCY:SCHEME_ID(version).CONCEPT_ID`.
+ * Returns undefined when the URN is absent or carries no version, which is the
+ * only thing separating the scheme id from the concept id.
+ */
+function conceptRefFromUrn(urn: unknown, dimensionId: string): ConceptRef | undefined {
+  if (typeof urn !== 'string') return;
+  const eq = urn.lastIndexOf('=');
+  if (eq < 0) return;
+  const rest = urn.slice(eq + 1); // "AGENCY:SCHEME_ID(version).CONCEPT_ID"
+  const colon = rest.indexOf(':');
+  if (colon < 0) return;
+  const agencyId = rest.slice(0, colon);
+  const tail = rest.slice(colon + 1); // "SCHEME_ID(version).CONCEPT_ID"
+  const paren = tail.indexOf('(');
+  const close = tail.indexOf(')', paren + 1);
+  if (paren < 0 || close < 0) return;
+  const schemeId = tail.slice(0, paren);
+  const conceptId = tail.slice(close + 1).replace(/^\./, '');
+  if (!agencyId || !schemeId || !conceptId) return;
+  return { agencyId, conceptId, dimensionId, schemeId };
+}
+
 /**
  * Extract the DSD identifier from the structure URN.
  * URN format: `urn:sdmx:...=AGENCY:DSD_ID(version)` or `urn:sdmx:...=AGENCY:DSD_ID`.
@@ -265,6 +483,10 @@ function parseDataflows(data: unknown): OecdDataflow[] {
       dsdId = dsdIdFromStructureUrn(structureUrn) ?? rawId.replace(/^DF_/, 'DSD_');
       flowId = rawId;
     }
+    // The catalog id is the reference the endpoints answer. Pairing a DF-only
+    // id with the datastructure named in its URN builds a combined ref the data
+    // endpoint rejects, so the id is passed through as published.
+    const flowRef = `${agencyId},${rawId}`;
 
     const name = localizedString(f.name) ?? rawId;
 
@@ -278,7 +500,7 @@ function parseDataflows(data: unknown): OecdDataflow[] {
     const nonProduction = annotations.some((a) => String(a.id ?? '') === 'NonProductionDataflow');
 
     return {
-      flowRef: `${agencyId},${dsdId}@${flowId}`,
+      flowRef,
       agencyId,
       flowId,
       dsdId,
@@ -289,12 +511,16 @@ function parseDataflows(data: unknown): OecdDataflow[] {
   });
 }
 
-function parseDataStructure(
-  data: unknown,
-  flowRef: string,
-  agencyId: string,
-  dsdId: string,
-): OecdDataStructure {
+/**
+ * The datastructure plus the concept references needed to name its dimensions,
+ * which the response itself does not carry.
+ */
+interface ParsedDataStructure {
+  conceptRefs: ConceptRef[];
+  structure: OecdDataStructure;
+}
+
+function parseDataStructure(data: unknown, flowRef: string, agencyId: string): ParsedDataStructure {
   const root = data as Record<string, unknown>;
   const structures = root?.data as Record<string, unknown> | undefined;
   const rawDsds = (structures?.dataStructures ?? []) as Array<Record<string, unknown>>;
@@ -315,6 +541,12 @@ function parseDataStructure(
   // Check NonProductionDataflow annotation
   const annotations = (dsd.annotations ?? []) as Array<Record<string, unknown>>;
   const nonProduction = annotations.some((a) => String(a.id ?? '') === 'NonProductionDataflow');
+
+  const conceptRefs: ConceptRef[] = [];
+  for (const d of [...rawDims, ...(rawTimeDim ? [rawTimeDim] : [])]) {
+    const ref = conceptRefFromUrn(d.conceptIdentity, String(d.id ?? ''));
+    if (ref) conceptRefs.push(ref);
+  }
 
   const dimensions = rawDims
     .map((d): OecdDimension => {
@@ -363,13 +595,50 @@ function parseDataStructure(
   }
 
   return {
-    flowRef,
-    agencyId,
-    dsdId,
-    dimensions,
-    timeDimension,
-    nonProduction,
+    conceptRefs,
+    structure: {
+      flowRef,
+      agencyId,
+      // The response is authoritative: the `{dsd_id}` half of a combined flow
+      // ref is a label OECD does not keep in step with the real datastructure.
+      dsdId: String(dsd.id ?? ''),
+      dimensions,
+      timeDimension,
+      nonProduction,
+    },
   };
+}
+
+/** Read a concept scheme into a `concept id → name` map. */
+function parseConceptScheme(data: unknown): Map<string, string> {
+  const root = data as Record<string, unknown>;
+  const structures = root?.data as Record<string, unknown> | undefined;
+  const rawSchemes = (structures?.conceptSchemes ?? []) as Array<Record<string, unknown>>;
+  const rawConcepts = (rawSchemes[0]?.concepts ?? []) as Array<Record<string, unknown>>;
+
+  const names = new Map<string, string>();
+  for (const concept of rawConcepts) {
+    const id = String(concept.id ?? '');
+    const name = localizedString(concept.name);
+    if (id && name) names.set(id, name);
+  }
+  return names;
+}
+
+/** Read the OECD agency scheme into a `directorate code → name` map. */
+function parseAgencyScheme(data: unknown): Map<string, string> {
+  const root = data as Record<string, unknown>;
+  const structures = root?.data as Record<string, unknown> | undefined;
+  const rawSchemes = (structures?.agencySchemes ?? []) as Array<Record<string, unknown>>;
+  const rawAgencies = (rawSchemes[0]?.agencies ?? []) as Array<Record<string, unknown>>;
+
+  const names = new Map<string, string>();
+  for (const agency of rawAgencies) {
+    const id = String(agency.id ?? '');
+    const name = localizedString(agency.name);
+    if (id && name) names.set(id, name);
+  }
+  return names;
 }
 
 function parseCodelist(data: unknown): OecdCode[] {

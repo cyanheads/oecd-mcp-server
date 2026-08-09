@@ -26,8 +26,9 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
     flow_ref: z
       .string()
       .describe(
-        'Full flow reference in the form {agencyID},{dsd_id}@{df_id} — ' +
-          'e.g. "OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I". Obtain from oecd_search_datasets.',
+        'Full flow reference, either {agencyID},{dsd_id}@{df_id} — e.g. ' +
+          '"OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I" — or the bare {agencyID},{df_id} form OECD uses for ' +
+          'the few dataflows published without a datastructure prefix. Obtain from oecd_search_datasets.',
       ),
   }),
   output: z.object({
@@ -37,7 +38,12 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
         z
           .object({
             id: z.string().describe('Dimension identifier — e.g. REF_AREA.'),
-            name: z.string().describe('Human-readable dimension name.'),
+            name: z
+              .string()
+              .describe(
+                'Concept name for the dimension — e.g. "Reference area" for REF_AREA. ' +
+                  'Repeats the id when OECD publishes no concept for it.',
+              ),
             position: z
               .number()
               .describe(
@@ -56,7 +62,11 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
     time_dimension: z
       .object({
         id: z.string().describe('Time dimension identifier — typically TIME_PERIOD.'),
-        name: z.string().describe('Human-readable time dimension name.'),
+        name: z
+          .string()
+          .describe(
+            'Concept name for the time dimension, repeating the id when none is published.',
+          ),
         position: z.number().describe('Position after all regular dimensions.'),
       })
       .optional()
@@ -76,10 +86,10 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
     {
       reason: 'invalid_flow_ref',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The flow_ref parameter does not match the expected {agencyID},{dsd_id}@{df_id} format.',
+      when: 'The flow_ref parameter matches neither the {agencyID},{dsd_id}@{df_id} nor the {agencyID},{df_id} format.',
       recovery:
-        'Obtain valid flow_ref values from oecd_search_datasets. ' +
-        'The format is {agencyID},{dsd_id}@{df_id}, e.g. "OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I".',
+        'Obtain valid flow_ref values from oecd_search_datasets and pass one unchanged, ' +
+        'e.g. "OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I".',
     },
     {
       reason: 'dataflow_not_found',
@@ -96,7 +106,7 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
     if (!parts) {
       throw ctx.fail(
         'invalid_flow_ref',
-        `flow_ref "${input.flow_ref}" is not in the expected {agencyID},{dsd_id}@{df_id} format`,
+        `flow_ref "${input.flow_ref}" is not in the expected {agencyID},{dsd_id}@{df_id} or {agencyID},{df_id} format`,
         { ...ctx.recoveryFor('invalid_flow_ref') },
       );
     }

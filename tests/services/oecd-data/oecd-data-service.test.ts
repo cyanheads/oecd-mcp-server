@@ -267,6 +267,94 @@ describe('OecdDataService.fetchData — decoding', () => {
   });
 });
 
+// ── Reference forms ───────────────────────────────────────────────────────────
+
+describe('OecdDataService.fetchData — flow reference forms', () => {
+  it('percent-encodes the separator of a combined reference', async () => {
+    respondOnce(JSON.stringify(DATA_RESPONSE));
+
+    await service().fetchData(FLOW_REF, 'A.USA..');
+
+    expect(http.calls[0]?.request.url).toBe(DATA_URL);
+  });
+
+  it('queries a datastructure-less dataflow under the bare reference OECD answers', async () => {
+    // Pairing this dataflow with the datastructure named in its URN produces
+    // `OECD.TAD.ARP,DSD_AEI2024_DASHBOARD%40DF_AEI2024_DASHBOARD`, which the
+    // data endpoint refuses; the bare id is the reference that resolves.
+    const bareUrl = `${BASE}/data/OECD.TAD.ARP,DF_AEI2024_DASHBOARD/AUS.NBAL.?dimensionAtObservation=AllDimensions`;
+    http.route({ match: bareUrl, respond: () => Response.json(DATA_RESPONSE) });
+
+    const result = await service().fetchData('OECD.TAD.ARP,DF_AEI2024_DASHBOARD', 'AUS.NBAL.');
+
+    expect(http.calls[0]?.request.url).toBe(bareUrl);
+    expect(result.rowCount).toBe(3);
+  });
+
+  it('keeps the flow reference on an all-wildcard key that URL resolution would eat', async () => {
+    // `..` is the every-series key for a three-dimension dataflow and the
+    // key_example those dataflows advertise. Left in the path it resolves away
+    // along with the flow reference, and OECD answers the remainder with a 400.
+    const allUrl = `${BASE}/data/OECD.TAD.ARP,DF_AEI2024_DASHBOARD/all?dimensionAtObservation=AllDimensions`;
+    http.route({ match: allUrl, respond: () => Response.json(DATA_RESPONSE) });
+
+    const result = await service().fetchData('OECD.TAD.ARP,DF_AEI2024_DASHBOARD', '..');
+
+    expect(new URL(http.calls[0]?.request.url ?? '').pathname).toBe(
+      '/data/OECD.TAD.ARP,DF_AEI2024_DASHBOARD/all',
+    );
+    expect(result.rowCount).toBe(3);
+  });
+
+  it('does the same for the two-dimension all-wildcard key', async () => {
+    const allUrl = `${BASE}/data/OECD.SDD.NAD,DSD_NAAG%40DF_NAAG_I/all?dimensionAtObservation=AllDimensions`;
+    http.route({ match: allUrl, respond: () => Response.json(DATA_RESPONSE) });
+
+    await service().fetchData(FLOW_REF, '.');
+
+    expect(new URL(http.calls[0]?.request.url ?? '').pathname).toBe(
+      '/data/OECD.SDD.NAD,DSD_NAAG%40DF_NAAG_I/all',
+    );
+  });
+
+  it('does the same for the percent-encoded spelling of a dot key', async () => {
+    // URL parsing reads `%2e` as a dot when it decides whether a segment is a
+    // dot reference, so `%2e%2e` resolves away exactly as `..` does.
+    const allUrl = `${BASE}/data/OECD.SDD.NAD,DSD_NAAG%40DF_NAAG_I/all?dimensionAtObservation=AllDimensions`;
+    http.route({ match: allUrl, respond: () => Response.json(DATA_RESPONSE) });
+
+    await service().fetchData(FLOW_REF, '%2e%2e');
+
+    expect(new URL(http.calls[0]?.request.url ?? '').pathname).toBe(
+      '/data/OECD.SDD.NAD,DSD_NAAG%40DF_NAAG_I/all',
+    );
+  });
+
+  it('rejects a flow reference whose segment is nothing but dots', async () => {
+    await expect(service().fetchData('OECD.TAD.ARP,..', 'all')).rejects.toThrow('Invalid flow_ref');
+    await expect(service().fetchData('..,DSD_A@DF_B', 'all')).rejects.toThrow('Invalid flow_ref');
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it('leaves a longer wildcard key alone', async () => {
+    const url = `${BASE}/data/OECD.SDD.NAD,DSD_NAAG%40DF_NAAG_I/...?dimensionAtObservation=AllDimensions`;
+    http.route({ match: url, respond: () => Response.json(DATA_RESPONSE) });
+
+    await service().fetchData(FLOW_REF, '...');
+
+    expect(new URL(http.calls[0]?.request.url ?? '').pathname).toBe(
+      '/data/OECD.SDD.NAD,DSD_NAAG%40DF_NAAG_I/...',
+    );
+  });
+
+  it('rejects a reference carrying path characters before any request goes out', async () => {
+    await expect(service().fetchData('OECD.TAD.ARP,../../etc/passwd', '..')).rejects.toThrow(
+      'Invalid flow_ref',
+    );
+    expect(http.calls).toHaveLength(0);
+  });
+});
+
 // ── Upstream boundary ─────────────────────────────────────────────────────────
 
 describe('OecdDataService.fetchData — upstream failures', () => {

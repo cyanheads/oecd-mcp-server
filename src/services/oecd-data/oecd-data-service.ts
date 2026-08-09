@@ -15,6 +15,7 @@ import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { fetchOecd, upstreamStatus } from '@/services/oecd-http/oecd-http.js';
 import { parseFlowRef } from '@/services/oecd-structure/oecd-structure-service.js';
+import type { DecodedRow, OecdColumn, OecdDataResult } from './types.js';
 
 /**
  * Allowed characters in an SDMX dimension key segment value.
@@ -24,7 +25,22 @@ import { parseFlowRef } from '@/services/oecd-structure/oecd-structure-service.j
  */
 const SDMX_KEY_SAFE = /^[A-Za-z0-9._+%-]*$/;
 
-import type { DecodedRow, OecdColumn, OecdDataResult } from './types.js';
+/**
+ * All-wildcard keys that URL normalization removes.
+ *
+ * The key occupies one path segment, so a key of `.` or `..` is read as a
+ * relative path reference and resolved away before the request is sent — `..`
+ * takes the flow reference with it and OECD answers the remainder with
+ * `Invalid structure: data`. Both are the every-series selection for a two- or
+ * three-dimension dataflow, which is exactly the `key_example` those dataflows
+ * advertise. SDMX spells the same selection as `all`, which survives
+ * normalization; longer wildcard keys (`...`) are unaffected.
+ *
+ * The pattern covers the percent-encoded spellings too. URL parsing treats
+ * `%2e` as a dot when it decides whether a segment is a dot reference, so
+ * `%2e%2e` resolves away exactly as `..` does.
+ */
+const NORMALIZED_AWAY_KEY = /^(?:\.|%2e){1,2}$/i;
 
 const DATA_ACCEPT = 'application/vnd.sdmx.data+json;version=2.0';
 
@@ -167,9 +183,11 @@ export class OecdDataService {
       throw validationError('Dimension key contains characters SDMX does not allow', { flowRef });
     }
 
-    // URL-encode `@` in the combined flowId
-    const encodedFlowId = `${parts.dsdId}%40${parts.dfId}`;
-    let url = `${this.baseUrl}/data/${parts.agencyId},${encodedFlowId}/${key}?dimensionAtObservation=AllDimensions`;
+    // The combined form needs `@` percent-encoded; a bare DF-only ref has no
+    // datastructure part and is sent as published.
+    const encodedFlowId = parts.dsdId ? `${parts.dsdId}%40${parts.dfId}` : parts.dfId;
+    const pathKey = NORMALIZED_AWAY_KEY.test(key) ? 'all' : key;
+    let url = `${this.baseUrl}/data/${parts.agencyId},${encodedFlowId}/${pathKey}?dimensionAtObservation=AllDimensions`;
     if (startPeriod) url += `&startPeriod=${encodeURIComponent(startPeriod)}`;
     if (endPeriod) url += `&endPeriod=${encodeURIComponent(endPeriod)}`;
 

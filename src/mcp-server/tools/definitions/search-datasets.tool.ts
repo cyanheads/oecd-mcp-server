@@ -76,7 +76,9 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
             flow_ref: z
               .string()
               .describe(
-                'Full flow reference in the form {agencyID},{dsd_id}@{df_id} — pass to oecd_get_dataset_info or oecd_query_dataset.',
+                'Full flow reference — {agencyID},{dsd_id}@{df_id}, or {agencyID},{df_id} for the ' +
+                  'few dataflows OECD publishes without a datastructure prefix. Pass through ' +
+                  'unchanged to oecd_get_dataset_info or oecd_query_dataset.',
               ),
             agency_id: z.string().describe('Publishing agency identifier.'),
             name: z.string().describe('Human-readable dataflow name.'),

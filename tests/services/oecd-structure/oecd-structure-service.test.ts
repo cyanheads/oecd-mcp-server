@@ -7,6 +7,7 @@ import { JsonRpcErrorCode, McpError, notFound } from '@cyanheads/mcp-ts-core/err
 import { createFetchMock } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  directorateCode,
   getStructureService,
   initStructureService,
   isDataflowNotFound,
@@ -22,12 +23,17 @@ describe('parseFlowRef', () => {
     expect(result).toEqual({ agencyId: 'OECD.SDD.NAD', dsdId: 'DSD_NAAG', dfId: 'DF_NAAG_I' });
   });
 
-  it('returns null when comma is missing', () => {
-    expect(parseFlowRef('OECD.SDD.NAD')).toBeNull();
+  it('parses the bare form OECD publishes for datastructure-less dataflows', () => {
+    // The data endpoint answers this reference and rejects DSD_…@DF_… for these
+    // flows, so it has to survive input validation.
+    expect(parseFlowRef('OECD.TAD.ARP,DF_AEI2024_DASHBOARD')).toEqual({
+      agencyId: 'OECD.TAD.ARP',
+      dfId: 'DF_AEI2024_DASHBOARD',
+    });
   });
 
-  it('returns null when @ separator is missing', () => {
-    expect(parseFlowRef('OECD.SDD.NAD,DSD_NAAG_DF_NAAG_I')).toBeNull();
+  it('returns null when comma is missing', () => {
+    expect(parseFlowRef('OECD.SDD.NAD')).toBeNull();
   });
 
   it('returns null for empty string', () => {
@@ -36,8 +42,54 @@ describe('parseFlowRef', () => {
 
   it('returns null when any part is empty after splitting', () => {
     expect(parseFlowRef(',@DF_NAAG_I')).toBeNull(); // empty agencyId
-    expect(parseFlowRef('OECD,@DF')).toBeNull(); // empty dsdId
+    expect(parseFlowRef('OECD,@DF')).toBeNull(); // empty dsdId beside a present '@'
     expect(parseFlowRef('OECD,DSD@')).toBeNull(); // empty dfId
+    expect(parseFlowRef('OECD,')).toBeNull(); // empty bare dfId
+  });
+
+  it('rejects characters that could alter the URL path', () => {
+    expect(parseFlowRef('OECD.SDD.NAD,DSD_NAAG@../../etc/passwd')).toBeNull();
+    expect(parseFlowRef('OECD.SDD.NAD,../../secret')).toBeNull();
+    expect(parseFlowRef('OECD.SDD.NAD,DSD@DF?x=1')).toBeNull();
+    expect(parseFlowRef('OECD.SDD.NAD,DSD@DF#frag')).toBeNull();
+    expect(parseFlowRef('OECD.SDD.NAD,DSD/EVIL@DF')).toBeNull();
+    expect(parseFlowRef('OECD/EVIL,DSD@DF')).toBeNull();
+    expect(parseFlowRef('OECD.SDD.NAD,DF_A%2fB')).toBeNull();
+    expect(parseFlowRef('OECD.SDD.NAD,DF_A B')).toBeNull();
+  });
+
+  it('rejects an identifier that is nothing but dots, in every position', () => {
+    // A whole-segment `.` or `..` is a relative path reference: URL resolution
+    // removes it and walks the request out of the endpoint it was addressed to.
+    // The bare form makes the dfId position reachable with no '@' to stop it.
+    expect(parseFlowRef('OECD.TAD.ARP,..')).toBeNull();
+    expect(parseFlowRef('OECD.TAD.ARP,.')).toBeNull();
+    expect(parseFlowRef('..,DSD_NAAG@DF_NAAG_I')).toBeNull();
+    expect(parseFlowRef('OECD.SDD.NAD,..@DF_NAAG_I')).toBeNull();
+    expect(parseFlowRef('OECD.SDD.NAD,DSD_NAAG@..')).toBeNull();
+    expect(parseFlowRef('..,..')).toBeNull();
+  });
+
+  it('keeps dots inside an identifier, which every agency id carries', () => {
+    expect(parseFlowRef('OECD.SDD.NAD.SEEA,DSD_A@DF_B')).toMatchObject({
+      agencyId: 'OECD.SDD.NAD.SEEA',
+    });
+    expect(parseFlowRef('IAEG-SDGs,DF_SDG_GLH')).toMatchObject({ agencyId: 'IAEG-SDGs' });
+  });
+});
+
+// ── directorateCode ───────────────────────────────────────────────────────────
+
+describe('directorateCode', () => {
+  it('reads the directorate segment regardless of how many segments follow', () => {
+    expect(directorateCode('OECD.SDD.NAD')).toBe('SDD');
+    expect(directorateCode('OECD.SDD.NAD.SEEA')).toBe('SDD');
+    expect(directorateCode('OECD.ITF')).toBe('ITF');
+  });
+
+  it('resolves nothing for a publisher with no directorate segment', () => {
+    expect(directorateCode('ESTAT')).toBeUndefined();
+    expect(directorateCode('IAEG-SDGs')).toBeUndefined();
   });
 });
 
@@ -143,12 +195,13 @@ describe('OecdStructureService.fetchDataflows', () => {
       flowRef: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_II',
       nonProduction: true,
     });
-    // DF-only id case: DSD extracted from structure URN
+    // DF-only id case: the reference stays as OECD publishes it, since pairing
+    // it with the URN's datastructure produces a ref the data endpoint rejects.
     expect(flows[2]).toMatchObject({
       agencyId: 'ESTAT',
       dsdId: 'SDG_DSD',
       flowId: 'DF_SDG_GLC',
-      flowRef: 'ESTAT,SDG_DSD@DF_SDG_GLC',
+      flowRef: 'ESTAT,DF_SDG_GLC',
       nonProduction: false,
     });
   });
@@ -442,6 +495,358 @@ describe('OecdStructureService.fetchDataStructure', () => {
   it('throws on invalid flow_ref format', async () => {
     const svc = new OecdStructureService('https://fake.oecd.test');
     await expect(svc.fetchDataStructure('bad-format')).rejects.toThrow('Invalid flow_ref');
+  });
+});
+
+// ── Dimension names from the concept scheme ───────────────────────────────────
+
+/**
+ * OECD's datastructure response carries no `name` on a dimension — only `id`,
+ * `position`, `conceptIdentity` and `localRepresentation`. The names live in
+ * the concept scheme the `conceptIdentity` URN points at.
+ */
+const NAMELESS_DSD_RESPONSE = {
+  data: {
+    dataStructures: [
+      {
+        id: 'DSD_NAMAIN1',
+        annotations: [],
+        dataStructureComponents: {
+          dimensionList: {
+            dimensions: [
+              {
+                id: 'FREQ',
+                position: 0,
+                conceptIdentity:
+                  'urn:sdmx:org.sdmx.infomodel.conceptscheme.Concept=OECD.SDD.NAD:CS_NA(1.0).FREQ',
+                localRepresentation: {
+                  enumeration: 'urn:sdmx:org.sdmx.infomodel.codelist.Codelist=SDMX:CL_FREQ(2.1)',
+                },
+              },
+              {
+                id: 'INSTR_ASSET',
+                position: 1,
+                conceptIdentity:
+                  'urn:sdmx:org.sdmx.infomodel.conceptscheme.Concept=OECD.SDD.NAD:CS_NA(1.0).INSTR_ASSET',
+              },
+              {
+                // A dimension the scheme does not cover.
+                id: 'TABLE_IDENTIFIER',
+                position: 2,
+                conceptIdentity:
+                  'urn:sdmx:org.sdmx.infomodel.conceptscheme.Concept=OECD.SDD.NAD:CS_NA(1.0).TABLE_IDENTIFIER',
+              },
+            ],
+            timeDimensions: [
+              {
+                id: 'TIME_PERIOD',
+                conceptIdentity:
+                  'urn:sdmx:org.sdmx.infomodel.conceptscheme.Concept=OECD.SDD.NAD:CS_NA(1.0).TIME_PERIOD',
+              },
+            ],
+          },
+        },
+      },
+    ],
+  },
+};
+
+const CONCEPT_SCHEME_RESPONSE = {
+  data: {
+    conceptSchemes: [
+      {
+        id: 'CS_NA',
+        concepts: [
+          { id: 'FREQ', name: { en: 'Frequency of observation' } },
+          { id: 'INSTR_ASSET', name: 'Financial instruments and non-financial assets' },
+          { id: 'TIME_PERIOD', name: 'Time period' },
+        ],
+      },
+    ],
+  },
+};
+
+const DSD_URL = 'https://fake.oecd.test/datastructure/OECD.SDD.NAD/DSD_NAMAIN1';
+const SCHEME_URL = 'https://fake.oecd.test/conceptscheme/OECD.SDD.NAD/CS_NA';
+const NAMAIN_FLOW_REF = 'OECD.SDD.NAD,DSD_NAMAIN1@DF_QNA_EXPENDITURE_GROWTH_OECD';
+
+describe('OecdStructureService.fetchDataStructure — dimension names', () => {
+  const http = createFetchMock();
+
+  beforeEach(() => {
+    http.reset();
+    http.install();
+  });
+
+  afterEach(() => {
+    http.restore();
+  });
+
+  it('names each dimension from the concept scheme instead of echoing the id', async () => {
+    http.route(
+      { match: DSD_URL, respond: () => Response.json(NAMELESS_DSD_RESPONSE) },
+      { match: SCHEME_URL, respond: () => Response.json(CONCEPT_SCHEME_RESPONSE) },
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const dsd = await svc.fetchDataStructure(NAMAIN_FLOW_REF);
+
+    expect(dsd.dimensions[0]).toMatchObject({ id: 'FREQ', name: 'Frequency of observation' });
+    expect(dsd.dimensions[1]).toMatchObject({
+      id: 'INSTR_ASSET',
+      name: 'Financial instruments and non-financial assets',
+    });
+    expect(dsd.timeDimension).toMatchObject({ id: 'TIME_PERIOD', name: 'Time period' });
+  });
+
+  it('leaves a dimension the scheme omits on its id', async () => {
+    http.route(
+      { match: DSD_URL, respond: () => Response.json(NAMELESS_DSD_RESPONSE) },
+      { match: SCHEME_URL, respond: () => Response.json(CONCEPT_SCHEME_RESPONSE) },
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const dsd = await svc.fetchDataStructure(NAMAIN_FLOW_REF);
+
+    expect(dsd.dimensions[2]).toMatchObject({
+      id: 'TABLE_IDENTIFIER',
+      name: 'TABLE_IDENTIFIER',
+    });
+  });
+
+  it('fetches one scheme for the whole datastructure', async () => {
+    http.route(
+      { match: DSD_URL, respond: () => Response.json(NAMELESS_DSD_RESPONSE) },
+      { match: SCHEME_URL, respond: () => Response.json(CONCEPT_SCHEME_RESPONSE) },
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    await svc.fetchDataStructure(NAMAIN_FLOW_REF);
+
+    expect(http.calls.filter((c) => c.request.url === SCHEME_URL)).toHaveLength(1);
+  });
+
+  it('still returns the datastructure when the concept scheme is unreachable', async () => {
+    http.route(
+      { match: DSD_URL, respond: () => Response.json(NAMELESS_DSD_RESPONSE) },
+      { match: SCHEME_URL, respond: () => new Response('upstream boom', { status: 503 }) },
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const dsd = await svc.fetchDataStructure(NAMAIN_FLOW_REF);
+
+    expect(dsd.dimensions.map((d) => d.name)).toEqual(['FREQ', 'INSTR_ASSET', 'TABLE_IDENTIFIER']);
+    expect(dsd.timeDimension).toMatchObject({ name: 'TIME_PERIOD' });
+  });
+
+  it('degrades without a request when conceptIdentity is absent or unparseable', async () => {
+    const noConcepts = {
+      data: {
+        dataStructures: [
+          {
+            id: 'DSD_NAMAIN1',
+            annotations: [],
+            dataStructureComponents: {
+              dimensionList: {
+                dimensions: [
+                  { id: 'FREQ', position: 0 },
+                  { id: 'REF_AREA', position: 1, conceptIdentity: 'not-a-urn' },
+                  { id: 'MEASURE', position: 2, conceptIdentity: 42 },
+                  {
+                    // Versionless URN: nothing separates the scheme id from the concept id.
+                    id: 'SECTOR',
+                    position: 3,
+                    conceptIdentity:
+                      'urn:sdmx:org.sdmx.infomodel.conceptscheme.Concept=OECD.SDD.NAD:CS_NA.SECTOR',
+                  },
+                ],
+                timeDimensions: [{ id: 'TIME_PERIOD' }],
+              },
+            },
+          },
+        ],
+      },
+    };
+    http.route({ match: DSD_URL, respond: () => Response.json(noConcepts) });
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const dsd = await svc.fetchDataStructure(NAMAIN_FLOW_REF);
+
+    expect(dsd.dimensions.map((d) => d.name)).toEqual(['FREQ', 'REF_AREA', 'MEASURE', 'SECTOR']);
+    // No conceptIdentity to follow means no second request is issued at all.
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it('resolves through the dataflow when the ref prefix names no datastructure', async () => {
+    // OECD publishes combined ids whose `@`-prefix is not the datastructure —
+    // the prefix 404s while the catalogued id answers.
+    http.route(
+      {
+        match: 'https://fake.oecd.test/datastructure/OECD.CFE.EDS/DSD_REG_LAB',
+        respond: () => new Response('Could not find requested structures', { status: 404 }),
+      },
+      {
+        match:
+          'https://fake.oecd.test/dataflow/OECD.CFE.EDS/DSD_REG_LAB@DF_RATES?references=datastructure',
+        respond: () => Response.json(NAMELESS_DSD_RESPONSE),
+      },
+      { match: SCHEME_URL, respond: () => Response.json(CONCEPT_SCHEME_RESPONSE) },
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const dsd = await svc.fetchDataStructure('OECD.CFE.EDS,DSD_REG_LAB@DF_RATES');
+
+    // The response names the datastructure the ref prefix got wrong.
+    expect(dsd.dsdId).toBe('DSD_NAMAIN1');
+    expect(dsd.dimensions).toHaveLength(3);
+  });
+
+  it('spends one structure request when the ref prefix resolves', async () => {
+    http.route(
+      { match: DSD_URL, respond: () => Response.json(NAMELESS_DSD_RESPONSE) },
+      { match: SCHEME_URL, respond: () => Response.json(CONCEPT_SCHEME_RESPONSE) },
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    await svc.fetchDataStructure(NAMAIN_FLOW_REF);
+
+    // Datastructure + concept scheme, with no speculative dataflow lookup.
+    expect(http.calls.map((c) => c.request.url)).toEqual([DSD_URL, SCHEME_URL]);
+  });
+
+  it('reports an outage on the datastructure route instead of retrying down the other one', async () => {
+    http.route({ match: DSD_URL, respond: () => new Response('boom', { status: 503 }) });
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    await expect(svc.fetchDataStructure(NAMAIN_FLOW_REF)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+    });
+    // Three attempts on the one route; the dataflow route is never reached.
+    expect(http.calls.every((c) => c.request.url === DSD_URL)).toBe(true);
+  });
+
+  it('reports not-found when neither route resolves the ref', async () => {
+    http.route(
+      {
+        match: 'https://fake.oecd.test/datastructure/OECD.SDD.NAD/DSD_GONE',
+        respond: () => new Response('Could not find requested structures', { status: 404 }),
+      },
+      {
+        match:
+          'https://fake.oecd.test/dataflow/OECD.SDD.NAD/DSD_GONE@DF_GONE?references=datastructure',
+        respond: () => new Response('Could not find requested structures', { status: 404 }),
+      },
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const error = await svc
+      .fetchDataStructure('OECD.SDD.NAD,DSD_GONE@DF_GONE')
+      .catch((e: Error) => e);
+
+    expect(isDataflowNotFound(error as Error)).toBe(true);
+    expect(http.calls).toHaveLength(2);
+  });
+
+  it('falls back when the datastructure route answers 200 with nothing in it', async () => {
+    http.route(
+      { match: DSD_URL, respond: () => Response.json({ data: { dataStructures: [] } }) },
+      {
+        match: `https://fake.oecd.test/dataflow/OECD.SDD.NAD/DSD_NAMAIN1@DF_QNA_EXPENDITURE_GROWTH_OECD?references=datastructure`,
+        respond: () => Response.json(NAMELESS_DSD_RESPONSE),
+      },
+      { match: SCHEME_URL, respond: () => Response.json(CONCEPT_SCHEME_RESPONSE) },
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const dsd = await svc.fetchDataStructure(NAMAIN_FLOW_REF);
+
+    expect(dsd.dimensions).toHaveLength(3);
+  });
+
+  it('resolves a bare flow ref through the dataflow entry that carries its datastructure', async () => {
+    http.route(
+      {
+        match:
+          'https://fake.oecd.test/dataflow/OECD.TAD.ARP/DF_AEI2024_DASHBOARD?references=datastructure',
+        respond: () => Response.json(NAMELESS_DSD_RESPONSE),
+      },
+      { match: SCHEME_URL, respond: () => Response.json(CONCEPT_SCHEME_RESPONSE) },
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const dsd = await svc.fetchDataStructure('OECD.TAD.ARP,DF_AEI2024_DASHBOARD');
+
+    expect(dsd.dimensions).toHaveLength(3);
+    expect(dsd.dimensions[0]).toMatchObject({ id: 'FREQ', name: 'Frequency of observation' });
+    // The response names the datastructure the bare reference could not.
+    expect(dsd.dsdId).toBe('DSD_NAMAIN1');
+  });
+});
+
+// ── fetchDirectorates ─────────────────────────────────────────────────────────
+
+const AGENCY_SCHEME_RESPONSE = {
+  data: {
+    agencySchemes: [
+      {
+        id: 'AGENCIES',
+        agencies: [
+          { id: 'SDD', name: { en: 'Statistics and Data Directorate' } },
+          { id: 'CTP', name: 'Centre for Tax Policy and Administration' },
+          { id: 'ITF', name: 'International Transport Forum' },
+        ],
+      },
+    ],
+  },
+};
+
+describe('OecdStructureService.fetchDirectorates', () => {
+  const http = createFetchMock();
+
+  beforeEach(() => {
+    http.reset();
+    http.install();
+  });
+
+  afterEach(() => {
+    http.restore();
+  });
+
+  it('maps directorate codes to their published names', async () => {
+    http.route({
+      match: 'https://fake.oecd.test/agencyscheme/OECD',
+      respond: () => Response.json(AGENCY_SCHEME_RESPONSE),
+    });
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const directorates = await svc.fetchDirectorates();
+
+    expect(directorates.get('SDD')).toBe('Statistics and Data Directorate');
+    expect(directorates.get('CTP')).toBe('Centre for Tax Policy and Administration');
+    expect(directorates.get('ITF')).toBe('International Transport Forum');
+    expect(directorates.has('NAD')).toBe(false);
+  });
+
+  it('returns an empty map when the scheme carries no agencies', async () => {
+    http.route({
+      match: 'https://fake.oecd.test/agencyscheme/OECD',
+      respond: () => Response.json({ data: { agencySchemes: [] } }),
+    });
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    expect((await svc.fetchDirectorates()).size).toBe(0);
+  });
+
+  it('surfaces an upstream failure to the caller', async () => {
+    http.route({
+      match: 'https://fake.oecd.test/agencyscheme/OECD',
+      respond: () => new Response('upstream boom', { status: 503 }),
+    });
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    await expect(svc.fetchDirectorates()).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+    });
   });
 });
 

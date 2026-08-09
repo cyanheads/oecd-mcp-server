@@ -111,7 +111,9 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     flow_ref: z
       .string()
       .describe(
-        'Full flow reference — e.g. "OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I". Obtain from oecd_search_datasets.',
+        'Full flow reference — e.g. "OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I", or the bare ' +
+          '"OECD.TAD.ARP,DF_AEI2024_DASHBOARD" form for a dataflow published without a ' +
+          'datastructure prefix. Obtain from oecd_search_datasets and pass it through unchanged.',
       ),
     key: z
       .string()
@@ -204,10 +206,9 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     {
       reason: 'invalid_flow_ref',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The flow_ref is not in the expected format.',
+      when: 'The flow_ref matches neither the {agencyID},{dsd_id}@{df_id} nor the {agencyID},{df_id} format.',
       recovery:
-        'Obtain valid flow_ref values from oecd_search_datasets. ' +
-        'Format: {agencyID},{dsd_id}@{df_id}.',
+        'Obtain valid flow_ref values from oecd_search_datasets and pass one through unchanged.',
     },
     {
       reason: 'dataflow_not_found',
