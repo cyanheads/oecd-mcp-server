@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-08-09 · ⚠️ Breaking · 🛡️ Security
+
+Dataflow reference resolution, concept-name and directorate metadata, paged codelists, dot-segment identifier fix
+
 ## [0.1.5](changelog/0.1.x/0.1.5.md) — 2026-08-09
 
 UNIT_MULT value scaling correction, full inline rendering, typed upstream-failure classification
