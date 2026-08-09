@@ -1,6 +1,6 @@
 {
-  "name": "@cyanheads/oecd-mcp-server",
-  "version": "0.1.3",
+  "name": "oecd-mcp-server",
+  "version": "0.1.4",
   "description": "Search and query 1,500+ OECD statistical datasets via SDMX. Keyless.",
   "author": {
     "name": "cyanheads",
@@ -23,7 +23,7 @@
   "interface": {
     "displayName": "oecd-mcp-server",
     "shortDescription": "Search and query 1,500+ OECD statistical datasets via SDMX. Keyless.",
-    "longDescription": "Search, explore, and query 1,500+ OECD statistical datasets (national accounts, employment, trade, PISA, health) via SDMX via MCP. STDIO or Streamable HTTP.",
+    "longDescription": "Search, explore, and query 1,500+ OECD statistical datasets (national accounts, employment, trade, education, health) via SDMX via MCP. STDIO or Streamable HTTP.",
     "developerName": "cyanheads",
     "category": "Data & Analytics",
     "capabilities": ["Read"],

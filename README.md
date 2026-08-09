@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/oecd-mcp-server</h1>
-  <p><b>Search, explore, and query 1,500+ OECD statistical datasets (national accounts, employment, trade, PISA, health) via SDMX via MCP. STDIO or Streamable HTTP.</b>
+  <p><b>Search, explore, and query 1,500+ OECD statistical datasets (national accounts, employment, trade, education, health) via SDMX via MCP. STDIO or Streamable HTTP.</b>
   <div>7 Tools • 1 Resource</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.1.3-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/oecd-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.29.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/oecd-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/oecd-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.11-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.1.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/oecd-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^1.30.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/oecd-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/oecd-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^6.0.3-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.14-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -39,7 +39,7 @@ Five discovery and data tools plus two SQL analytics tools for large query resul
 
 Entry point for discovery — enumerate OECD's statistical departments before searching.
 
-- Returns agency IDs (e.g. `OECD.SDD.NAD`, `OECD.ELS`, `OECD.EDU`) and dataflow counts
+- Returns agency IDs (e.g. `OECD.SDD.NAD`, `OECD.ELS.SPD`, `OECD.EDU.IMEP`) and dataflow counts
 - Useful for scoping `oecd_search_datasets` by department (national accounts, labour, education, etc.)
 
 ---
@@ -48,8 +48,10 @@ Entry point for discovery — enumerate OECD's statistical departments before se
 
 Search the full catalog of 1,500+ OECD dataflows by keyword or department.
 
-- Token-matching across dataflow names — finds GDP, PISA, trade, inflation, and other datasets by description
+- Token-matching across dataflow names and descriptions — reaches datasets whose name never carries the term, so `inflation` returns `Economic Outlook 119` and `poverty` returns `Income inequality - Regions`
+- Each result reports `matched_in` (`name`, `description`, or `both`) and a plain-text description trimmed to 240 characters
 - Optional `agency_id` filter scopes results to a specific statistical department
+- `limit` (1–100) and `offset` page through the match list; `total_matches` reports the full count
 - Returns `flow_ref` values (e.g. `OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I`) — pass directly to `oecd_get_dataset_info` or `oecd_query_dataset`
 - Fetches and filters in-memory; the full catalog is ~800 KB and bounded (OECD adds datasets weekly, not continuously)
 
@@ -71,7 +73,7 @@ Inspect a dataflow's structure before querying.
 Resolve human-readable names (countries, measures) to SDMX codes.
 
 - Returns all valid code + label pairs for a single dimension (e.g. `REF_AREA` → `USA`/`United States`, `DEU`/`Germany`)
-- The `REF_AREA` codelist has 570+ entries and is returned in full
+- Large codelists are returned in full — the `REF_AREA` list runs to 570 entries — in `structuredContent`; the rendered text block lists the first 50 and states the total
 - Use substring matching on the returned list to find the right code before building a key
 
 ---
@@ -226,7 +228,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.3.11](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.3.14](https://bun.sh/) or higher (or Node.js v24+).
 - No API key required — OECD SDMX is a free, public API.
 
 ### Installation
