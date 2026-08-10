@@ -1,6 +1,6 @@
 # oecd-mcp-server - Directory Structure
 
-Generated on: 2026-08-10 00:57:25
+Generated on: 2026-08-10 02:51:23
 
 ```text
 oecd-mcp-server/
@@ -23,6 +23,7 @@ oecd-mcp-server/
 ├── changelog/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
+│   ├── 0.3.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -163,6 +164,8 @@ oecd-mcp-server/
 │   │       └── types.ts
 │   └── index.ts
 ├── tests/
+│   ├── helpers/
+│   │   └── error-contract.ts
 │   ├── prompts/
 │   ├── resources/
 │   │   └── dataflow.resource.test.ts
@@ -174,14 +177,15 @@ oecd-mcp-server/
 │   │   │   └── oecd-http.test.ts
 │   │   └── oecd-structure/
 │   │       └── oecd-structure-service.test.ts
-│   └── tools/
-│       ├── dataframe-describe.tool.test.ts
-│       ├── dataframe-query.tool.test.ts
-│       ├── get-dataset-info.tool.test.ts
-│       ├── get-dimension-values.tool.test.ts
-│       ├── list-agencies.tool.test.ts
-│       ├── query-dataset.tool.test.ts
-│       └── search-datasets.tool.test.ts
+│   ├── tools/
+│   │   ├── dataframe-describe.tool.test.ts
+│   │   ├── dataframe-query.tool.test.ts
+│   │   ├── get-dataset-info.tool.test.ts
+│   │   ├── get-dimension-values.tool.test.ts
+│   │   ├── list-agencies.tool.test.ts
+│   │   ├── query-dataset.tool.test.ts
+│   │   └── search-datasets.tool.test.ts
+│   └── error-contract-coherence.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes

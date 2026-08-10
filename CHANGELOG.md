@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-08-10 · ⚠️ Breaking
+
+All seven tools and the dataflow resource now declare explicit reasons and recovery hints for OECD upstream failures and unparseable flow references, in place of bare or inconsistent codes
+
 ## [0.2.2](changelog/0.2.x/0.2.2.md) — 2026-08-10 · 🛡️ Security
 
 OECD fetch boundary refuses redirects instead of following them; five tools now report the refusal as a misconfiguration, not a retryable outage
