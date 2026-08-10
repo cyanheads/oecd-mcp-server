@@ -274,7 +274,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 
 | Variable | Description | Default |
 |:---------|:------------|:--------|
-| `OECD_BASE_URL` | OECD SDMX REST API base URL. | `https://sdmx.oecd.org/public/rest` |
+| `OECD_BASE_URL` | OECD SDMX REST API base URL. Must be an https origin that answers directly — no redirect is followed, so a plaintext `http://` origin fails instead of being upgraded to https. | `https://sdmx.oecd.org/public/rest` |
 | `OECD_TIMEOUT_MS` | Per-request timeout in milliseconds. | `30000` |
 | `CANVAS_PROVIDER_TYPE` | Canvas engine. Set to `duckdb` so a large `oecd_query_dataset` result spills to a queryable table instead of just capping the rendered preview — unset, every row still comes back in `structuredContent`, only the rendered table is capped. | `none` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
@@ -327,7 +327,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/config/` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools/definitions/` | Tool definitions (`*.tool.ts`) — seven tools for OECD data discovery and retrieval. |
 | `src/mcp-server/resources/definitions/` | Resource definitions (`*.resource.ts`) — the `oecd://dataflow` resource. |
-| `src/services/oecd-http/` | Shared OECD fetch boundary — timeout and retry-classification corrections used by both services below, plus the origin check every delegated service root passes before it is addressed. |
+| `src/services/oecd-http/` | Shared OECD fetch boundary — timeout and retry-classification corrections used by both services below, the origin check every delegated service root passes before it is addressed, and the refusal of any redirect off the configured host. |
 | `src/services/oecd-structure/` | OECD SDMX structure service — dataflows, data structures, codelists. |
 | `src/services/oecd-data/` | OECD SDMX data service — observations, SDMX-JSON decoding, DataCanvas spillover. |
 | `src/services/canvas-accessor/` | DataCanvas accessor — registers and exposes the framework canvas instance to tools. |
