@@ -1,6 +1,6 @@
 {
   "name": "@cyanheads/oecd-mcp-server",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Search, explore, and query 1,500+ OECD statistical datasets (national accounts, employment, trade, education, health) via SDMX via MCP. STDIO or Streamable HTTP.",
   "mcpName": "io.github.cyanheads/oecd-mcp-server",
   "type": "module",

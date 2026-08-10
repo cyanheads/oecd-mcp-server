@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.2.1](changelog/0.2.x/0.2.1.md) — 2026-08-09
+
+Delegated dataflows resolve end to end; codelists and concept schemes read at the root and version the datastructure references
+
 ## [0.2.0](changelog/0.2.x/0.2.0.md) — 2026-08-09 · ⚠️ Breaking · 🛡️ Security
 
 Dataflow reference resolution, concept-name and directorate metadata, paged codelists, dot-segment identifier fix
