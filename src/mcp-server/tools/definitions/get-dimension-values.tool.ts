@@ -6,7 +6,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { refusedRedirectText } from '@/services/oecd-http/oecd-http.js';
+import { upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
 import {
   getStructureService,
   isDataflowNotFound,
@@ -108,6 +108,14 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
   },
   errors: [
     {
+      reason: 'invalid_flow_ref',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The flow_ref parameter matches neither the {agencyID},{dsd_id}@{df_id} nor the {agencyID},{df_id} format.',
+      recovery:
+        'Obtain valid flow_ref values from oecd_search_datasets and pass one unchanged, ' +
+        'e.g. "OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I".',
+    },
+    {
       reason: 'dataflow_not_found',
       code: JsonRpcErrorCode.NotFound,
       when: 'The flow_ref does not correspond to a known dataflow.',
@@ -122,6 +130,33 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
         'then use one of the returned dimension IDs.',
     },
     {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      when: 'OECD throttled the request rate and was still refusing after the retries.',
+      recovery:
+        'Wait several seconds before calling again, and space out consecutive queries ' +
+        'rather than issuing them back to back.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      when: 'OECD did not finish responding before OECD_TIMEOUT_MS elapsed.',
+      recovery:
+        'Retry once — a codelist response runs to megabytes and is occasionally slow — ' +
+        'and raise OECD_TIMEOUT_MS if it keeps timing out.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'OECD returned a server fault or was unreachable once the retries ran out.',
+      recovery:
+        'Retry after a short pause; if it keeps failing, check OECD API availability ' +
+        'before issuing further queries.',
+    },
+    {
       reason: 'upstream_redirect',
       code: JsonRpcErrorCode.Forbidden,
       retryable: false,
@@ -130,17 +165,49 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
         'Stop retrying and report the server configuration — OECD_BASE_URL must name the https ' +
         'origin that answers directly, and no wait clears a redirect.',
     },
+    {
+      reason: 'upstream_error',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'OECD refused the request with a status this server does not model — an authorization challenge, a rejection from something sitting in front of the API, or a request read as malformed.',
+      recovery:
+        'Retry once; a repeat is not transient, so report the OECD response and check that ' +
+        'OECD_BASE_URL names the public SDMX API rather than a proxy in front of it.',
+    },
   ],
 
   async handler(input, ctx) {
+    /**
+     * A ref that does not parse is a syntax failure — no request is issued, so
+     * nothing has been looked up and "not found" would assert something this
+     * server never checked. The same string reaches oecd_get_dataset_info,
+     * oecd_query_dataset, and the dataflow resource as `invalid_flow_ref`.
+     */
     const parts = parseFlowRef(input.flow_ref);
     if (!parts) {
       throw ctx.fail(
-        'dataflow_not_found',
-        `flow_ref "${input.flow_ref}" is not in the expected format`,
-        { ...ctx.recoveryFor('dataflow_not_found') },
+        'invalid_flow_ref',
+        `flow_ref "${input.flow_ref}" is not in the expected {agencyID},{dsd_id}@{df_id} or {agencyID},{df_id} format`,
+        { ...ctx.recoveryFor('invalid_flow_ref') },
       );
     }
+
+    /**
+     * Both upstream calls report an OECD refusal the same way. The codelist read
+     * sits outside the datastructure's catch and needs the same ladder — a
+     * throttle is charged across every endpoint, so it lands on whichever of the
+     * two happens to be in flight.
+     */
+    const asUpstreamFailure = (err: unknown): unknown => {
+      const refusal = upstreamRefusal(err);
+      return refusal
+        ? ctx.fail(
+            refusal.reason,
+            refusal.message,
+            { ...ctx.recoveryFor(refusal.reason) },
+            { cause: err as Error },
+          )
+        : err;
+    };
 
     ctx.log.info('Fetching dimension values', {
       flowRef: input.flow_ref,
@@ -160,16 +227,7 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
           ...ctx.recoveryFor('dataflow_not_found'),
         });
       }
-      const refusal = refusedRedirectText(err);
-      if (refusal !== undefined) {
-        throw ctx.fail(
-          'upstream_redirect',
-          refusal,
-          { ...ctx.recoveryFor('upstream_redirect') },
-          { cause: err as Error },
-        );
-      }
-      throw err;
+      throw asUpstreamFailure(err);
     }
 
     const dim = dsd.dimensions.find((d) => d.id === input.dimension_id);
@@ -210,13 +268,11 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
      * Both matter, and for the same reason: a codelist read from the wrong root
      * or at the wrong revision carries codes this dimension does not accept.
      */
-    const codes: OecdCode[] = await getStructureService().fetchCodelist(
-      clAgencyId,
-      codelistId,
-      ctx.signal,
-      dsd.serviceRoot,
-      dim.codelistVersion,
-    );
+    const codes: OecdCode[] = await getStructureService()
+      .fetchCodelist(clAgencyId, codelistId, ctx.signal, dsd.serviceRoot, dim.codelistVersion)
+      .catch((err: unknown) => {
+        throw asUpstreamFailure(err);
+      });
 
     /**
      * Narrow the result set, not the rendering. Both client surfaces read the

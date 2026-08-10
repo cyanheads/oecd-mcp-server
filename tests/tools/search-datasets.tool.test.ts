@@ -8,6 +8,7 @@ import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mc
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdSearchDatasets } from '@/mcp-server/tools/definitions/search-datasets.tool.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
+import { declaredRecovery } from '../helpers/error-contract.js';
 
 const FAKE_BASE = 'https://fake.oecd.test';
 
@@ -125,13 +126,44 @@ describe('oecdSearchDatasets', () => {
     });
   });
 
-  it('throws ctx.fail(upstream_error) when fetch fails', async () => {
+  it('throws ctx.fail(upstream_unavailable) when fetch fails', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network error')));
     const ctx = createMockContext({ errors: oecdSearchDatasets.errors });
     const input = oecdSearchDatasets.input.parse({ query: 'gdp' });
     await expect(oecdSearchDatasets.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
-      data: { reason: 'upstream_error' },
+      data: {
+        reason: 'upstream_unavailable',
+        retryable: true,
+        recovery: { hint: declaredRecovery(oecdSearchDatasets, 'upstream_unavailable') },
+      },
+    });
+  }, 20_000);
+
+  it('names a throttled catalog read rate_limited rather than a generic outage', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockImplementation(() =>
+          Promise.resolve(
+            new Response(
+              'You have exceeded the number of requests currently permitted in the OECD Data API.',
+              { status: 429, headers: { 'retry-after': '99999' } },
+            ),
+          ),
+        ),
+    );
+    const ctx = createMockContext({ errors: oecdSearchDatasets.errors });
+    const input = oecdSearchDatasets.input.parse({ query: 'gdp' });
+
+    await expect(oecdSearchDatasets.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.RateLimited,
+      data: {
+        reason: 'rate_limited',
+        retryable: true,
+        recovery: { hint: declaredRecovery(oecdSearchDatasets, 'rate_limited') },
+      },
     });
   });
 

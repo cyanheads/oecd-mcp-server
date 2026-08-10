@@ -8,6 +8,7 @@ import { createFetchMock, createMockContext } from '@cyanheads/mcp-ts-core/testi
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdListAgencies } from '@/mcp-server/tools/definitions/list-agencies.tool.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
+import { declaredRecovery } from '../helpers/error-contract.js';
 
 const FAKE_BASE = 'https://fake.oecd.test';
 
@@ -76,12 +77,44 @@ describe('oecdListAgencies', () => {
     expect(result.agencies[1]).toMatchObject({ agency_id: 'OECD.EDU.IMEP', dataflow_count: 1 });
   });
 
-  it('throws ctx.fail(upstream_error) when fetch fails', async () => {
+  it('throws ctx.fail(upstream_unavailable) when fetch fails', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network failure')));
     const ctx = createMockContext({ errors: oecdListAgencies.errors });
     await expect(oecdListAgencies.handler({}, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
-      data: { reason: 'upstream_error' },
+      data: {
+        reason: 'upstream_unavailable',
+        retryable: true,
+        recovery: { hint: declaredRecovery(oecdListAgencies, 'upstream_unavailable') },
+      },
+    });
+  }, 20_000);
+
+  it('names a throttled catalog read rate_limited rather than a generic outage', async () => {
+    // The wait that clears a throttle is seconds, not the minutes an outage
+    // hint asks for, and the two used to arrive under the same reason here.
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockImplementation(() =>
+          Promise.resolve(
+            new Response(
+              'You have exceeded the number of requests currently permitted in the OECD Data API.',
+              { status: 429, headers: { 'retry-after': '99999' } },
+            ),
+          ),
+        ),
+    );
+    const ctx = createMockContext({ errors: oecdListAgencies.errors });
+
+    await expect(oecdListAgencies.handler({}, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.RateLimited,
+      data: {
+        reason: 'rate_limited',
+        retryable: true,
+        recovery: { hint: declaredRecovery(oecdListAgencies, 'rate_limited') },
+      },
     });
   });
 
@@ -96,8 +129,8 @@ describe('oecdListAgencies', () => {
     );
     const ctx = createMockContext({ errors: oecdListAgencies.errors });
 
-    // Not upstream_error: that reason carries a retryable "wait it out" hint,
-    // and no wait clears a redirect.
+    // Not upstream_unavailable: that reason is retryable and its hint says to
+    // wait, and no wait clears a redirect.
     await expect(oecdListAgencies.handler({}, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.Forbidden,
       data: { reason: 'upstream_redirect', retryable: false },

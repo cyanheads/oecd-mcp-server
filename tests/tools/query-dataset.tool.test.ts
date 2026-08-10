@@ -475,6 +475,18 @@ describe('oecdQueryDataset', () => {
     expect(failure.hint).toContain('Retry after a short pause');
   }, 15_000);
 
+  it('names a status it does not model upstream_error rather than passing the code bare', async () => {
+    respond('Forbidden', { status: 403 });
+
+    const output = await runToolContract(oecdQueryDataset, { flow_ref: FLOW_REF, key: 'A.USA..' });
+    const failure = failureOf(output);
+
+    // Not upstream_redirect: that reason is a refused 3xx, and blaming
+    // OECD_BASE_URL for handing the request onward would be the wrong advice.
+    expect(failure.reason).toBe('upstream_error');
+    expect(failure.hint).toContain('report the OECD response');
+  });
+
   it('reports a redirect from the configured host as a misconfiguration, not an outage', async () => {
     respond('', { status: 302, headers: { Location: 'https://elsewhere.test/pwned' } });
 

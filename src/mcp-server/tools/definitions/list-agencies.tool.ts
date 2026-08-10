@@ -5,7 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { refusedRedirectText } from '@/services/oecd-http/oecd-http.js';
+import { upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
 import {
   directorateCode,
   getStructureService,
@@ -48,11 +48,31 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
   }),
   errors: [
     {
-      reason: 'upstream_error',
-      code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'The OECD structure API fetch failed after retries.',
-      recovery: 'The OECD API may be temporarily unavailable. Retry in a few minutes.',
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
       retryable: true,
+      when: 'OECD throttled the request rate and was still refusing after the retries.',
+      recovery:
+        'Wait several seconds before calling again, and space out consecutive queries ' +
+        'rather than issuing them back to back.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      when: 'OECD did not finish responding before OECD_TIMEOUT_MS elapsed.',
+      recovery:
+        'Retry once — the whole-catalog response runs to megabytes and is occasionally slow — ' +
+        'and raise OECD_TIMEOUT_MS if it keeps timing out.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'OECD returned a server fault or was unreachable once the retries ran out.',
+      recovery:
+        'Retry after a short pause; if it keeps failing, check OECD API availability ' +
+        'before issuing further queries.',
     },
     {
       reason: 'upstream_redirect',
@@ -62,6 +82,14 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
       recovery:
         'Stop retrying and report the server configuration — OECD_BASE_URL must name the https ' +
         'origin that answers directly, and no wait clears a redirect.',
+    },
+    {
+      reason: 'upstream_error',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'OECD refused the request with a status this server does not model — an authorization challenge, a rejection from something sitting in front of the API, or a request read as malformed.',
+      recovery:
+        'Retry once; a repeat is not transient, so report the OECD response and check that ' +
+        'OECD_BASE_URL names the public SDMX API rather than a proxy in front of it.',
     },
   ],
 
@@ -84,21 +112,16 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
     try {
       dataflows = await getStructureService().fetchDataflows(undefined, ctx.signal);
     } catch (err) {
-      const refusal = refusedRedirectText(err);
-      if (refusal !== undefined) {
+      const refusal = upstreamRefusal(err);
+      if (refusal) {
         throw ctx.fail(
-          'upstream_redirect',
-          refusal,
-          { ...ctx.recoveryFor('upstream_redirect') },
+          refusal.reason,
+          refusal.message,
+          { ...ctx.recoveryFor(refusal.reason) },
           { cause: err as Error },
         );
       }
-      throw ctx.fail(
-        'upstream_error',
-        'Failed to fetch OECD dataflows',
-        { ...ctx.recoveryFor('upstream_error') },
-        { cause: err as Error },
-      );
+      throw err;
     }
 
     const directorates = await directoratesPromise;

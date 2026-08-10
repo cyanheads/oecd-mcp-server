@@ -10,11 +10,8 @@ import type { AddressInfo } from 'node:net';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createFetchMock } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import {
-  invalidQueryText,
-  OecdDataService,
-  throttleText,
-} from '@/services/oecd-data/oecd-data-service.js';
+import { invalidQueryText, OecdDataService } from '@/services/oecd-data/oecd-data-service.js';
+import { throttleText } from '@/services/oecd-http/oecd-http.js';
 
 const BASE = 'https://fake.oecd.test';
 const FLOW_REF = 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I';

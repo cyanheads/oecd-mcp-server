@@ -12,6 +12,21 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdGetDatasetInfo } from '@/mcp-server/tools/definitions/get-dataset-info.tool.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
+import { declaredRecovery } from '../helpers/error-contract.js';
+
+/** Answer every request with a fresh copy of one response — a body reads once. */
+function respondWith(build: Response): void {
+  const init = {
+    headers: build.headers,
+    status: build.status,
+    statusText: build.statusText,
+  };
+  const body = build.clone().text();
+  vi.stubGlobal(
+    'fetch',
+    vi.fn().mockImplementation(async () => new Response(await body, init)),
+  );
+}
 
 const FAKE_BASE = 'https://fake.oecd.test';
 
@@ -104,7 +119,70 @@ describe('oecdGetDatasetInfo', () => {
     const input = oecdGetDatasetInfo.input.parse({ flow_ref: 'BAD_FORMAT' });
     await expect(oecdGetDatasetInfo.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
-      data: { reason: 'invalid_flow_ref' },
+      data: {
+        reason: 'invalid_flow_ref',
+        recovery: { hint: declaredRecovery(oecdGetDatasetInfo, 'invalid_flow_ref') },
+      },
+    });
+  });
+
+  it('names a throttled structure read rate_limited with a wait-it-out hint', async () => {
+    // OECD charges one throttle budget across the data and structure endpoints,
+    // so a refused /datastructure is an ordinary outcome — and the hint matters
+    // most here, since withRetry has already spent its attempts and its backoff
+    // by the time the refusal surfaces.
+    respondWith(
+      new Response(
+        'You have exceeded the number of requests currently permitted in the OECD Data API.',
+        { status: 429, headers: { 'retry-after': '99999' } },
+      ),
+    );
+    const ctx = createMockContext({ errors: oecdGetDatasetInfo.errors });
+    const input = oecdGetDatasetInfo.input.parse({
+      flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+    });
+
+    await expect(oecdGetDatasetInfo.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.RateLimited,
+      data: {
+        reason: 'rate_limited',
+        retryable: true,
+        recovery: { hint: declaredRecovery(oecdGetDatasetInfo, 'rate_limited') },
+      },
+    });
+  });
+
+  it('names an exhausted outage upstream_unavailable', async () => {
+    respondWith(new Response('boom', { status: 503 }));
+    const ctx = createMockContext({ errors: oecdGetDatasetInfo.errors });
+    const input = oecdGetDatasetInfo.input.parse({
+      flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+    });
+
+    await expect(oecdGetDatasetInfo.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: {
+        reason: 'upstream_unavailable',
+        retryable: true,
+        recovery: { hint: declaredRecovery(oecdGetDatasetInfo, 'upstream_unavailable') },
+      },
+    });
+  }, 20_000);
+
+  it('names a status it does not model upstream_error rather than passing the code bare', async () => {
+    // An Unauthorized on a keyless public API tells the caller nothing about
+    // what to do next. The reason and its hint do.
+    respondWith(new Response('Unauthorized', { status: 401 }));
+    const ctx = createMockContext({ errors: oecdGetDatasetInfo.errors });
+    const input = oecdGetDatasetInfo.input.parse({
+      flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+    });
+
+    await expect(oecdGetDatasetInfo.handler(input, ctx)).rejects.toMatchObject({
+      data: {
+        reason: 'upstream_error',
+        recovery: { hint: declaredRecovery(oecdGetDatasetInfo, 'upstream_error') },
+      },
     });
   });
 

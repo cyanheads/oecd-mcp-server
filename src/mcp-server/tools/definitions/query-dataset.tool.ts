@@ -5,15 +5,11 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { type ColumnSchema, spillover } from '@cyanheads/mcp-ts-core/canvas';
-import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
-import {
-  getDataService,
-  invalidQueryText,
-  throttleText,
-} from '@/services/oecd-data/oecd-data-service.js';
+import { getDataService, invalidQueryText } from '@/services/oecd-data/oecd-data-service.js';
 import type { OecdDataResult } from '@/services/oecd-data/types.js';
-import { refusedRedirectText } from '@/services/oecd-http/oecd-http.js';
+import { throttleText, upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
 import {
   isDataflowNotFound,
   parseFlowRef,
@@ -72,27 +68,13 @@ const PERIOD_REJECTION = /\b(date|period)\b/i;
  */
 const DOWNLOAD_THROTTLE = /\b(downloads?|data ranges?)\b/i;
 
-/** Contract reasons for a query OECD parsed but declined to answer. */
-type UpstreamReason =
-  | 'download_limit'
-  | 'rate_limited'
-  | 'upstream_timeout'
-  | 'upstream_unavailable';
-
 /**
- * Reason for an upstream refusal the caller cannot fix by correcting the key
- * or the period. `throttle` is OECD's own throttle wording when it sent any;
- * otherwise the classification `fetchOecd` produced is what distinguishes a
- * timed-out request from an unreachable service.
+ * Which of OECD's two throttles refused the query, read off its own wording.
+ * Only this tool splits them: the download cap clears by asking for less, and
+ * this is the only surface whose caller has a key and a period to shrink.
  */
-function upstreamReason(err: Error, throttle: string | undefined): UpstreamReason | undefined {
-  if (throttle !== undefined) {
-    return DOWNLOAD_THROTTLE.test(throttle) ? 'download_limit' : 'rate_limited';
-  }
-  if (!(err instanceof McpError)) return;
-  if (err.code === JsonRpcErrorCode.Timeout) return 'upstream_timeout';
-  if (err.code === JsonRpcErrorCode.ServiceUnavailable) return 'upstream_unavailable';
-  return;
+function throttleReason(throttle: string): 'download_limit' | 'rate_limited' {
+  return DOWNLOAD_THROTTLE.test(throttle) ? 'download_limit' : 'rate_limited';
 }
 
 export const oecdQueryDataset = tool('oecd_query_dataset', {
@@ -207,9 +189,10 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     {
       reason: 'invalid_flow_ref',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The flow_ref matches neither the {agencyID},{dsd_id}@{df_id} nor the {agencyID},{df_id} format.',
+      when: 'The flow_ref parameter matches neither the {agencyID},{dsd_id}@{df_id} nor the {agencyID},{df_id} format.',
       recovery:
-        'Obtain valid flow_ref values from oecd_search_datasets and pass one through unchanged.',
+        'Obtain valid flow_ref values from oecd_search_datasets and pass one unchanged, ' +
+        'e.g. "OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I".',
     },
     {
       reason: 'dataflow_not_found',
@@ -286,6 +269,14 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
         'Stop retrying and report the server configuration — OECD_BASE_URL must name the https ' +
         'origin that answers directly, and no wait clears a redirect.',
     },
+    {
+      reason: 'upstream_error',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'OECD refused the request with a status this server does not model — an authorization challenge, a rejection from something sitting in front of the API, or a request read as malformed.',
+      recovery:
+        'Retry once; a repeat is not transient, so report the OECD response and check that ' +
+        'OECD_BASE_URL names the public SDMX API rather than a proxy in front of it.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -293,7 +284,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     if (!parts) {
       throw ctx.fail(
         'invalid_flow_ref',
-        `flow_ref "${input.flow_ref}" is not in the expected format`,
+        `flow_ref "${input.flow_ref}" is not in the expected {agencyID},{dsd_id}@{df_id} or {agencyID},{df_id} format`,
         { ...ctx.recoveryFor('invalid_flow_ref') },
       );
     }
@@ -316,15 +307,6 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       );
     } catch (err) {
       const e = err as Error;
-      const refusal = refusedRedirectText(e);
-      if (refusal !== undefined) {
-        throw ctx.fail(
-          'upstream_redirect',
-          refusal,
-          { ...ctx.recoveryFor('upstream_redirect') },
-          { cause: e },
-        );
-      }
       if (isDataflowNotFound(e)) {
         throw ctx.fail(
           'dataflow_not_found',
@@ -352,14 +334,21 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
         );
       }
       const throttle = throttleText(e);
-      const upstream = upstreamReason(e, throttle);
-      if (upstream) {
+      if (throttle !== undefined) {
+        const reason = throttleReason(throttle);
         throw ctx.fail(
-          upstream,
-          throttle === undefined
-            ? e.message
-            : `OECD throttled the query for ${input.flow_ref}: ${throttle}`,
-          { ...ctx.recoveryFor(upstream) },
+          reason,
+          `OECD throttled the query for ${input.flow_ref}: ${throttle}`,
+          { ...ctx.recoveryFor(reason) },
+          { cause: e },
+        );
+      }
+      const refusal = upstreamRefusal(e);
+      if (refusal) {
+        throw ctx.fail(
+          refusal.reason,
+          refusal.message,
+          { ...ctx.recoveryFor(refusal.reason) },
           { cause: e },
         );
       }

@@ -4,7 +4,8 @@
  */
 
 import { resource, z } from '@cyanheads/mcp-ts-core';
-import { notFound } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
 import {
   getStructureService,
   isDataflowNotFound,
@@ -72,18 +73,103 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
       .describe('True if OECD flagged this dataflow as experimental or deprecated.'),
     source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
   }),
+  /**
+   * The same failures oecd_get_dataset_info declares, under the same reasons and
+   * codes — the two surfaces resolve the same identifier against the same
+   * endpoints, so a client must not have to learn which one it called to read
+   * the failure. Only the `invalid_flow_ref` recovery differs: the tool takes
+   * one `flow_ref` string, this takes it split across two URI segments, so the
+   * hint has to say how to perform that split.
+   */
+  errors: [
+    {
+      reason: 'invalid_flow_ref',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The agency_id and flow_id segments do not combine into a flow reference in the {agencyID},{dsd_id}@{df_id} or {agencyID},{df_id} format, or flow_id carries a malformed percent-escape.',
+      recovery:
+        'Take a flow_ref from oecd_search_datasets and split it on its comma — the part before ' +
+        'is the agency_id segment, the part after is the flow_id segment with @ percent-encoded ' +
+        'as %40, e.g. oecd://dataflow/OECD.SDD.NAD/DSD_NAAG%40DF_NAAG_I.',
+    },
+    {
+      reason: 'dataflow_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'No datastructure was found for the flow reference the URI segments name.',
+      recovery:
+        'Verify the flow_ref with oecd_search_datasets. ' +
+        'The dataflow may have been renamed or removed.',
+    },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      retryable: true,
+      when: 'OECD throttled the request rate and was still refusing after the retries.',
+      recovery:
+        'Wait several seconds before calling again, and space out consecutive queries ' +
+        'rather than issuing them back to back.',
+    },
+    {
+      reason: 'upstream_timeout',
+      code: JsonRpcErrorCode.Timeout,
+      retryable: true,
+      when: 'OECD did not finish responding before OECD_TIMEOUT_MS elapsed.',
+      recovery:
+        'Retry once — a structure response runs to megabytes and is occasionally slow — ' +
+        'and raise OECD_TIMEOUT_MS if it keeps timing out.',
+    },
+    {
+      reason: 'upstream_unavailable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: true,
+      when: 'OECD returned a server fault or was unreachable once the retries ran out.',
+      recovery:
+        'Retry after a short pause; if it keeps failing, check OECD API availability ' +
+        'before issuing further queries.',
+    },
+    {
+      reason: 'upstream_redirect',
+      code: JsonRpcErrorCode.Forbidden,
+      retryable: false,
+      when: 'The configured OECD host answered with a redirect, which this server never follows.',
+      recovery:
+        'Stop retrying and report the server configuration — OECD_BASE_URL must name the https ' +
+        'origin that answers directly, and no wait clears a redirect.',
+    },
+    {
+      reason: 'upstream_error',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      when: 'OECD refused the request with a status this server does not model — an authorization challenge, a rejection from something sitting in front of the API, or a request read as malformed.',
+      recovery:
+        'Retry once; a repeat is not transient, so report the OECD response and check that ' +
+        'OECD_BASE_URL names the public SDMX API rather than a proxy in front of it.',
+    },
+  ],
 
   async handler(params, ctx) {
-    // Decode %40 → @ to reconstruct the canonical flow_id
-    const decodedFlowId = decodeURIComponent(params.flow_id);
+    // Decode %40 → @ to reconstruct the canonical flow_id. A malformed escape
+    // (`%ZZ`, a trailing `%`) reaches here as a URIError, which is the same
+    // caller mistake as an unparseable ref and is reported the same way rather
+    // than as an unexplained internal fault.
+    let decodedFlowId: string;
+    try {
+      decodedFlowId = decodeURIComponent(params.flow_id);
+    } catch {
+      throw ctx.fail(
+        'invalid_flow_ref',
+        `flow_id segment "${params.flow_id}" carries a malformed percent-escape`,
+        { ...ctx.recoveryFor('invalid_flow_ref') },
+      );
+    }
     const flowRef = `${params.agency_id},${decodedFlowId}`;
 
     const parts = parseFlowRef(flowRef);
     if (!parts) {
-      throw notFound(`Invalid flow_ref reconstructed from URI: ${flowRef}`, {
-        agencyId: params.agency_id,
-        flowId: params.flow_id,
-      });
+      throw ctx.fail(
+        'invalid_flow_ref',
+        `URI segments "${params.agency_id}" and "${params.flow_id}" do not combine into a flow ` +
+          'reference in the expected {agencyID},{dsd_id}@{df_id} or {agencyID},{df_id} format',
+        { ...ctx.recoveryFor('invalid_flow_ref') },
+      );
     }
 
     ctx.log.info('Fetching dataflow resource', { flowRef });
@@ -93,13 +179,29 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
       dsd = await getStructureService().fetchDataStructure(flowRef, ctx.signal);
     } catch (err) {
       if (isDataflowNotFound(err as Error)) {
-        throw notFound(`Dataflow not found: ${flowRef}`, { flowRef }, { cause: err as Error });
+        throw ctx.fail(
+          'dataflow_not_found',
+          `Dataflow not found: ${flowRef}`,
+          { ...ctx.recoveryFor('dataflow_not_found') },
+          { cause: err as Error },
+        );
+      }
+      const refusal = upstreamRefusal(err);
+      if (refusal) {
+        throw ctx.fail(
+          refusal.reason,
+          refusal.message,
+          { ...ctx.recoveryFor(refusal.reason) },
+          { cause: err as Error },
+        );
       }
       throw err;
     }
 
     if (!dsd.dimensions.length) {
-      throw notFound(`Dataflow ${flowRef} returned no dimensions`, { flowRef });
+      throw ctx.fail('dataflow_not_found', `Dataflow ${flowRef} returned no dimensions`, {
+        ...ctx.recoveryFor('dataflow_not_found'),
+      });
     }
 
     const keyExample = dsd.dimensions.map(() => '').join('.');

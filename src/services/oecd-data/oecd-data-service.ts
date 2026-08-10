@@ -156,19 +156,6 @@ export function invalidQueryText(err: unknown): string | undefined {
 }
 
 /**
- * Explanatory text from a query OECD throttled. OECD names which limit was hit
- * — request rate, or the separate cap on downloads and very large data ranges
- * — and only that wording tells the two apart, so tool handlers read it to
- * pick between "wait" and "ask for less". Returns undefined for any failure
- * that is not a throttle.
- */
-export function throttleText(err: unknown): string | undefined {
-  if (!(err instanceof McpError) || err.code !== JsonRpcErrorCode.RateLimited) return;
-  const body = err.data?.body;
-  return typeof body === 'string' && body.trim() !== '' ? body.trim() : err.message;
-}
-
-/**
  * How OECD spells "the query was valid and matched nothing", which it answers
  * with a 404 rather than a 200 carrying no observations. The sentinel is not
  * uniform across the service roots — `sti-public` returns `NoResultsFound` and

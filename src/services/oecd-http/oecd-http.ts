@@ -1,8 +1,9 @@
 /**
  * @fileoverview Shared HTTP boundary for the OECD SDMX endpoints — one fetch
  * path for the structure and data services, carrying the retry-classification
- * corrections both of them need and the rule that holds every request to the
- * configured host.
+ * corrections both of them need, the rule that holds every request to the
+ * configured host, and the readers that turn a terminal failure into the
+ * upstream reason every definition declares for it.
  * @module services/oecd-http/oecd-http
  */
 
@@ -70,11 +71,11 @@ function refusedRedirect(err: unknown, url: string): McpError | undefined {
  *
  * Both services restate an upstream failure with a message of their own before
  * a handler sees it — "Failed to fetch OECD dataflows" — which keeps the code
- * and the data but drops the sentence naming `OECD_BASE_URL`. Tool handlers
- * read it back from the cause chain so a host that redirects is reported as the
+ * and the data but drops the sentence naming `OECD_BASE_URL`. {@link upstreamRefusal}
+ * reads it back from the cause chain so a host that redirects is reported as the
  * configuration it is, rather than as the outage it is not.
  */
-export function refusedRedirectText(err: unknown): string | undefined {
+function refusedRedirectText(err: unknown): string | undefined {
   let text: string | undefined;
   for (let cur: unknown = err; cur instanceof Error; cur = (cur as { cause?: unknown }).cause) {
     if (!(cur instanceof McpError) || cur.code !== JsonRpcErrorCode.Forbidden) continue;
@@ -84,6 +85,77 @@ export function refusedRedirectText(err: unknown): string | undefined {
     if (redirectStatus(cur) !== undefined) text = cur.message;
   }
   return text;
+}
+
+/**
+ * Explanatory text from a request OECD throttled. OECD names which limit was hit
+ * — request rate, or the separate cap on downloads and very large data ranges
+ * — and only that wording tells the two apart, so a caller that can shrink its
+ * request reads it to pick between "wait" and "ask for less". Returns undefined
+ * for any failure that is not a throttle.
+ *
+ * The throttle is charged against the client across every OECD endpoint, so a
+ * refused `/datastructure`, `/codelist`, or `/conceptscheme` call is as ordinary
+ * as a refused `/data` one. This reader lives at the shared boundary for that
+ * reason rather than beside either service.
+ */
+export function throttleText(err: unknown): string | undefined {
+  if (!(err instanceof McpError) || err.code !== JsonRpcErrorCode.RateLimited) return;
+  const body = err.data?.body;
+  return typeof body === 'string' && body.trim() !== '' ? body.trim() : err.message;
+}
+
+/**
+ * Reasons every definition that reaches OECD declares, so the same upstream
+ * failure carries the same reason whichever surface received the call.
+ */
+export type UpstreamReason =
+  | 'rate_limited'
+  | 'upstream_error'
+  | 'upstream_redirect'
+  | 'upstream_timeout'
+  | 'upstream_unavailable';
+
+/**
+ * Codes a definition can add nothing to, so they bubble as themselves rather
+ * than being restated as an upstream reason.
+ *
+ * `InternalError` is what a caller's own abort arrives as, `SerializationError`
+ * is a body this server could not decode, and `ValidationError` reaching here
+ * means a branch above already declined to claim it. Reporting any of the three
+ * as an OECD refusal would name the wrong party.
+ */
+const OWN_FAULT_CODES: ReadonlySet<JsonRpcErrorCode> = new Set([
+  JsonRpcErrorCode.InternalError,
+  JsonRpcErrorCode.SerializationError,
+  JsonRpcErrorCode.ValidationError,
+]);
+
+/**
+ * The declared reason an upstream failure carries, with the text to report, or
+ * undefined when the failure is not OECD's to answer for.
+ *
+ * Handlers call this last, after the branches that recognise a failure their own
+ * caller can fix — a missing dataflow, a rejected key. What is left is the
+ * upstream's answer, and every surface names it the same way: a refused
+ * redirect, a throttle, a timeout, an outage, or a status this server does not
+ * model. That last bucket is `upstream_error` rather than a bare code because a
+ * `Forbidden`, an `Unauthorized`, or an `InvalidParams` on a keyless public API
+ * says nothing about what to do next; the reason and its hint do.
+ */
+export function upstreamRefusal(
+  err: unknown,
+): { message: string; reason: UpstreamReason } | undefined {
+  const redirect = refusedRedirectText(err);
+  if (redirect !== undefined) return { message: redirect, reason: 'upstream_redirect' };
+  const throttle = throttleText(err);
+  if (throttle !== undefined) return { message: throttle, reason: 'rate_limited' };
+  if (!(err instanceof McpError) || OWN_FAULT_CODES.has(err.code)) return;
+  if (err.code === JsonRpcErrorCode.Timeout)
+    return { message: err.message, reason: 'upstream_timeout' };
+  if (err.code === JsonRpcErrorCode.ServiceUnavailable)
+    return { message: err.message, reason: 'upstream_unavailable' };
+  return { message: err.message, reason: 'upstream_error' };
 }
 
 /**

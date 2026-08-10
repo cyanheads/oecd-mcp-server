@@ -13,6 +13,19 @@ import {
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdGetDimensionValues } from '@/mcp-server/tools/definitions/get-dimension-values.tool.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
+import { declaredRecovery } from '../helpers/error-contract.js';
+
+/** OECD's own wording for the request-rate throttle, which is charged across every endpoint. */
+const THROTTLE_BODY =
+  'You have exceeded the number of requests currently permitted in the OECD Data API.';
+
+/**
+ * A throttle naming a wait longer than the retry budget, so the refusal surfaces
+ * on the first attempt instead of spending the backoff inside the test.
+ */
+function throttleResponse(): Response {
+  return new Response(THROTTLE_BODY, { status: 429, headers: { 'retry-after': '99999' } });
+}
 
 const FAKE_BASE = 'https://fake.oecd.test';
 
@@ -205,16 +218,25 @@ describe('oecdGetDimensionValues', () => {
     }
   });
 
-  it('throws ctx.fail(dataflow_not_found) for malformed flow_ref', async () => {
+  it('throws ctx.fail(invalid_flow_ref) for malformed flow_ref', async () => {
+    // No request is issued for a string that is not a flow reference, so
+    // "not found" would assert something this tool never checked — and its hint
+    // sends the caller to re-look-up a reference they may already hold.
+    const fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
     const ctx = createMockContext({ errors: oecdGetDimensionValues.errors });
     const input = oecdGetDimensionValues.input.parse({
       flow_ref: 'BAD',
       dimension_id: 'FREQ',
     });
     await expect(oecdGetDimensionValues.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'dataflow_not_found' },
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'invalid_flow_ref',
+        recovery: { hint: declaredRecovery(oecdGetDimensionValues, 'invalid_flow_ref') },
+      },
     });
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it('throws ctx.fail(dataflow_not_found) when 200 response has empty dataStructures', async () => {
@@ -257,6 +279,79 @@ describe('oecdGetDimensionValues', () => {
     await expect(oecdGetDimensionValues.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'dimension_not_found' },
+    });
+  });
+
+  it('names a throttled datastructure read rate_limited, not an unexplained refusal', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(() => Promise.resolve(throttleResponse())),
+    );
+    const ctx = createMockContext({ errors: oecdGetDimensionValues.errors });
+    const input = oecdGetDimensionValues.input.parse({
+      flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+      dimension_id: 'FREQ',
+    });
+
+    await expect(oecdGetDimensionValues.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.RateLimited,
+      data: {
+        reason: 'rate_limited',
+        retryable: true,
+        recovery: { hint: declaredRecovery(oecdGetDimensionValues, 'rate_limited') },
+      },
+    });
+  });
+
+  it('names a throttled codelist read too, which no datastructure catch covers', async () => {
+    // The codelist is fetched after the datastructure resolves, outside the
+    // catch that handles it. OECD charges the throttle across every endpoint,
+    // so the refusal lands on whichever of the two is in flight.
+    const http = createFetchMock();
+    http.route(
+      {
+        match: `${FAKE_BASE}/datastructure/OECD.SDD.NAD/DSD_NAAG`,
+        respond: () => Response.json(DSD_RESPONSE),
+      },
+      { match: `${FAKE_BASE}/codelist/OECD/CL_FREQ/1.0`, respond: () => throttleResponse() },
+    );
+    http.install();
+
+    try {
+      const ctx = createMockContext({ errors: oecdGetDimensionValues.errors });
+      const input = oecdGetDimensionValues.input.parse({
+        flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+        dimension_id: 'FREQ',
+      });
+
+      await expect(oecdGetDimensionValues.handler(input, ctx)).rejects.toMatchObject({
+        code: JsonRpcErrorCode.RateLimited,
+        data: {
+          reason: 'rate_limited',
+          recovery: { hint: declaredRecovery(oecdGetDimensionValues, 'rate_limited') },
+        },
+      });
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('names a status it does not model upstream_error rather than passing the code bare', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(() => Promise.resolve(new Response('Forbidden', { status: 403 }))),
+    );
+    const ctx = createMockContext({ errors: oecdGetDimensionValues.errors });
+    const input = oecdGetDimensionValues.input.parse({
+      flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+      dimension_id: 'FREQ',
+    });
+
+    await expect(oecdGetDimensionValues.handler(input, ctx)).rejects.toMatchObject({
+      data: {
+        reason: 'upstream_error',
+        recovery: { hint: declaredRecovery(oecdGetDimensionValues, 'upstream_error') },
+      },
     });
   });
 
