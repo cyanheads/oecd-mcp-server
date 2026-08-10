@@ -85,6 +85,27 @@ describe('oecdListAgencies', () => {
     });
   });
 
+  it('separates a redirecting host from a transient outage', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response('', { status: 302, headers: { Location: 'https://elsewhere.test/' } }),
+        ),
+    );
+    const ctx = createMockContext({ errors: oecdListAgencies.errors });
+
+    // Not upstream_error: that reason carries a retryable "wait it out" hint,
+    // and no wait clears a redirect.
+    await expect(oecdListAgencies.handler({}, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.Forbidden,
+      data: { reason: 'upstream_redirect', retryable: false },
+    });
+    // The sentence the fetch boundary wrote survives the service's relabel.
+    await expect(oecdListAgencies.handler({}, ctx)).rejects.toThrow(/OECD_BASE_URL/);
+  });
+
   it('formats output with agency table and totals', () => {
     const output = {
       agencies: [

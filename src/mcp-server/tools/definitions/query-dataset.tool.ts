@@ -13,6 +13,7 @@ import {
   throttleText,
 } from '@/services/oecd-data/oecd-data-service.js';
 import type { OecdDataResult } from '@/services/oecd-data/types.js';
+import { refusedRedirectText } from '@/services/oecd-http/oecd-http.js';
 import {
   isDataflowNotFound,
   parseFlowRef,
@@ -276,6 +277,15 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
         'Retry after a short pause; if it keeps failing, check OECD API availability ' +
         'before issuing further queries.',
     },
+    {
+      reason: 'upstream_redirect',
+      code: JsonRpcErrorCode.Forbidden,
+      retryable: false,
+      when: 'The configured OECD host answered with a redirect, which this server never follows.',
+      recovery:
+        'Stop retrying and report the server configuration — OECD_BASE_URL must name the https ' +
+        'origin that answers directly, and no wait clears a redirect.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -306,6 +316,15 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       );
     } catch (err) {
       const e = err as Error;
+      const refusal = refusedRedirectText(e);
+      if (refusal !== undefined) {
+        throw ctx.fail(
+          'upstream_redirect',
+          refusal,
+          { ...ctx.recoveryFor('upstream_redirect') },
+          { cause: e },
+        );
+      }
       if (isDataflowNotFound(e)) {
         throw ctx.fail(
           'dataflow_not_found',

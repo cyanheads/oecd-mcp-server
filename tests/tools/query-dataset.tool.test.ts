@@ -475,6 +475,20 @@ describe('oecdQueryDataset', () => {
     expect(failure.hint).toContain('Retry after a short pause');
   }, 15_000);
 
+  it('reports a redirect from the configured host as a misconfiguration, not an outage', async () => {
+    respond('', { status: 302, headers: { Location: 'https://elsewhere.test/pwned' } });
+
+    const ctx = createMockContext({ errors: oecdQueryDataset.errors });
+    const input = oecdQueryDataset.input.parse({ flow_ref: FLOW_REF, key: 'A.USA..' });
+
+    await expect(oecdQueryDataset.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.Forbidden,
+      data: { reason: 'upstream_redirect', retryable: false },
+    });
+    // The sentence the fetch boundary wrote survives the service's relabel.
+    await expect(oecdQueryDataset.handler(input, ctx)).rejects.toThrow(/OECD_BASE_URL/);
+  });
+
   // ── Canvas spillover path ───────────────────────────────────────────────────
 
   it('declares sparse attribute columns on the spilled canvas table', async () => {

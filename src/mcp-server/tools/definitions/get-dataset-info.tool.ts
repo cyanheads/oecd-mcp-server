@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { refusedRedirectText } from '@/services/oecd-http/oecd-http.js';
 import {
   getStructureService,
   isDataflowNotFound,
@@ -99,6 +100,15 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
         'Verify the flow_ref with oecd_search_datasets. ' +
         'The dataflow may have been renamed or removed.',
     },
+    {
+      reason: 'upstream_redirect',
+      code: JsonRpcErrorCode.Forbidden,
+      retryable: false,
+      when: 'The configured OECD host answered with a redirect, which this server never follows.',
+      recovery:
+        'Stop retrying and report the server configuration — OECD_BASE_URL must name the https ' +
+        'origin that answers directly, and no wait clears a redirect.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -121,6 +131,15 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
         throw ctx.fail('dataflow_not_found', `Dataflow not found: ${input.flow_ref}`, {
           ...ctx.recoveryFor('dataflow_not_found'),
         });
+      }
+      const refusal = refusedRedirectText(err);
+      if (refusal !== undefined) {
+        throw ctx.fail(
+          'upstream_redirect',
+          refusal,
+          { ...ctx.recoveryFor('upstream_redirect') },
+          { cause: err as Error },
+        );
       }
       throw err;
     }
