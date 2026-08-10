@@ -327,7 +327,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/config/` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools/definitions/` | Tool definitions (`*.tool.ts`) — seven tools for OECD data discovery and retrieval. |
 | `src/mcp-server/resources/definitions/` | Resource definitions (`*.resource.ts`) — the `oecd://dataflow` resource. |
-| `src/services/oecd-http/` | Shared OECD fetch boundary — timeout and retry-classification corrections used by both services below, the origin check every delegated service root passes before it is addressed, and the refusal of any redirect off the configured host. |
+| `src/services/oecd-http/` | Shared OECD fetch boundary — timeout and retry-classification corrections used by both services below, the origin check every delegated service root passes before it is addressed, the refusal of any redirect off the configured host, and the classification that gives an upstream refusal the same declared reason on every tool and resource. |
 | `src/services/oecd-structure/` | OECD SDMX structure service — dataflows, data structures, codelists. |
 | `src/services/oecd-data/` | OECD SDMX data service — observations, SDMX-JSON decoding, DataCanvas spillover. |
 | `src/services/canvas-accessor/` | DataCanvas accessor — registers and exposes the framework canvas instance to tools. |
