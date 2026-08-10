@@ -12,6 +12,7 @@ import {
 } from '@cyanheads/mcp-ts-core/errors';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { externalServiceRootOf } from '@/services/oecd-http/external-service-root.js';
 import { fetchOecd } from '@/services/oecd-http/oecd-http.js';
 import type {
   OecdCode,
@@ -36,6 +37,19 @@ const STRUCTURE_ACCEPT = 'application/vnd.sdmx.structure+json;version=1.0';
  * endpoint it was addressed to.
  */
 const SDMX_ID_SAFE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * Allowed shape of an SDMX artefact version, which is a dot-separated run of
+ * digits (`1.0`, `1.7`). Versions arrive inside upstream URNs and land in a URL
+ * path segment, so anything else is dropped at parse time and the reference is
+ * carried unversioned rather than pinned to something unfetchable.
+ */
+const SDMX_VERSION_SAFE = /^\d+(?:\.\d+)*$/;
+
+/** The version an upstream URN pins a reference to, or undefined when it names none this server will address. */
+function safeVersion(version: string): string | undefined {
+  return SDMX_VERSION_SAFE.test(version) ? version : undefined;
+}
 
 /**
  * Parse a flow ref into its parts.
@@ -109,6 +123,52 @@ function fetchStructureJson(
   });
 }
 
+/** The id a dataflow is catalogued under — combined `{dsd}@{df}`, or bare `{df}`. */
+function dataflowIdOf(parts: { dfId: string; dsdId?: string }): string {
+  return parts.dsdId ? `${parts.dsdId}@${parts.dfId}` : parts.dfId;
+}
+
+/**
+ * Absorb a missing datastructure so the caller can try another route, while an
+ * outage or a timeout is reported as itself rather than retried down a path
+ * that was never going to answer it.
+ */
+function swallowNotFound(err: unknown): undefined {
+  if (err instanceof Error && isDataflowNotFound(err)) return;
+  throw err;
+}
+
+/**
+ * The service root the catalog entry for a flow ref delegates to, or undefined
+ * when it names none this server will follow.
+ *
+ * Takes the base URL rather than reading the singleton so the data service can
+ * resolve a delegation without depending on structure-service initialization.
+ * A failed lookup resolves to undefined: this runs only when the caller already
+ * holds a real error to report, and a second failure must not replace the first.
+ *
+ * One attempt, deliberately unretried. The caller reaches here holding a
+ * failure it wants settled faster than a retry loop would settle it, so
+ * answering "where does this flow live" with three requests and a backoff would
+ * reintroduce the delay on the catalog endpoint that skipping the retries on
+ * the data endpoint just removed.
+ */
+export async function fetchExternalServiceRoot(
+  baseUrl: string,
+  flowRef: string,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  const parts = parseFlowRef(flowRef);
+  if (!parts) return;
+
+  const payload = await fetchJson(
+    `${baseUrl}/dataflow/${parts.agencyId}/${dataflowIdOf(parts)}`,
+    signal,
+  ).catch(() => undefined);
+
+  return payload === undefined ? undefined : externalServiceRootOf(payload, baseUrl);
+}
+
 let _instance: OecdStructureService | undefined;
 
 /** Service for fetching OECD SDMX structural metadata. */
@@ -166,6 +226,20 @@ export class OecdStructureService {
    * nonetheless reachable on its own endpoint. Trying the direct route first
    * keeps them working; falling back covers the mismatched prefixes. Only the
    * refs the first route cannot resolve pay the second request.
+   *
+   * Every route asks for latest. A `flow_ref` carries no version, and learning
+   * which one to pin would cost a catalog request to answer a question nothing
+   * asked — this is the entry point, not a reference followed from somewhere
+   * else. Whichever revision answers is then the authority for the lookups that
+   * follow it, so the codelists and concept schemes read back at the versions
+   * it names are coherent with the dimensions it declared.
+   *
+   * A third route exists for the entries neither of the first two can answer.
+   * Part of the catalog is published as a pointer rather than a definition —
+   * `isExternalReference: true`, no `structure` URN, and a `links[]` entry
+   * naming the OECD service root that owns the real thing. The second route's
+   * response already carries that link, so following it costs one request and
+   * only on a ref that would otherwise have failed.
    */
   async fetchDataStructure(flowRef: string, signal?: AbortSignal): Promise<OecdDataStructure> {
     const parts = parseFlowRef(flowRef);
@@ -173,31 +247,75 @@ export class OecdStructureService {
       throw new Error(`Invalid flow_ref format: ${flowRef}`);
     }
 
+    /**
+     * Root that answered. Codelists and concept schemes are versioned per root
+     * — the public catalog mirrors an older revision of both for the delegated
+     * entries — so the labels for this structure have to be read back from
+     * whichever root defined it.
+     */
+    let serviceRoot = this.baseUrl;
     let parsed: ParsedDataStructure | undefined;
+
     if (parts.dsdId) {
       parsed = await this.loadDataStructure(
         `${this.baseUrl}/datastructure/${parts.agencyId}/${parts.dsdId}`,
         flowRef,
         parts.agencyId,
         signal,
-      ).catch((err: unknown): ParsedDataStructure | undefined => {
-        // Only a missing datastructure earns the second request; an outage or a
-        // timeout is reported as itself rather than retried down another path.
-        if (err instanceof Error && isDataflowNotFound(err)) return;
-        throw err;
-      });
+      ).catch(swallowNotFound);
     }
 
-    // The dataflow is catalogued under the id as published — combined or bare.
-    const dataflowId = parts.dsdId ? `${parts.dsdId}@${parts.dfId}` : parts.dfId;
-    parsed ??= await this.loadDataStructure(
-      `${this.baseUrl}/dataflow/${parts.agencyId}/${dataflowId}?references=datastructure`,
+    if (!parsed) {
+      // The dataflow is catalogued under the id as published — combined or bare.
+      const payload = await fetchStructureJson(
+        `${this.baseUrl}/dataflow/${parts.agencyId}/${dataflowIdOf(parts)}?references=datastructure`,
+        `Failed to fetch OECD datastructure for ${flowRef}`,
+        signal,
+      );
+      try {
+        parsed = parseDataStructure(payload, flowRef, parts.agencyId);
+      } catch (err) {
+        if (!isDataflowNotFound(err as Error)) throw err;
+        const external = externalServiceRootOf(payload, this.baseUrl);
+        // No delegation to follow means the ref genuinely resolves nowhere.
+        if (!external) throw err;
+        parsed = await this.loadDelegatedDataStructure(external, parts, flowRef, signal);
+        serviceRoot = external;
+      }
+    }
+
+    return this.applyConceptNames({ ...parsed.structure, serviceRoot }, parsed.conceptRefs, signal);
+  }
+
+  /**
+   * Resolve a datastructure on the service root the catalog delegated to,
+   * trying the same two routes in the same order and for the same reasons as
+   * {@link fetchDataStructure}. The delegating root is only ever the validated
+   * one {@link externalServiceRootOf} returns; the path is rebuilt here from
+   * identifiers `parseFlowRef` already checked, never from the upstream href.
+   */
+  private async loadDelegatedDataStructure(
+    serviceRoot: string,
+    parts: { agencyId: string; dfId: string; dsdId?: string },
+    flowRef: string,
+    signal?: AbortSignal,
+  ): Promise<ParsedDataStructure> {
+    if (parts.dsdId) {
+      const direct = await this.loadDataStructure(
+        `${serviceRoot}/datastructure/${parts.agencyId}/${parts.dsdId}`,
+        flowRef,
+        parts.agencyId,
+        signal,
+      ).catch(swallowNotFound);
+      if (direct) return direct;
+    }
+
+    return this.loadDataStructure(
+      `${serviceRoot}/dataflow/${parts.agencyId}/${dataflowIdOf(parts)}?references=datastructure`,
       flowRef,
       parts.agencyId,
       signal,
     );
-
-    return this.applyConceptNames(parsed.structure, parsed.conceptRefs, signal);
   }
 
   /** Fetch one structure endpoint and read the datastructure out of it. */
@@ -218,11 +336,23 @@ export class OecdStructureService {
   /**
    * Fetch one concept scheme as a `concept id → name` map.
    * Uses `GET /conceptscheme/{agencyID}/{conceptSchemeID}`.
+   *
+   * `serviceRoot` addresses the root that defined the datastructure this scheme
+   * names. Omit it, or pass an {@link OecdDataStructure.serviceRoot} — those are
+   * the only two values that have been through the origin check, and this
+   * parameter becomes a request URL.
+   *
+   * `version` pins the scheme to the revision the datastructure references, for
+   * the reason {@link fetchCodelist} pins a codelist. Pass a
+   * {@link ConceptRef.version}; anything else has not been through
+   * {@link SDMX_VERSION_SAFE} and this parameter becomes a URL path segment.
    */
   async fetchConceptScheme(
     agencyId: string,
     schemeId: string,
     signal?: AbortSignal,
+    serviceRoot: string = this.baseUrl,
+    version?: string,
   ): Promise<Map<string, string>> {
     // Both IDs come from a datastructure URN, but validate as a safety net
     // before embedding in the URL path.
@@ -232,15 +362,19 @@ export class OecdStructureService {
         schemeId,
       });
     }
-    const url = `${this.baseUrl}/conceptscheme/${agencyId}/${schemeId}`;
+    const url = `${serviceRoot}/conceptscheme/${agencyId}/${schemeId}`;
+    const label = `OECD concept scheme ${agencyId}/${schemeId}`;
 
-    const data = await fetchStructureJson(
-      url,
-      `Failed to fetch OECD concept scheme ${agencyId}/${schemeId}`,
-      signal,
-    );
+    if (version !== undefined) {
+      const pinned = await fetchStructureJson(
+        `${url}/${version}`,
+        `Failed to fetch ${label} version ${version}`,
+        signal,
+      ).catch(swallowNotFound);
+      if (pinned !== undefined) return parseConceptScheme(pinned);
+    }
 
-    return parseConceptScheme(data);
+    return parseConceptScheme(await fetchStructureJson(url, `Failed to fetch ${label}`, signal));
   }
 
   /**
@@ -283,9 +417,13 @@ export class OecdStructureService {
           async ([key, ref]) =>
             [
               key,
-              await this.fetchConceptScheme(ref.agencyId, ref.schemeId, signal).catch(
-                () => new Map<string, string>(),
-              ),
+              await this.fetchConceptScheme(
+                ref.agencyId,
+                ref.schemeId,
+                signal,
+                structure.serviceRoot,
+                ref.version,
+              ).catch(() => new Map<string, string>()),
             ] as const,
         ),
       ),
@@ -314,12 +452,34 @@ export class OecdStructureService {
 
   /**
    * Fetch all codes for a codelist.
-   * Uses `GET /codelist/{agencyID}/{codelistID}`.
+   * Uses `GET /codelist/{agencyID}/{codelistID}`, with `/{version}` appended
+   * when the datastructure named one.
+   *
+   * `serviceRoot` addresses the root that defined the datastructure the
+   * codelist belongs to. The distinction carries real codes: the public catalog
+   * answers `OECD.STI.PIE/CL_TIVA_MEASURE` with version 1.0 while the root that
+   * owns `DSD_TIVA_EXGRVA` answers with the 1.1 the datastructure actually
+   * references, three codes shorter. Omit it, or pass an
+   * {@link OecdDataStructure.serviceRoot} — those are the only two values that
+   * have been through the origin check, and this parameter becomes a request URL.
+   *
+   * `version` pins the same lookup on the other axis. An unversioned request
+   * answers with whatever the root currently calls latest, which for a codelist
+   * that has moved on since the datastructure was published means codes the
+   * dimension rejects — `CL_AREA` is at 1.9 (568 codes) where
+   * `DSD_TIVA_EXGRVA` references 1.7 (560). A version the root no longer serves
+   * 404s, and that falls back to latest: an outdated list is a better answer
+   * than none, and the fallback costs a request only on a reference gone stale.
+   * Pass an {@link OecdDimension.codelistVersion}; anything else has not been
+   * through {@link SDMX_VERSION_SAFE} and this parameter becomes a URL path
+   * segment.
    */
   async fetchCodelist(
     agencyId: string,
     codelistId: string,
     signal?: AbortSignal,
+    serviceRoot: string = this.baseUrl,
+    version?: string,
   ): Promise<OecdCode[]> {
     // Both IDs are derived from upstream DSD responses, but validate as a safety net
     // before embedding in the URL path.
@@ -329,15 +489,19 @@ export class OecdStructureService {
         codelistId,
       });
     }
-    const url = `${this.baseUrl}/codelist/${agencyId}/${codelistId}`;
+    const url = `${serviceRoot}/codelist/${agencyId}/${codelistId}`;
+    const label = `OECD codelist ${agencyId}/${codelistId}`;
 
-    const data = await fetchStructureJson(
-      url,
-      `Failed to fetch OECD codelist ${agencyId}/${codelistId}`,
-      signal,
-    );
+    if (version !== undefined) {
+      const pinned = await fetchStructureJson(
+        `${url}/${version}`,
+        `Failed to fetch ${label} version ${version}`,
+        signal,
+      ).catch(swallowNotFound);
+      if (pinned !== undefined) return parseCodelist(pinned);
+    }
 
-    return parseCodelist(data);
+    return parseCodelist(await fetchStructureJson(url, `Failed to fetch ${label}`, signal));
   }
 }
 
@@ -411,11 +575,13 @@ interface ConceptRef {
   dimensionId: string;
   /** Concept scheme identifier — e.g. `CS_NA`. */
   schemeId: string;
+  /** Scheme version the URN pins — see {@link OecdDimension.codelistVersion} for why a reference is fetched at its version. */
+  version?: string | undefined;
 }
 
 /** Identity of the concept scheme a ref points at, for de-duplicating fetches. */
 function schemeKey(ref: ConceptRef): string {
-  return `${ref.agencyId}/${ref.schemeId}`;
+  return `${ref.agencyId}/${ref.schemeId}/${ref.version ?? ''}`;
 }
 
 /**
@@ -439,13 +605,49 @@ function conceptRefFromUrn(urn: unknown, dimensionId: string): ConceptRef | unde
   const schemeId = tail.slice(0, paren);
   const conceptId = tail.slice(close + 1).replace(/^\./, '');
   if (!agencyId || !schemeId || !conceptId) return;
-  return { agencyId, conceptId, dimensionId, schemeId };
+  return {
+    agencyId,
+    conceptId,
+    dimensionId,
+    schemeId,
+    version: safeVersion(tail.slice(paren + 1, close)),
+  };
+}
+
+/**
+ * Resolve the codelist a dimension's `localRepresentation.enumeration` URN names.
+ * URN format: `urn:sdmx:...Codelist=AGENCY:CL_ID(version)`.
+ * Returns undefined when the URN is absent or names no agency and id.
+ */
+function codelistRefFromUrn(
+  urn: unknown,
+): { ref: string; version?: string | undefined } | undefined {
+  if (typeof urn !== 'string') return;
+  const eq = urn.lastIndexOf('=');
+  if (eq < 0) return;
+  const rest = urn.slice(eq + 1); // "AGENCY:CL_ID(version)"
+  const paren = rest.indexOf('(');
+  const close = rest.indexOf(')', paren + 1);
+  const agencyCl = paren >= 0 ? rest.slice(0, paren) : rest; // "AGENCY:CL_ID"
+  const colon = agencyCl.indexOf(':');
+  if (colon < 0) return;
+  const agencyId = agencyCl.slice(0, colon);
+  const codelistId = agencyCl.slice(colon + 1);
+  if (!agencyId || !codelistId) return;
+  const version =
+    paren >= 0 && close > paren ? safeVersion(rest.slice(paren + 1, close)) : undefined;
+  return { ref: `${agencyId},${codelistId}`, version };
 }
 
 /**
  * Extract the DSD identifier from the structure URN.
  * URN format: `urn:sdmx:...=AGENCY:DSD_ID(version)` or `urn:sdmx:...=AGENCY:DSD_ID`.
  * Returns undefined when the URN cannot be parsed.
+ *
+ * The version is discarded rather than carried, unlike the codelist and
+ * concept-scheme URNs: this one only labels a catalog entry. Nothing addresses
+ * a datastructure by it — a `flow_ref` is what the endpoints answer, and it is
+ * built from the catalogued id.
  */
 function dsdIdFromStructureUrn(urn: string): string | undefined {
   // Match the part after the last '=' and before any '(' or end
@@ -517,7 +719,8 @@ function parseDataflows(data: unknown): OecdDataflow[] {
  */
 interface ParsedDataStructure {
   conceptRefs: ConceptRef[];
-  structure: OecdDataStructure;
+  /** The root that served it is the caller's to record — see {@link OecdDataStructure.serviceRoot}. */
+  structure: Omit<OecdDataStructure, 'serviceRoot'>;
 }
 
 function parseDataStructure(data: unknown, flowRef: string, agencyId: string): ParsedDataStructure {
@@ -554,32 +757,16 @@ function parseDataStructure(data: unknown, flowRef: string, agencyId: string): P
 
       // Codelist reference sits inside localRepresentation.enumeration, which
       // is a string URN: "urn:sdmx:...=AGENCY:CL_ID(version)".
-      // Parse the AGENCY:CL_ID portion from the URN.
       const localRep = d.localRepresentation as Record<string, unknown> | undefined;
-      const enumUrn = localRep?.enumeration;
-      let codelistRef: string | undefined;
-      if (typeof enumUrn === 'string') {
-        // Extract "AGENCY:CL_ID" from "urn:sdmx:...=AGENCY:CL_ID(version)"
-        const eq = enumUrn.lastIndexOf('=');
-        if (eq >= 0) {
-          const rest = enumUrn.slice(eq + 1); // "AGENCY:CL_ID(version)"
-          const paren = rest.indexOf('(');
-          const agencyCl = paren >= 0 ? rest.slice(0, paren) : rest; // "AGENCY:CL_ID"
-          const colon = agencyCl.indexOf(':');
-          if (colon >= 0) {
-            const clAgency = agencyCl.slice(0, colon);
-            const clId = agencyCl.slice(colon + 1);
-            if (clAgency && clId) codelistRef = `${clAgency},${clId}`;
-          }
-        }
-      }
+      const codelist = codelistRefFromUrn(localRep?.enumeration);
 
       // API positions are 0-based; expose as 1-based for user-facing key construction
       return {
         id: String(d.id ?? ''),
         name: String(name),
         position: Number(d.position ?? 0) + 1,
-        codelistRef,
+        codelistRef: codelist?.ref,
+        codelistVersion: codelist?.version,
       };
     })
     .sort((a, b) => a.position - b.position);

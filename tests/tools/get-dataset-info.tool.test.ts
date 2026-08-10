@@ -339,7 +339,8 @@ const CONCEPT_SCHEME_RESPONSE = {
 };
 
 const DSD_URL = `${FAKE_BASE}/datastructure/OECD.SDD.NAD/DSD_NAMAIN1`;
-const SCHEME_URL = `${FAKE_BASE}/conceptscheme/OECD.SDD.NAD/CS_NA`;
+/** The fixture URNs reference `CS_NA(1.0)`, and that version is what gets addressed. */
+const SCHEME_URL = `${FAKE_BASE}/conceptscheme/OECD.SDD.NAD/CS_NA/1.0`;
 const NAMAIN_FLOW_REF = 'OECD.SDD.NAD,DSD_NAMAIN1@DF_QNA_EXPENDITURE_GROWTH_OECD';
 
 describe('oecdGetDatasetInfo dimension names', () => {

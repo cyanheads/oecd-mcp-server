@@ -202,7 +202,8 @@ describe('oecdDataflowResource dimension names', () => {
         respond: () => Response.json(NAMELESS_DSD_RESPONSE),
       },
       {
-        match: `${FAKE_BASE}/conceptscheme/OECD.SDD.NAD/CS_NA`,
+        // The fixture URNs reference `CS_NA(1.0)`, and that version is addressed.
+        match: `${FAKE_BASE}/conceptscheme/OECD.SDD.NAD/CS_NA/1.0`,
         respond: () =>
           Response.json({
             data: {

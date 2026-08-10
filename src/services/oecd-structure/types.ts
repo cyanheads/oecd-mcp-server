@@ -33,6 +33,14 @@ export interface OecdDataflow {
 export interface OecdDimension {
   /** Codelist reference, if available — e.g. `OECD.SDD.NAD,CL_AREA`. */
   codelistRef?: string | undefined;
+  /**
+   * Codelist version the datastructure references — e.g. `1.7`. A codelist is
+   * versioned independently of the datastructures that use it, and an
+   * unversioned request answers with the root's current latest, which offers
+   * codes a dimension pinned to an older revision rejects. Absent when the
+   * enumeration URN names no version this server will address.
+   */
+  codelistVersion?: string | undefined;
   /** Dimension identifier — e.g. `REF_AREA`. */
   id: string;
   /**
@@ -60,6 +68,15 @@ export interface OecdDataStructure {
   dsdId: string;
   flowRef: string;
   nonProduction: boolean;
+  /**
+   * OECD service root that served this datastructure — the configured base URL
+   * for nearly every dataflow, and the root named in the catalog entry's
+   * `rel: external` link for the ones published as a pointer rather than a
+   * definition. Codelists and concept schemes are versioned per root and the
+   * public catalog mirrors an older revision of both, so a label lookup for
+   * these dimensions has to address the root recorded here.
+   */
+  serviceRoot: string;
   timeDimension?: OecdTimeDimension | undefined;
 }
 

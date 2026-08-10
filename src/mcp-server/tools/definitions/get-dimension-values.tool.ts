@@ -186,10 +186,17 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
     const clAgencyId = clCommaIdx >= 0 ? dim.codelistRef.slice(0, clCommaIdx) : parts.agencyId;
     const codelistId = clCommaIdx >= 0 ? dim.codelistRef.slice(clCommaIdx + 1) : dim.codelistRef;
 
+    /**
+     * Read the codelist at the root and the version the datastructure names.
+     * Both matter, and for the same reason: a codelist read from the wrong root
+     * or at the wrong revision carries codes this dimension does not accept.
+     */
     const codes: OecdCode[] = await getStructureService().fetchCodelist(
       clAgencyId,
       codelistId,
       ctx.signal,
+      dsd.serviceRoot,
+      dim.codelistVersion,
     );
 
     /**

@@ -4,7 +4,12 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createFetchMock,
+  createMockContext,
+  getEnrichment,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdGetDimensionValues } from '@/mcp-server/tools/definitions/get-dimension-values.tool.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
@@ -155,6 +160,49 @@ describe('oecdGetDimensionValues', () => {
     await oecdGetDimensionValues.handler(input, ctx);
 
     expect(getEnrichment(ctx).notice).toBeUndefined();
+  });
+
+  it('reads the codelist at the version the dimension references', async () => {
+    /**
+     * The unversioned endpoint answers with the root's current latest, which
+     * for a codelist that has moved on since the datastructure was published
+     * offers codes the dimension rejects.
+     */
+    const http = createFetchMock();
+    http.route(
+      {
+        match: `${FAKE_BASE}/datastructure/OECD.SDD.NAD/DSD_NAAG`,
+        respond: () => Response.json(DSD_RESPONSE),
+      },
+      {
+        match: `${FAKE_BASE}/codelist/OECD/CL_FREQ/1.0`,
+        respond: () => Response.json(CODELIST_RESPONSE),
+      },
+      // Latest, carrying a code the referenced revision does not have.
+      {
+        match: `${FAKE_BASE}/codelist/OECD/CL_FREQ`,
+        respond: () =>
+          Response.json({ data: { codelists: [{ codes: [{ id: 'W', name: 'Weekly' }] }] } }),
+      },
+    );
+    http.install();
+
+    try {
+      const ctx = createMockContext({ errors: oecdGetDimensionValues.errors });
+      const input = oecdGetDimensionValues.input.parse({
+        flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+        dimension_id: 'FREQ',
+      });
+      const result = await oecdGetDimensionValues.handler(input, ctx);
+
+      expect(result.codes.map((c) => c.id)).toEqual(['A', 'Q', 'M']);
+      expect(http.calls.map((c) => c.request.url)).toEqual([
+        `${FAKE_BASE}/datastructure/OECD.SDD.NAD/DSD_NAAG`,
+        `${FAKE_BASE}/codelist/OECD/CL_FREQ/1.0`,
+      ]);
+    } finally {
+      http.restore();
+    }
   });
 
   it('throws ctx.fail(dataflow_not_found) for malformed flow_ref', async () => {
