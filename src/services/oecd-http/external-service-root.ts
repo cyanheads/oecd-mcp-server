@@ -36,6 +36,12 @@ const EXTERNAL_DATAFLOW_PATH = /^\/([A-Za-z0-9][A-Za-z0-9._-]*)\/rest\/dataflow\
  *    plaintext delegates nowhere at all rather than widening the surface.
  * 3. The path must match the SDMX dataflow shape above, and only its leading
  *    service segment survives into the returned root.
+ *
+ * The origin pinned here is the origin the request reaches only because
+ * `fetchOecd` issues every request with `redirect: 'manual'` and refuses a 3xx
+ * outright: a host allowed to redirect could hand the request to any other one
+ * after this check has passed. The two rules are a pair — neither is worth much
+ * loosened on its own.
  */
 export function externalServiceRoot(href: unknown, baseUrl: string): string | undefined {
   if (typeof href !== 'string') return;
