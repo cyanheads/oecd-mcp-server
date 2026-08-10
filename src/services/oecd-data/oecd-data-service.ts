@@ -14,7 +14,10 @@ import {
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { fetchOecd, upstreamStatus } from '@/services/oecd-http/oecd-http.js';
-import { parseFlowRef } from '@/services/oecd-structure/oecd-structure-service.js';
+import {
+  fetchExternalServiceRoot,
+  parseFlowRef,
+} from '@/services/oecd-structure/oecd-structure-service.js';
 import type { DecodedRow, OecdColumn, OecdDataResult } from './types.js';
 
 /**
@@ -68,6 +71,12 @@ const HANDLED_STATUSES = [
   404,
   // A malformed key or an unparseable period, with the explanation in the body.
   400, 422,
+  // What a root answers for a dataflow it catalogues without hosting. Whether
+  // that is a fault at all is settled a request later, by the catalog lookup —
+  // a query the delegation carries to a successful answer should not have
+  // reported an upstream fault along the way. One that turns out to be a real
+  // fault surfaces where every other failed query does, at the tool boundary.
+  500,
 ];
 
 /** Fetch and parse one observations response. */
@@ -86,6 +95,20 @@ async function fetchDataJson(url: string, signal?: AbortSignal): Promise<unknown
         cause: err,
       },
     );
+  });
+}
+
+/**
+ * Fetch one observations response, retrying the failures worth retrying.
+ *
+ * `maxRetries` is the caller's because the attempts at a root are not always a
+ * fresh budget — a query resumed after the catalog lookup ruled delegation out
+ * has already spent one of them.
+ */
+function loadObservations(url: string, signal?: AbortSignal, maxRetries = 2): Promise<unknown> {
+  return withRetry(() => fetchDataJson(url, signal), {
+    maxRetries,
+    ...(signal ? { signal } : {}),
   });
 }
 
@@ -145,6 +168,90 @@ export function throttleText(err: unknown): string | undefined {
   return typeof body === 'string' && body.trim() !== '' ? body.trim() : err.message;
 }
 
+/**
+ * How OECD spells "the query was valid and matched nothing", which it answers
+ * with a 404 rather than a 200 carrying no observations. The sentinel is not
+ * uniform across the service roots — `sti-public` returns `NoResultsFound` and
+ * `dcd-public` returns `NoRecordsFound` for the same outcome — and a root that
+ * genuinely does not hold the dataflow says so in prose instead
+ * (`Could not find Dataflow and/or DSD related with this data request`), which
+ * stays a not-found.
+ */
+const NO_MATCH_BODY = /No(?:Results|Records)Found|no result/;
+
+/**
+ * An empty result for the failure OECD reports as one.
+ * Returns undefined for every other failure.
+ */
+function emptyResultFor(err: unknown): OecdDataResult | undefined {
+  const upstream = upstreamStatus(err);
+  if (upstream?.status === 404 && NO_MATCH_BODY.test(upstream.body)) {
+    return { columns: [], rowCount: 0, rows: [], source: 'OECD' };
+  }
+  return;
+}
+
+/**
+ * Whether a failed observations fetch is worth one catalog lookup to see if the
+ * dataflow is served by a different OECD service root.
+ *
+ * Only the two statuses the public root answers with for an entry it catalogues
+ * but does not host: a 500 (`Object reference not set to an instance of an
+ * object.` — what the data endpoint returns for every externally-referenced
+ * dataflow) and a plain 404. A throttle or an exhausted outage is a fact about
+ * the service, not about where the dataflow lives, and spending another request
+ * on it would only deepen the hole.
+ */
+function mayLiveElsewhere(err: unknown): boolean {
+  const status = upstreamStatus(err)?.status;
+  return status === 404 || status === 500;
+}
+
+/**
+ * The first pass at the configured root, with the retry budget withheld from
+ * the statuses a catalog lookup can settle — see {@link mayLiveElsewhere}.
+ *
+ * `data.retryable: false` is the framework's in-band opt-out from `withRetry`'s
+ * classification, so such a failure surfaces on the first attempt rather than
+ * after two backoffs. It is withheld, not spent: a 500 the lookup does not
+ * explain is a genuine fault and gets its remaining attempts afterwards. A 429,
+ * a 503, or a timeout is never held back — none of them says anything about
+ * where a dataflow lives, so the lookup has nothing cheaper to offer and the
+ * ordinary budget is what clears them.
+ */
+function probeConfiguredRoot(url: string, signal?: AbortSignal): Promise<unknown> {
+  return withRetry(
+    () =>
+      fetchDataJson(url, signal).catch((err: unknown) => {
+        if (!mayLiveElsewhere(err) || !(err instanceof McpError)) throw err;
+        throw new McpError(
+          err.code,
+          err.message,
+          { ...err.data, retryable: false },
+          { cause: err },
+        );
+      }),
+    { maxRetries: 2, ...(signal ? { signal } : {}) },
+  );
+}
+
+/**
+ * Decode one observations response, reading OECD's empty-match 404 as an empty
+ * result and restating every other failure as the outcome the caller acts on.
+ */
+async function settleObservations(
+  load: Promise<unknown>,
+  flowRef: string,
+): Promise<OecdDataResult> {
+  try {
+    return decodeObservations(await load);
+  } catch (err) {
+    const empty = emptyResultFor(err);
+    if (empty) return empty;
+    throw dataFetchFailure(err, flowRef);
+  }
+}
+
 let _instance: OecdDataService | undefined;
 
 /** Service for fetching and decoding OECD SDMX observation data. */
@@ -157,6 +264,18 @@ export class OecdDataService {
 
   /**
    * Fetch observations for a dataflow, decoding SDMX-JSON with AllDimensions mode.
+   *
+   * The configured root is tried first and answers for nearly the whole
+   * catalog. The entries it publishes as external references are the exception:
+   * it holds the catalog entry but not the observations, and answers the data
+   * endpoint with a 500. For those, one catalog lookup names the OECD service
+   * root that does host them and the same request is reissued there — see
+   * {@link fetchExternalServiceRoot} for what makes a delegation followable.
+   *
+   * The lookup runs before the retries rather than after, because it is the
+   * only thing that tells a 500 meaning "not served here" from a 500 meaning
+   * "unwell right now", and the first repeats on every attempt. The one it
+   * cannot explain resumes its retries against the configured root.
    *
    * @param flowRef - e.g. `OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I`
    * @param key - dot-delimited dimension key, e.g. `A.USA.B1GQ..`
@@ -187,27 +306,31 @@ export class OecdDataService {
     // datastructure part and is sent as published.
     const encodedFlowId = parts.dsdId ? `${parts.dsdId}%40${parts.dfId}` : parts.dfId;
     const pathKey = NORMALIZED_AWAY_KEY.test(key) ? 'all' : key;
-    let url = `${this.baseUrl}/data/${parts.agencyId},${encodedFlowId}/${pathKey}?dimensionAtObservation=AllDimensions`;
-    if (startPeriod) url += `&startPeriod=${encodeURIComponent(startPeriod)}`;
-    if (endPeriod) url += `&endPeriod=${encodeURIComponent(endPeriod)}`;
+    let path = `/data/${parts.agencyId},${encodedFlowId}/${pathKey}?dimensionAtObservation=AllDimensions`;
+    if (startPeriod) path += `&startPeriod=${encodeURIComponent(startPeriod)}`;
+    if (endPeriod) path += `&endPeriod=${encodeURIComponent(endPeriod)}`;
 
-    const retryOpts = { maxRetries: 2, ...(signal ? { signal } : {}) };
-    let parsed: unknown;
+    const primary = `${this.baseUrl}${path}`;
     try {
-      parsed = await withRetry(() => fetchDataJson(url, signal), retryOpts);
+      return decodeObservations(await probeConfiguredRoot(primary, signal));
     } catch (err) {
-      const upstream = upstreamStatus(err);
-      // OECD reports "the query was valid, nothing matched" as a 404.
-      if (
-        upstream?.status === 404 &&
-        (upstream.body.includes('NoResultsFound') || upstream.body.includes('no result'))
-      ) {
-        return { columns: [], rowCount: 0, rows: [], source: 'OECD' };
-      }
-      throw dataFetchFailure(err, flowRef);
-    }
+      const empty = emptyResultFor(err);
+      if (empty) return empty;
+      if (!mayLiveElsewhere(err)) throw dataFetchFailure(err, flowRef);
 
-    return decodeObservations(parsed);
+      const serviceRoot = await fetchExternalServiceRoot(this.baseUrl, flowRef, signal);
+      // The delegated root owns the data, so its refusal is the one to report.
+      if (serviceRoot !== undefined) {
+        return settleObservations(loadObservations(`${serviceRoot}${path}`, signal), flowRef);
+      }
+
+      // No other root claims the flow, so the failure was the configured root's
+      // own. A 404 is terminal — the dataflow is nowhere. A 500 is the
+      // transient fault it looked like before delegation was ruled out, and
+      // gets the attempts the probe withheld, less the one already spent.
+      if (upstreamStatus(err)?.status !== 500) throw dataFetchFailure(err, flowRef);
+      return settleObservations(loadObservations(primary, signal, 1), flowRef);
+    }
   }
 }
 

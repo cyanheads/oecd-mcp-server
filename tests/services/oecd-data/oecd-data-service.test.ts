@@ -502,6 +502,16 @@ describe('OecdDataService.fetchData — upstream failures', () => {
     expect(result).toEqual({ columns: [], rowCount: 0, rows: [], source: 'OECD' });
   });
 
+  it('reads a 404 NoRecordsFound body as an empty result too', async () => {
+    // The service roots do not agree on the sentinel: one says NoResultsFound,
+    // another NoRecordsFound, for the same "valid query, nothing matched".
+    respondOnce('NoRecordsFound', { status: 404 });
+
+    const result = await service().fetchData(FLOW_REF, 'A.USA..');
+
+    expect(result).toEqual({ columns: [], rowCount: 0, rows: [], source: 'OECD' });
+  });
+
   it('reads any other 404 as a missing dataflow', async () => {
     respondOnce('Could not find Dataflow and/or DSD related with this data request', {
       status: 404,
@@ -523,4 +533,270 @@ describe('OecdDataService.fetchData — upstream failures', () => {
     expect(http.calls).toHaveLength(0);
     expect(invalidQueryText(error)).toContain('Dimension key contains characters');
   });
+});
+
+// ── Delegated service roots ───────────────────────────────────────────────────
+
+/**
+ * The configured root catalogues part of the collection without hosting its
+ * observations. Those entries answer the data endpoint with a 500 and carry a
+ * `links[]` entry naming the OECD service root that does host them.
+ */
+describe('OecdDataService.fetchData — delegated service roots', () => {
+  const CATALOG_URL = `${BASE}/dataflow/OECD.SDD.NAD/DSD_NAAG@DF_NAAG_I`;
+  const DELEGATED_ROOT = `${BASE}/sti-public/rest`;
+  const DELEGATED_DATA_URL = `${DELEGATED_ROOT}/data/OECD.SDD.NAD,DSD_NAAG%40DF_NAAG_I/A.USA..?dimensionAtObservation=AllDimensions`;
+
+  /** A catalog entry delegating to `href`. */
+  function routeCatalog(href: string): void {
+    http.route({
+      match: CATALOG_URL,
+      respond: () =>
+        Response.json({
+          data: {
+            dataflows: [
+              {
+                agencyID: 'OECD.SDD.NAD',
+                id: 'DSD_NAAG@DF_NAAG_I',
+                isExternalReference: true,
+                links: [{ rel: 'external', href }],
+              },
+            ],
+          },
+        }),
+    });
+  }
+
+  /**
+   * A permissive last route answering anything still requested with a usable
+   * result, so following a rejected href would succeed. A test that ends in the
+   * original failure therefore proves the request was never issued.
+   */
+  function routeAnythingElse(): void {
+    http.route({ match: () => true, respond: () => Response.json(DATA_RESPONSE) });
+  }
+
+  it('reissues the query against the root the catalog entry delegates to', async () => {
+    http.route(
+      {
+        match: DATA_URL,
+        respond: () =>
+          new Response('Object reference not set to an instance of an object.', { status: 500 }),
+      },
+      { match: DELEGATED_DATA_URL, respond: () => Response.json(DATA_RESPONSE) },
+    );
+    routeCatalog(`${BASE}/sti-public/rest/dataflow/OECD.SDD.NAD/DSD_NAAG@DF_NAAG_I/1.1`);
+
+    const result = await service().fetchData(FLOW_REF, 'A.USA..');
+
+    expect(result.rowCount).toBe(3);
+    expect(http.calls.at(-1)?.request.url).toBe(DELEGATED_DATA_URL);
+  }, 15_000);
+
+  it('carries the key and period filters through to the delegated root unchanged', async () => {
+    const delegatedWithPeriod = `${DELEGATED_DATA_URL}&startPeriod=2020&endPeriod=2021`;
+    http.route(
+      {
+        match: `${DATA_URL}&startPeriod=2020&endPeriod=2021`,
+        respond: () => new Response('Object reference not set', { status: 500 }),
+      },
+      { match: delegatedWithPeriod, respond: () => Response.json(DATA_RESPONSE) },
+    );
+    routeCatalog(`${BASE}/sti-public/rest/dataflow/OECD.SDD.NAD/DSD_NAAG@DF_NAAG_I/1.1`);
+
+    const result = await service().fetchData(FLOW_REF, 'A.USA..', '2020', '2021');
+
+    expect(result.rowCount).toBe(3);
+    expect(http.calls.at(-1)?.request.url).toBe(delegatedWithPeriod);
+  }, 15_000);
+
+  it('never issues a request to a host the delegation names but the base URL does not', async () => {
+    http.route({
+      match: DATA_URL,
+      respond: () => new Response('Object reference not set', { status: 500 }),
+    });
+    routeCatalog('https://attacker.example/sti-public/rest/dataflow/OECD.SDD.NAD/DSD_NAAG@DF/1.1');
+    routeAnythingElse();
+
+    const error = await service()
+      .fetchData(FLOW_REF, 'A.USA..')
+      .catch((e: Error) => e);
+
+    expect(http.calls.map((c) => new URL(c.request.url).host)).not.toContain('attacker.example');
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+  }, 15_000);
+
+  it('never issues a request for a delegation over plaintext', async () => {
+    http.route({
+      match: DATA_URL,
+      respond: () => new Response('Object reference not set', { status: 500 }),
+    });
+    routeCatalog(`http://fake.oecd.test/sti-public/rest/dataflow/OECD.SDD.NAD/DSD_NAAG@DF/1.1`);
+    routeAnythingElse();
+
+    const error = await service()
+      .fetchData(FLOW_REF, 'A.USA..')
+      .catch((e: Error) => e);
+
+    expect(http.calls.map((c) => new URL(c.request.url).protocol)).not.toContain('http:');
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+  }, 15_000);
+
+  it('reports the original failure when the catalog entry delegates nowhere', async () => {
+    http.route({
+      match: DATA_URL,
+      respond: () => new Response('Object reference not set', { status: 500 }),
+    });
+    http.route({
+      match: CATALOG_URL,
+      respond: () =>
+        Response.json({ data: { dataflows: [{ agencyID: 'OECD.SDD.NAD', links: [] }] } }),
+    });
+    routeAnythingElse();
+
+    const error = await service()
+      .fetchData(FLOW_REF, 'A.USA..')
+      .catch((e: Error) => e);
+
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+    expect(http.calls.map((c) => c.request.url)).not.toContain(DELEGATED_DATA_URL);
+  }, 15_000);
+
+  it('spends no catalog lookup on a throttle or an outage', async () => {
+    // Neither says anything about where the dataflow lives, and another request
+    // is the last thing a throttled or failing service needs.
+    http.route({ match: DATA_URL, respond: () => new Response('boom', { status: 503 }) });
+    routeAnythingElse();
+
+    await service()
+      .fetchData(FLOW_REF, 'A.USA..')
+      .catch((e: Error) => e);
+
+    expect(http.calls.map((c) => c.request.url)).toEqual([DATA_URL, DATA_URL, DATA_URL]);
+  }, 15_000);
+
+  it('surfaces the delegated root’s own rejection rather than the first failure', async () => {
+    http.route(
+      {
+        match: DATA_URL,
+        respond: () => new Response('Object reference not set', { status: 500 }),
+      },
+      {
+        match: DELEGATED_DATA_URL,
+        respond: () =>
+          new Response('Not enough key values in query, expecting 6 got 3', { status: 422 }),
+      },
+    );
+    routeCatalog(`${BASE}/sti-public/rest/dataflow/OECD.SDD.NAD/DSD_NAAG@DF_NAAG_I/1.1`);
+
+    const error = await service()
+      .fetchData(FLOW_REF, 'A.USA..')
+      .catch((e: Error) => e);
+
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.ValidationError });
+    expect(invalidQueryText(error)).toBe('Not enough key values in query, expecting 6 got 3');
+  }, 15_000);
+
+  it('reads a NoResultsFound from the delegated root as an empty result', async () => {
+    http.route(
+      {
+        match: DATA_URL,
+        respond: () => new Response('Object reference not set', { status: 500 }),
+      },
+      { match: DELEGATED_DATA_URL, respond: () => new Response('NoRecordsFound', { status: 404 }) },
+    );
+    routeCatalog(`${BASE}/sti-public/rest/dataflow/OECD.SDD.NAD/DSD_NAAG@DF_NAAG_I/1.1`);
+
+    const result = await service().fetchData(FLOW_REF, 'A.USA..');
+
+    expect(result).toEqual({ columns: [], rowCount: 0, rows: [], source: 'OECD' });
+  }, 15_000);
+
+  it('asks the catalog after one 500 rather than after three', async () => {
+    // The 500 is a fixed property of a flow this root does not host, so the
+    // backoff cannot clear it and the lookup settles it for one request.
+    http.route(
+      {
+        match: DATA_URL,
+        respond: () =>
+          new Response('Object reference not set to an instance of an object.', { status: 500 }),
+      },
+      { match: DELEGATED_DATA_URL, respond: () => Response.json(DATA_RESPONSE) },
+    );
+    routeCatalog(`${BASE}/sti-public/rest/dataflow/OECD.SDD.NAD/DSD_NAAG@DF_NAAG_I/1.1`);
+
+    const startedAt = Date.now();
+    const result = await service().fetchData(FLOW_REF, 'A.USA..');
+    const elapsed = Date.now() - startedAt;
+
+    expect(result.rowCount).toBe(3);
+    expect(http.calls.map((c) => c.request.url)).toEqual([
+      DATA_URL,
+      CATALOG_URL,
+      DELEGATED_DATA_URL,
+    ]);
+    // Three attempts would have carried the framework's 1s and 2s backoffs.
+    expect(elapsed).toBeLessThan(1000);
+  }, 15_000);
+
+  it('spends one request on the catalog lookup, not a retry loop of its own', async () => {
+    // Skipping the retries at the data endpoint buys nothing if the question
+    // that replaces them costs the same three requests and backoff.
+    http.route({
+      match: DATA_URL,
+      respond: () => new Response('Object reference not set', { status: 500 }),
+    });
+    http.route({ match: CATALOG_URL, respond: () => new Response('boom', { status: 503 }) });
+
+    await service()
+      .fetchData(FLOW_REF, 'A.USA..')
+      .catch((e: Error) => e);
+
+    expect(http.calls.filter((c) => c.request.url === CATALOG_URL)).toHaveLength(1);
+  }, 15_000);
+
+  it('still retries a 500 the catalog cannot explain', async () => {
+    // Delegation and an unwell service are spelled the same way, and only the
+    // lookup tells them apart. Ruling delegation out leaves an ordinary
+    // transient fault, which gets the attempts the probe withheld.
+    http.route({
+      match: DATA_URL,
+      respond: () => new Response('Object reference not set', { status: 500 }),
+    });
+    http.route({
+      match: CATALOG_URL,
+      respond: () =>
+        Response.json({ data: { dataflows: [{ agencyID: 'OECD.SDD.NAD', links: [] }] } }),
+    });
+
+    const error = await service()
+      .fetchData(FLOW_REF, 'A.USA..')
+      .catch((e: Error) => e);
+
+    expect(http.calls.filter((c) => c.request.url === DATA_URL)).toHaveLength(3);
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+  }, 15_000);
+
+  it('succeeds on a retry the catalog lookup cleared the way for', async () => {
+    let attempts = 0;
+    http.route({
+      match: DATA_URL,
+      respond: () => {
+        attempts += 1;
+        return attempts === 1
+          ? new Response('Object reference not set', { status: 500 })
+          : Response.json(DATA_RESPONSE);
+      },
+    });
+    http.route({
+      match: CATALOG_URL,
+      respond: () =>
+        Response.json({ data: { dataflows: [{ agencyID: 'OECD.SDD.NAD', links: [] }] } }),
+    });
+
+    const result = await service().fetchData(FLOW_REF, 'A.USA..');
+
+    expect(result.rowCount).toBe(3);
+    expect(attempts).toBe(2);
+  }, 15_000);
 });
