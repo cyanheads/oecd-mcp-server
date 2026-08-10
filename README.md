@@ -143,6 +143,8 @@ OECD-specific:
 
 - Keyless access — no API key required; OECD SDMX 2.1 REST API is fully public
 - Covers 1,500+ dataflows across 20+ OECD statistical departments (national accounts, employment, inflation, trade, education, health, environment, taxation, inequality)
+- Delegated dataflows resolved end to end — the entries OECD catalogues on one service root but defines on another (Trade in Value Added, the DAC creditor-reporting aid series) follow the catalog's own link for structure, codes, and observations, with the target checked against the configured origin before any request goes out
+- Codes read at the revision the dataflow references — a codelist moves on independently of the datastructures using it, so a dimension's values come from the version its structure names rather than the endpoint's current latest, and never include a code the dimension rejects
 - `AllDimensions` observation mode — one-pass SDMX-JSON decoding into flat row objects; no nested series key reconstruction
 - `oecd_query_dataset` materializes large observation sets (multi-country time-series) on a DuckDB DataCanvas for in-conversation SQL analytics
 - OECD source attribution (`source: "OECD"`) on every observation row per OECD terms of use
@@ -325,7 +327,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/config/` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools/definitions/` | Tool definitions (`*.tool.ts`) — seven tools for OECD data discovery and retrieval. |
 | `src/mcp-server/resources/definitions/` | Resource definitions (`*.resource.ts`) — the `oecd://dataflow` resource. |
-| `src/services/oecd-http/` | Shared OECD fetch boundary — timeout and retry-classification corrections used by both services below. |
+| `src/services/oecd-http/` | Shared OECD fetch boundary — timeout and retry-classification corrections used by both services below, plus the origin check every delegated service root passes before it is addressed. |
 | `src/services/oecd-structure/` | OECD SDMX structure service — dataflows, data structures, codelists. |
 | `src/services/oecd-data/` | OECD SDMX data service — observations, SDMX-JSON decoding, DataCanvas spillover. |
 | `src/services/canvas-accessor/` | DataCanvas accessor — registers and exposes the framework canvas instance to tools. |
