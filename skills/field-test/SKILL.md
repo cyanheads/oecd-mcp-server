@@ -4,7 +4,7 @@ description: >
   Exercise tools, resources, and prompts against a live HTTP server via MCP JSON-RPC over curl. Starts the server, surfaces the catalog, runs real and adversarial inputs, and produces a tight report with concrete findings and numbered follow-up options. Use after adding or modifying definitions, or when the user asks to test, try out, or verify their MCP surface.
 metadata:
   author: cyanheads
-  version: "2.8"
+  version: "2.9"
   audience: external
   type: debug
 ---
@@ -309,7 +309,9 @@ Use `TaskCreate` — one task per definition. Mark complete as you go. Don't bat
 
 For each call, capture: input sent, response (trim huge payloads to files), whether `isError: true` appeared, anything surprising (slow response, parity drift, unhelpful text, crash).
 
-When a call surprises you — slow, hangs, returns terse output, surfaces an unhelpful error — run `. /tmp/<project-name>-field-test-<ID>.sh && mcp_log <log>` to tail the server log. The pino startup banner, request handler errors, upstream API call traces, and rate-limit warnings all land in the per-server log (read via `mcp_log`) rather than coming back through `mcp_call`. Don't guess at runtime behavior from response text alone.
+When a call surprises you — slow, hangs, returns terse output, surfaces an unhelpful error — run `. /tmp/<project-name>-field-test-<ID>.sh && mcp_log <log>` to tail the server log. The pino startup banner, request handler errors, and rate-limit warnings land in the per-server log (read via `mcp_log`) rather than coming back through `mcp_call`. Don't guess at runtime behavior from response text alone.
+
+**`mcp_log` caps at info — upstream call traces are debug and never appear there.** It tails the server process's stdout/stderr, and those pino targets are registered without an explicit `level`; only the file sinks set one. To see per-request fetch traces (URL, timeout, status, retry attempts), start the server with `LOGS_DIR=<dir> MCP_LOG_LEVEL=debug` and read `<dir>/combined.log`; `<dir>/error.log` alongside it carries error-and-above only, which makes it a fast check for whether a successful-looking call logged failures on the way.
 
 **Interpreting responses**
 
