@@ -1,6 +1,6 @@
 # oecd-mcp-server - Directory Structure
 
-Generated on: 2026-08-09 23:16:42
+Generated on: 2026-08-10 00:57:25
 
 ```text
 oecd-mcp-server/
@@ -170,7 +170,8 @@ oecd-mcp-server/
 │   │   ├── oecd-data/
 │   │   │   └── oecd-data-service.test.ts
 │   │   ├── oecd-http/
-│   │   │   └── external-service-root.test.ts
+│   │   │   ├── external-service-root.test.ts
+│   │   │   └── oecd-http.test.ts
 │   │   └── oecd-structure/
 │   │       └── oecd-structure-service.test.ts
 │   └── tools/
