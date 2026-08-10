@@ -19,6 +19,12 @@
 
 </div>
 
+<div align="center">
+
+**Public Hosted Server:** [https://oecd.caseyjhand.com/mcp](https://oecd.caseyjhand.com/mcp)
+
+</div>
+
 ---
 
 ## Tools
@@ -156,6 +162,23 @@ Agent-friendly output:
 - Full SDMX decoding server-side — agents see `{ REF_AREA: "United States", MEASURE: "Gross domestic product", UNIT_MULT: "Billions", value: 26054614000000, value_scale: 1000000000 }`, not raw index arrays
 
 ## Getting started
+
+### Public Hosted Instance
+
+A public instance is available at `https://oecd.caseyjhand.com/mcp` — no installation required. Point any MCP client at it via Streamable HTTP:
+
+```json
+{
+  "mcpServers": {
+    "oecd-mcp-server": {
+      "type": "streamable-http",
+      "url": "https://oecd.caseyjhand.com/mcp"
+    }
+  }
+}
+```
+
+### Self-Hosted / Local
 
 Add the following to your MCP client configuration file.
 
