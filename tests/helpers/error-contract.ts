@@ -15,9 +15,19 @@ export interface DeclaredError {
   when: string;
 }
 
-/** Any definition carrying a declared error contract. */
+/**
+ * Any definition carrying a declared error contract. `errors` is optional on the
+ * framework's definition types, so it is optional here too — a definition that
+ * declares none still fits, and {@link declaredError} is what turns an absent
+ * contract into a failed assertion rather than a silent undefined.
+ */
 export interface WithErrors {
-  errors: readonly DeclaredError[];
+  errors?: readonly DeclaredError[] | undefined;
+}
+
+/** The contract a definition declares, or an empty list when it declares none. */
+export function declaredErrors(def: WithErrors): readonly DeclaredError[] {
+  return def.errors ?? [];
 }
 
 /**
@@ -28,10 +38,11 @@ export interface WithErrors {
  * exactly the false green this helper exists to prevent.
  */
 export function declaredError(def: WithErrors, reason: string): DeclaredError {
-  const entry = def.errors.find((e) => e.reason === reason);
+  const entries = declaredErrors(def);
+  const entry = entries.find((e) => e.reason === reason);
   if (!entry) {
     throw new Error(
-      `No "${reason}" contract entry — declared: ${def.errors.map((e) => e.reason).join(', ')}`,
+      `No "${reason}" contract entry — declared: ${entries.map((e) => e.reason).join(', ')}`,
     );
   }
   return entry;

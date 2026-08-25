@@ -177,7 +177,9 @@ describe('oecdSearchDatasets', () => {
     const ctx = createMockContext({ errors: oecdSearchDatasets.errors });
     const input = oecdSearchDatasets.input.parse({ query: 'gdp', agency_id: 'OECD.ELS' });
 
-    const error = await oecdSearchDatasets.handler(input, ctx).catch((e: Error) => e);
+    const error = await Promise.resolve(oecdSearchDatasets.handler(input, ctx)).catch(
+      (e: Error) => e,
+    );
     expect(error).toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'agency_not_found' },
@@ -193,7 +195,9 @@ describe('oecdSearchDatasets', () => {
     const ctx = createMockContext({ errors: oecdSearchDatasets.errors });
     const input = oecdSearchDatasets.input.parse({ query: 'gdp', agency_id: 'OECD/../secrets' });
 
-    const error = await oecdSearchDatasets.handler(input, ctx).catch((e: Error) => e);
+    const error = await Promise.resolve(oecdSearchDatasets.handler(input, ctx)).catch(
+      (e: Error) => e,
+    );
     expect(error).toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'agency_not_found' },

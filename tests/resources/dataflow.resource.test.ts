@@ -13,6 +13,14 @@ import { declaredRecovery as declaredRecoveryOf } from '../helpers/error-contrac
 const FAKE_BASE = 'https://fake.oecd.test';
 
 /**
+ * The resource's own params schema, read once. `params` is optional on the
+ * definition type, so pinning it here keeps every case free of a per-call
+ * narrowing that would say nothing about the resource.
+ */
+const resourceParams = oecdDataflowResource.params;
+if (!resourceParams) throw new Error('oecdDataflowResource must declare params');
+
+/**
  * The recovery text the resource declares for a reason. A resource re-throws
  * rather than producing an `isError` envelope, so the `McpError` a handler
  * throws is what the framework hands the SDK verbatim and what reaches the
@@ -82,9 +90,9 @@ describe('oecdDataflowResource', () => {
   });
 
   it('returns dimension metadata for a valid resource URI', async () => {
-    const ctx = createMockContext();
+    const ctx = createMockContext({ errors: oecdDataflowResource.errors });
     // flow_id is the URL-encoded combined dsd_id@df_id
-    const params = oecdDataflowResource.params.parse({
+    const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_NAAG%40DF_NAAG_I',
     });
@@ -98,8 +106,8 @@ describe('oecdDataflowResource', () => {
   });
 
   it('handles plain @ (not percent-encoded) in flow_id', async () => {
-    const ctx = createMockContext();
-    const params = oecdDataflowResource.params.parse({
+    const ctx = createMockContext({ errors: oecdDataflowResource.errors });
+    const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_NAAG@DF_NAAG_I',
     });
@@ -109,8 +117,8 @@ describe('oecdDataflowResource', () => {
   });
 
   it('serves a bare df_id, which OECD publishes for datastructure-less dataflows', async () => {
-    const ctx = createMockContext();
-    const params = oecdDataflowResource.params.parse({
+    const ctx = createMockContext({ errors: oecdDataflowResource.errors });
+    const params = resourceParams.parse({
       agency_id: 'OECD.TAD.ARP',
       flow_id: 'DF_AEI2024_DASHBOARD',
     });
@@ -122,7 +130,7 @@ describe('oecdDataflowResource', () => {
 
   it('throws ctx.fail(invalid_flow_ref) for a flow_id carrying path characters', async () => {
     const ctx = createMockContext({ errors: oecdDataflowResource.errors });
-    const params = oecdDataflowResource.params.parse({
+    const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_NAAG%40..%2f..%2fetc',
     });
@@ -139,7 +147,7 @@ describe('oecdDataflowResource', () => {
     const ctx = createMockContext({ errors: oecdDataflowResource.errors });
     // decodeURIComponent throws a URIError on this, which without the contract
     // reaches the client as an unexplained internal fault.
-    const params = oecdDataflowResource.params.parse({
+    const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_NAAG%ZZDF_NAAG_I',
     });
@@ -171,7 +179,7 @@ describe('oecdDataflowResource', () => {
       }),
     );
     const ctx = createMockContext({ errors: oecdDataflowResource.errors });
-    const params = oecdDataflowResource.params.parse({
+    const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_MISSING%40DF_MISSING',
     });
@@ -196,7 +204,7 @@ describe('oecdDataflowResource', () => {
         ),
     );
     const ctx = createMockContext({ errors: oecdDataflowResource.errors });
-    const params = oecdDataflowResource.params.parse({
+    const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_X%40DF_X',
     });
@@ -219,7 +227,7 @@ describe('oecdDataflowResource', () => {
         ),
     );
     const ctx = createMockContext({ errors: oecdDataflowResource.errors });
-    const params = oecdDataflowResource.params.parse({
+    const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_NAAG%40DF_NAAG_I',
     });
@@ -251,7 +259,7 @@ describe('oecdDataflowResource', () => {
         ),
     );
     const ctx = createMockContext({ errors: oecdDataflowResource.errors });
-    const params = oecdDataflowResource.params.parse({
+    const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_NAAG%40DF_NAAG_I',
     });
@@ -272,7 +280,7 @@ describe('oecdDataflowResource', () => {
       vi.fn().mockImplementation(() => Promise.resolve(new Response('Forbidden', { status: 403 }))),
     );
     const ctx = createMockContext({ errors: oecdDataflowResource.errors });
-    const params = oecdDataflowResource.params.parse({
+    const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_NAAG%40DF_NAAG_I',
     });
@@ -359,8 +367,8 @@ describe('oecdDataflowResource dimension names', () => {
       },
     );
 
-    const ctx = createMockContext();
-    const params = oecdDataflowResource.params.parse({
+    const ctx = createMockContext({ errors: oecdDataflowResource.errors });
+    const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_NAMAIN1%40DF_QNA',
     });

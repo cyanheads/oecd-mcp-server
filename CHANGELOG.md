@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-08-25
+
+Adopts mcp-ts-core 0.12.3 and MCP SDK v2 — strict tool inputs, the error output envelope, and client-visible logging — alongside a Docker and TypeScript build refresh.
+
 ## [0.3.0](changelog/0.3.x/0.3.0.md) — 2026-08-10 · ⚠️ Breaking
 
 All seven tools and the dataflow resource now declare explicit reasons and recovery hints for OECD upstream failures and unparseable flow references, in place of bare or inconsistent codes

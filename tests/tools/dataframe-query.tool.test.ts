@@ -168,7 +168,9 @@ describe('oecdDataframeQuery', () => {
       canvas_id: 'canvas-001',
       sql: 'SELECT * FROM nonexistent_tbl',
     });
-    const err = (await oecdDataframeQuery.handler(input, ctx).catch((e: unknown) => e)) as McpError;
+    const err = (await Promise.resolve(oecdDataframeQuery.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    )) as McpError;
 
     expect(err).toMatchObject({
       code: JsonRpcErrorCode.NotFound,

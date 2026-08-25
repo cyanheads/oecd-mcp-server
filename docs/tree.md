@@ -1,10 +1,9 @@
 # oecd-mcp-server - Directory Structure
 
-Generated on: 2026-08-10 02:51:23
+Generated on: 2026-08-25 07:10:18
 
 ```text
 oecd-mcp-server/
-├── .claude/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── .codex-plugin/
@@ -185,7 +184,8 @@ oecd-mcp-server/
 │   │   ├── list-agencies.tool.test.ts
 │   │   ├── query-dataset.tool.test.ts
 │   │   └── search-datasets.tool.test.ts
-│   └── error-contract-coherence.test.ts
+│   ├── error-contract-coherence.test.ts
+│   └── tool-input-strictness.test.ts
 ├── .dockerignore
 ├── .env.example
 ├── .gitattributes

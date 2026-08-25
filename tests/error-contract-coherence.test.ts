@@ -15,7 +15,7 @@ import { oecdListAgencies } from '@/mcp-server/tools/definitions/list-agencies.t
 import { oecdQueryDataset } from '@/mcp-server/tools/definitions/query-dataset.tool.js';
 import { oecdSearchDatasets } from '@/mcp-server/tools/definitions/search-datasets.tool.js';
 import { allToolDefinitions } from '@/mcp-server/tools/index.js';
-import { declaredError, type WithErrors } from './helpers/error-contract.js';
+import { declaredError, declaredErrors, type WithErrors } from './helpers/error-contract.js';
 
 /** Every definition whose failures can come from OECD rather than from itself. */
 const OECD_REACHING: ReadonlyArray<readonly [string, WithErrors]> = [
@@ -90,7 +90,7 @@ describe('every OECD-reaching definition names an upstream failure the same way'
 
   it('declares download_limit only where the caller has a request to shrink', () => {
     const declaring = OECD_REACHING.filter(([, def]) =>
-      def.errors.some((e) => e.reason === 'download_limit'),
+      declaredErrors(def).some((e) => e.reason === 'download_limit'),
     ).map(([name]) => name);
 
     // Every other surface asks OECD for one fixed artefact, so "ask for less"
@@ -106,7 +106,7 @@ describe('one reason, one code, across the whole surface', () => {
   it('never gives the same reason two different codes', () => {
     const codesByReason = new Map<string, Map<number, string[]>>();
     for (const [name, def] of ALL_DEFINITIONS) {
-      for (const entry of def.errors) {
+      for (const entry of declaredErrors(def)) {
         const byCode = codesByReason.get(entry.reason) ?? new Map<number, string[]>();
         byCode.set(entry.code, [...(byCode.get(entry.code) ?? []), name]);
         codesByReason.set(entry.reason, byCode);

@@ -141,7 +141,10 @@ function service(): OecdDataService {
   return new OecdDataService(BASE);
 }
 
-function respondOnce(body: BodyInit, init?: ResponseInit): void {
+/** What `new Response(...)` accepts, read off the constructor rather than a global. */
+type ResponseBody = ConstructorParameters<typeof Response>[0];
+
+function respondOnce(body: ResponseBody, init?: ResponseInit): void {
   http.route({ match: DATA_URL, respond: () => new Response(body, init) });
 }
 

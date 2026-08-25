@@ -91,7 +91,7 @@ const EMPTY_DATA_RESPONSE = {
 
 const http = createFetchMock();
 
-function respond(body: BodyInit | unknown, init?: ResponseInit): void {
+function respond(body: unknown, init?: ResponseInit): void {
   const payload = typeof body === 'string' ? body : JSON.stringify(body);
   http.route({ match: DATA_URL, respond: () => new Response(payload, init) });
 }
@@ -113,11 +113,11 @@ function recordingCanvas(canvasId: string): {
     canvasId,
     registerTable: async (
       name: string,
-      rows: Iterable<unknown>,
+      rows: AsyncIterable<unknown> | Iterable<unknown>,
       options?: RegisterTableOptions,
     ) => {
       let rowCount = 0;
-      for await (const _row of rows as AsyncIterable<unknown>) rowCount += 1;
+      for await (const _row of rows) rowCount += 1;
       return { tableName: name, rowCount, columns: (options?.schema ?? []).map((c) => c.name) };
     },
     drop: async () => true,
@@ -204,6 +204,58 @@ describe('oecdQueryDataset', () => {
   });
 
   // ── content[] / structuredContent parity ────────────────────────────────────
+
+  it('carries every dimension and attribute key into structuredContent', async () => {
+    respond(DATA_RESPONSE);
+
+    const output = await runToolContract(oecdQueryDataset, { flow_ref: FLOW_REF, key: 'A.USA..' });
+    const [row] = (output.structuredContent as { rows: Record<string, unknown>[] }).rows;
+
+    // Dimension keys are per-dataflow and cannot be declared, so the row schema
+    // is deliberately open. Output validation runs against it before
+    // structuredContent is built: a closed row object would strip every one of
+    // these and leave the caller with `value` alone.
+    expect(row).toMatchObject({
+      FREQ: 'Annual',
+      OBS_STATUS: 'Normal value',
+      REF_AREA: 'United States',
+      TIME_PERIOD: '2022',
+      UNIT_MULT: 'Billions',
+      source: 'OECD',
+      value_scale: 1_000_000_000,
+    });
+    // The same keys reach the other surface, as table columns.
+    const text = textOf(output.content);
+    for (const key of ['FREQ', 'OBS_STATUS', 'REF_AREA', 'TIME_PERIOD', 'UNIT_MULT']) {
+      expect(text).toContain(key);
+    }
+  });
+
+  it('accepts a dimension name the schema has never seen', () => {
+    const parsed = oecdQueryDataset.output.parse({
+      rows: [
+        {
+          ACTIVITY: 'Manufacturing',
+          SOME_FUTURE_DIM: 'x',
+          value: 1,
+          value_scale: 1,
+          source: 'OECD',
+        },
+      ],
+      row_count: 1,
+      query_flow_ref: FLOW_REF,
+      query_key: 'A.USA..',
+      source: 'OECD',
+    });
+
+    expect(Object.keys(parsed.rows[0] ?? {})).toEqual([
+      'ACTIVITY',
+      'SOME_FUTURE_DIM',
+      'value',
+      'value_scale',
+      'source',
+    ]);
+  });
 
   it('renders every inline row in content[], not a 10-row sample', async () => {
     respond(seriesResponse(40));
@@ -511,12 +563,12 @@ describe('oecdQueryDataset', () => {
       canvasId: 'canvas-001',
       registerTable: async (
         name: string,
-        rows: Iterable<unknown>,
+        rows: AsyncIterable<unknown> | Iterable<unknown>,
         options?: RegisterTableOptions,
       ) => {
         registered = options;
         let rowCount = 0;
-        for await (const _row of rows as AsyncIterable<unknown>) rowCount += 1;
+        for await (const _row of rows) rowCount += 1;
         return { tableName: name, rowCount, columns: (options?.schema ?? []).map((c) => c.name) };
       },
       drop: async () => true,
