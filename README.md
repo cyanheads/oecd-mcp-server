@@ -27,7 +27,11 @@
 
 ---
 
-## Tools
+## Overview
+
+OECD statistical data via the SDMX 2.1 REST API — 1,500+ dataflows spanning national accounts, employment, trade, education, and health. Search datasets, inspect their dimensions, resolve codes, and query observations, with large multi-country time-series spilling to a queryable DataCanvas table for SQL analysis. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+
+### Tools
 
 Five discovery and data tools plus two SQL analytics tools for large query results:
 
@@ -41,20 +45,26 @@ Five discovery and data tools plus two SQL analytics tools for large query resul
 | `oecd_dataframe_describe` | List DataCanvas tables and columns staged by a prior `oecd_query_dataset` spill |
 | `oecd_dataframe_query` | Run a read-only SQL SELECT against DataCanvas tables |
 
-### `oecd_list_agencies`
+### Resources
 
-Entry point for discovery — enumerate OECD's statistical departments before searching.
+| Resource | Description |
+|:---------|:------------|
+| `oecd://dataflow/{agency_id}/{flow_id}` | Dimension metadata for a single OECD dataflow — same content as `oecd_get_dataset_info` |
 
-- Returns agency IDs (e.g. `OECD.SDD.NAD`, `OECD.ELS.SPD`, `OECD.EDU.IMEP`) and dataflow counts
+All resource data is also reachable via tools. Use `oecd_get_dataset_info` for the same content.
+
+## Capability reference
+
+### `oecd_list_agencies` <sub>tool</sub>
+
+- Returns agency IDs (e.g. `OECD.SDD.NAD`, `OECD.ELS.SPD`, `OECD.EDU.IMEP`) and dataflow counts, sorted descending by count
 - Each agency carries the name of its directorate — `OECD.CTP.TPS` is the Centre for Tax Policy and Administration, `OECD.SDD.NAD` the Statistics and Data Directorate — so a department can be picked without decoding the identifier
 - Publishers outside OECD that ship dataflows through the same catalog (`ESTAT`, `IAEG-SDGs`) carry no directorate
 - Useful for scoping `oecd_search_datasets` by department (national accounts, labour, education, etc.)
 
 ---
 
-### `oecd_search_datasets`
-
-Search the full catalog of 1,500+ OECD dataflows by keyword or department.
+### `oecd_search_datasets` <sub>tool</sub>
 
 - Token-matching across dataflow names and descriptions — reaches datasets whose name never carries the term, so `inflation` returns `Economic Outlook 119` and `poverty` returns `Income inequality - Regions`
 - Each result reports `matched_in` (`name`, `description`, or `both`) and a plain-text description trimmed to 240 characters
@@ -65,9 +75,7 @@ Search the full catalog of 1,500+ OECD dataflows by keyword or department.
 
 ---
 
-### `oecd_get_dataset_info`
-
-Inspect a dataflow's structure before querying.
+### `oecd_get_dataset_info` <sub>tool</sub>
 
 - Returns all dimensions in key order (position 1, 2, 3 …) — dimension order is required to construct the dot-delimited key for `oecd_query_dataset`
 - Each dimension carries its concept name from the datastructure's concept scheme, so `INSTR_ASSET` reads as "Financial instruments and non-financial assets" rather than repeating the id. A dimension the scheme does not cover keeps the id
@@ -78,9 +86,7 @@ Inspect a dataflow's structure before querying.
 
 ---
 
-### `oecd_get_dimension_values`
-
-Resolve human-readable names (countries, measures) to SDMX codes.
+### `oecd_get_dimension_values` <sub>tool</sub>
 
 - Returns code + label pairs for a single dimension (e.g. `REF_AREA` → `USA`/`United States`, `DEU`/`Germany`)
 - `query` matches a case-insensitive substring against both the code and its label, so `PA` and `percent` each reach `PA` / `Percent per annum`
@@ -89,71 +95,49 @@ Resolve human-readable names (countries, measures) to SDMX codes.
 
 ---
 
-### `oecd_query_dataset`
+### `oecd_query_dataset` <sub>tool</sub>
 
-Fetch observations from an OECD dataflow filtered by dimension key and time range.
-
-- Accepts a dot-delimited key (e.g. `A.USA+DEU.B1GQ_R.PC.`) where empty segments are wildcards and `+` separates multiple values
-- Optional `start_period` / `end_period` bound the time range (ISO format: `2010`, `2010-Q1`)
-- Decodes SDMX-JSON index notation (`0:0:2:3:0`) into human-readable row objects with dimension labels
-- Observation attributes (`UNIT_MULT`, `OBS_STATUS`, `PRICE_BASE`, `DECIMALS`, …) each become their own column, so an estimated or break-flagged point is distinguishable from a confirmed one
-- `value` arrives already multiplied by the observation's `UNIT_MULT` — a GDP figure OECD publishes as `26054.614` billions comes back as `26054614000000`. Every row carries `value_scale`, the power of ten applied; divide by it for the figure as OECD published it
-- Every response row includes `source: "OECD"` per OECD terms of use
-- **Small results** (few countries, narrow time range): every observation is returned inline, in `structuredContent` and in the rendered table alike — no `canvas_id`, and `truncated` is omitted rather than set to `false`
-- **Large results** (multi-country, multi-year time-series) with `CANVAS_PROVIDER_TYPE=duckdb`: a leading preview slice plus `canvas_id` + `truncated: true` — use `oecd_dataframe_describe` to list tables, then `oecd_dataframe_query` for SQL analytics
-- **Large results** without DataCanvas: there is nowhere to stage the remainder, so every observation still comes back in `structuredContent`, while the rendered table stops at the same preview budget a canvas would have used — the response reports `content_table_capped` and the number of rows it showed. Narrow the key or the `start_period` / `end_period` range to shrink the result itself
+- Dot-delimited key (e.g. `A.USA+DEU.B1GQ_R.PC.`) with `+`-separated multi-values and empty wildcard segments; optional `start_period` / `end_period` bound the range (ISO format: `2010`, `2010-Q1`)
+- SDMX-JSON decoded into row objects — every dimension and observation attribute (`UNIT_MULT`, `OBS_STATUS`, `PRICE_BASE`, `DECIMALS`, …) becomes its own column, so an estimated or break-flagged point is distinguishable from a confirmed one
+- `value` is pre-multiplied by `value_scale` (the observation's unit multiplier) — a GDP figure OECD publishes as `26054.614` billions comes back as `26054614000000`; divide by `value_scale` for the figure as OECD published it. Every row carries `source: "OECD"`
+- Small results return every observation inline with no `canvas_id`; large results (multi-country, multi-year) spill to DataCanvas (`CANVAS_PROVIDER_TYPE=duckdb`) with `truncated: true` plus a `canvas_id` / `table_name` for `oecd_dataframe_describe` and `oecd_dataframe_query`; without DataCanvas every row still returns in `structuredContent`, but the rendered table caps at a preview slice, reported via `content_table_capped`
 
 ---
 
-### `oecd_dataframe_describe` / `oecd_dataframe_query`
+### `oecd_dataframe_describe` <sub>tool</sub>
 
-SQL analytics over observation data staged by `oecd_query_dataset`.
+- Lists table and view names, row counts, and column names/types staged on a DataCanvas by a prior `oecd_query_dataset` spill
+- Takes the `canvas_id` `oecd_query_dataset` returned
+- Only available when `CANVAS_PROVIDER_TYPE=duckdb` is set — call before `oecd_dataframe_query` to discover exact table and column names for SQL
 
-When `oecd_query_dataset` returns `truncated: true`, the full result is staged on a DuckDB-backed DataCanvas. Pass the `canvas_id` to:
+---
 
-- **`oecd_dataframe_describe`** — list staged table names and their columns. Run this first to discover the schema before writing SQL.
-- **`oecd_dataframe_query`** — run a single-statement SQL SELECT. Supports aggregates, window functions, GROUP BY, ORDER BY, and standard DuckDB SQL.
+### `oecd_dataframe_query` <sub>tool</sub>
 
-Requires `CANVAS_PROVIDER_TYPE=duckdb`. Read-only: writes, DDL, and system catalog access are rejected.
+- Runs a single read-only SQL `SELECT` against the staged tables — aggregates, window functions, GROUP BY, ORDER BY, and standard DuckDB SQL
+- Writes, DDL, and system-catalog access are rejected
+- Results capped at the canvas row limit; `row_count` reports the full count before the cap
+- Only available when `CANVAS_PROVIDER_TYPE=duckdb` is set
 
-**Typical workflow for a large query:**
+---
 
-```text
-oecd_query_dataset → { canvas_id, table_name, truncated: true, rows: [preview...] }
-  → oecd_dataframe_describe(canvas_id) → table/column names
-  → oecd_dataframe_query(canvas_id, "SELECT REF_AREA, AVG(value) FROM spilled_... GROUP BY REF_AREA")
-```
+### `oecd://dataflow/{agency_id}/{flow_id}` <sub>resource</sub>
 
-## Resources
-
-| Type | Name | Description |
-|:-----|:-----|:------------|
-| Resource | `oecd://dataflow/{agency_id}/{flow_id}` | Dimension metadata for a single OECD dataflow — same content as `oecd_get_dataset_info` |
-
-`{flow_id}` is the combined `{dsd_id}@{df_id}` string with `@` percent-encoded as `%40`, or the bare `{df_id}` for a dataflow catalogued without a datastructure prefix. Example: `oecd://dataflow/OECD.SDD.NAD/DSD_NAAG%40DF_NAAG_I`.
-
-All resource data is also reachable via tools. Use `oecd_get_dataset_info` for the same content.
+- Dimension metadata for a single OECD dataflow as `application/json` — same content as `oecd_get_dataset_info`
+- `{flow_id}` is the combined `{dsd_id}@{df_id}` string with `@` percent-encoded as `%40`, or the bare `{df_id}` for a dataflow catalogued without a datastructure prefix
+- Example: `oecd://dataflow/OECD.SDD.NAD/DSD_NAAG%40DF_NAAG_I`
 
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
-
-- Declarative tool, resource, and prompt definitions — single file per primitive, framework handles registration and validation
-- Unified error handling — handlers throw, framework catches, classifies, and formats
-- Pluggable auth: `none`, `jwt`, `oauth`
-- Swappable storage backends: `in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`
-- Structured logging with optional OpenTelemetry tracing
-- STDIO and Streamable HTTP transports
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
 OECD-specific:
 
 - Keyless access — no API key required; OECD SDMX 2.1 REST API is fully public
 - Covers 1,500+ dataflows across 20+ OECD statistical departments (national accounts, employment, inflation, trade, education, health, environment, taxation, inequality)
-- Delegated dataflows resolved end to end — the entries OECD catalogues on one service root but defines on another (Trade in Value Added, the DAC creditor-reporting aid series) follow the catalog's own link for structure, codes, and observations, with the target checked against the configured origin before any request goes out
-- Codes read at the revision the dataflow references — a codelist moves on independently of the datastructures using it, so a dimension's values come from the version its structure names rather than the endpoint's current latest, and never include a code the dimension rejects
-- `AllDimensions` observation mode — one-pass SDMX-JSON decoding into flat row objects; no nested series key reconstruction
+- Delegated dataflows and codelist revisions resolved end to end — a dataflow OECD catalogues on one service root but defines on another follows the catalog's own link for structure, codes, and observations, and codes come from the revision the datastructure names rather than the endpoint's current latest
+- `AllDimensions` observation mode — one-pass SDMX-JSON decoding into flat row objects, no nested series key reconstruction
 - `oecd_query_dataset` materializes large observation sets (multi-country time-series) on a DuckDB DataCanvas for in-conversation SQL analytics
-- OECD source attribution (`source: "OECD"`) on every observation row per OECD terms of use
 
 Agent-friendly output:
 
@@ -261,7 +245,7 @@ MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.3.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
 - No API key required — OECD SDMX is a free, public API.
 
 ### Installation
@@ -302,6 +286,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `CANVAS_PROVIDER_TYPE` | Canvas engine. Set to `duckdb` so a large `oecd_query_dataset` result spills to a queryable table instead of just capping the rendered preview — unset, every row still comes back in `structuredContent`, only the rendered table is capped. | `none` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
+| `MCP_SESSION_MODE` | HTTP session posture: `stateful`, `stateless`, or `auto`. The server declares `stateless` in source — it keeps no per-session state, and a DataCanvas handle is keyed by `canvas_id` — so set this only to override that. | `stateless` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
 | `LOGS_DIR` | Directory for log files (Node.js only). | `<project-root>/logs` |
@@ -367,7 +352,7 @@ See [`CLAUDE.md`](./CLAUDE.md) for development guidelines and architectural rule
 
 ## Contributing
 
-Issues and pull requests are welcome. Run checks and tests before submitting:
+Issues are welcome — see [CONTRIBUTING.md](./.github/CONTRIBUTING.md) for what makes one actionable, and [CODE_OF_CONDUCT.md](./.github/CODE_OF_CONDUCT.md) for how we work together. Run checks and tests before submitting:
 
 ```sh
 bun run devcheck

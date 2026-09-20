@@ -504,6 +504,37 @@ describe('oecdQueryDataset', () => {
     expect(failure.hint).not.toContain('Wait several seconds');
   });
 
+  /**
+   * Two throttles share the `RateLimited` code and differ only in whether
+   * waiting clears them. `structuredContent` has carried `retryable` all along;
+   * the text surface carries it too, so a client reading only `content[]` can
+   * tell them apart without parsing the recovery prose.
+   */
+  it('renders reason and retryability into content[], not just structuredContent', async () => {
+    respond(
+      'You have exceeded the number of requests for data downloads or very large data ranges permitted in the OECD Data API.',
+      { headers: { 'Retry-After': '120' }, status: 429 },
+    );
+
+    const output = await runToolContract(oecdQueryDataset, { flow_ref: FLOW_REF, key: '' });
+    const structured = output.structuredContent as {
+      error: { data?: { reason?: string; retryable?: boolean } };
+    };
+
+    expect(structured.error.data).toMatchObject({ reason: 'download_limit', retryable: false });
+    expect(textOf(output.content)).toContain('(reason download_limit · not retryable)');
+  });
+
+  it('marks a wait-it-out throttle retryable on the same surface', async () => {
+    respond('You have exceeded the number of requests currently permitted in the OECD Data API.', {
+      status: 429,
+    });
+
+    const output = await runToolContract(oecdQueryDataset, { flow_ref: FLOW_REF, key: 'A.USA..' });
+
+    expect(textOf(output.content)).toContain('(reason rate_limited · retryable)');
+  }, 15_000);
+
   it('maps an upstream timeout to upstream_timeout naming both ways out', async () => {
     respond('Gateway Timeout', { status: 504 });
 

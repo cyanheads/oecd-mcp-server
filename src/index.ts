@@ -15,6 +15,14 @@ import { initStructureService } from './services/oecd-structure/oecd-structure-s
 await createApp({
   name: 'oecd-mcp-server',
   title: 'oecd-mcp-server',
+  /**
+   * No tool here calls `ctx.requestInput`, and a DataCanvas handle is keyed by
+   * `canvas_id` rather than by session, so nothing needs a session store.
+   * Declared in source so a deployment that never sets `MCP_SESSION_MODE` —
+   * and the schema default `auto`, which resolves to stateful — cannot diverge
+   * from what the Dockerfile and `.env.example` already set.
+   */
+  sessionMode: 'stateless',
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
   prompts: allPromptDefinitions,
