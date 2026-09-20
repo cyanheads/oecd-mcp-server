@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.3.2](changelog/0.3.x/0.3.2.md) — 2026-09-20
+
+Adopts mcp-ts-core 0.13.6 — reason/retryable error text, URL-free error data, argument-time canvas_id and cancellation checks — alongside a dependency refresh and two defect fixes.
+
 ## [0.3.1](changelog/0.3.x/0.3.1.md) — 2026-08-25
 
 Adopts mcp-ts-core 0.12.3 and MCP SDK v2 — strict tool inputs, the error output envelope, and client-visible logging — alongside a Docker and TypeScript build refresh.
