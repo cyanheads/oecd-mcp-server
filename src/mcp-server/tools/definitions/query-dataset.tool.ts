@@ -4,7 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { type ColumnSchema, spillover } from '@cyanheads/mcp-ts-core/canvas';
+import { CanvasIdSchema, type ColumnSchema, spillover } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 import { getDataService, invalidQueryText } from '@/services/oecd-data/oecd-data-service.js';
@@ -119,14 +119,12 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
         'End of the time range — ISO period code such as "2023" or "2023-Q4". ' +
           'Omit to include up to the latest available period.',
       ),
-    canvas_id: z
-      .string()
-      .optional()
-      .describe(
-        'Canvas ID from a prior oecd_query_dataset call, to stage this result alongside that one. ' +
-          'Omit to let the server mint a canvas if this result needs one — a canvas_id comes back ' +
-          'only when the result was large enough to spill, never on a result that fits inline.',
-      ),
+    canvas_id: CanvasIdSchema.optional().describe(
+      'Canvas ID from a prior oecd_query_dataset call — exactly 10 characters of letters, digits, ' +
+        'hyphens, and underscores — to stage this result alongside that one. Omit to let the ' +
+        'server mint a canvas if this result needs one; a canvas_id comes back only when the ' +
+        'result was large enough to spill, never on a result that fits inline.',
+    ),
   }),
   output: z.object({
     rows: z

@@ -4,7 +4,7 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import type { CanvasInstance } from '@cyanheads/mcp-ts-core/canvas';
+import { CanvasIdSchema, type CanvasInstance } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 
@@ -19,12 +19,11 @@ export const oecdDataframeDescribe = tool('oecd_dataframe_describe', {
     openWorldHint: false,
   },
   input: z.object({
-    canvas_id: z
-      .string()
-      .describe(
-        'Canvas ID returned by oecd_query_dataset. ' +
-          'Identifies the DataCanvas session holding the staged observation tables.',
-      ),
+    canvas_id: CanvasIdSchema.describe(
+      'Canvas ID returned by oecd_query_dataset — exactly 10 characters of letters, digits, ' +
+        'hyphens, and underscores. Identifies the DataCanvas session holding the staged ' +
+        'observation tables.',
+    ),
   }),
   output: z.object({
     canvas_id: z.string().describe('The canvas ID whose tables are listed.'),

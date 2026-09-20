@@ -79,7 +79,9 @@ describe('oecdDataframeDescribe', () => {
     setCanvas(mockCanvas as never);
 
     const ctx = createMockContext({ errors: oecdDataframeDescribe.errors });
-    const input = oecdDataframeDescribe.input.parse({ canvas_id: 'expired-001' });
+    // Well-formed but unknown — the only way to reach the registry at all now
+    // that an impossible id is rejected at argument validation.
+    const input = oecdDataframeDescribe.input.parse({ canvas_id: 'expired001' });
     await expect(oecdDataframeDescribe.handler(input, ctx)).rejects.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: { reason: 'canvas_not_found' },

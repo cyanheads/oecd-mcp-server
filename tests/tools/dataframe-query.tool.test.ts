@@ -3,6 +3,7 @@
  * @module tests/tools/dataframe-query.tool.test
  */
 
+import { DUCKDB_ERROR_REASONS } from '@cyanheads/mcp-ts-core/canvas';
 import {
   databaseError,
   JsonRpcErrorCode,
@@ -82,8 +83,10 @@ describe('oecdDataframeQuery', () => {
     setCanvas(mockCanvas as never);
 
     const ctx = createMockContext({ errors: oecdDataframeQuery.errors });
+    // Well-formed but unknown — the only way to reach the registry at all now
+    // that an impossible id is rejected at argument validation.
     const input = oecdDataframeQuery.input.parse({
-      canvas_id: 'expired-001',
+      canvas_id: 'expired001',
       sql: 'SELECT 1',
     });
     await expect(oecdDataframeQuery.handler(input, ctx)).rejects.toMatchObject({
@@ -143,6 +146,45 @@ describe('oecdDataframeQuery', () => {
     });
   });
 
+  /**
+   * A gated SELECT that prepared cleanly and then failed on the staged data —
+   * a cast the observation values cannot take. The statement is a valid,
+   * read-only SELECT, so `invalid_sql`'s "only SELECT is allowed, DDL and DML
+   * are rejected" is the wrong thing to tell a caller whose next move is
+   * TRY_CAST.
+   */
+  it('separates a DuckDB execution error from a rejected statement', async () => {
+    const mockInstance = buildMockInstance('canvas-001', null);
+    mockInstance.query = vi.fn().mockRejectedValue(
+      validationError("Conversion Error: Could not convert string 'n/a' to DOUBLE", {
+        reason: DUCKDB_ERROR_REASONS.sqlExecutionError,
+        recovery: {
+          hint: 'Wrap the cast in TRY_CAST, or filter out the rows the message names before converting them.',
+        },
+      }),
+    );
+    setCanvas({ acquire: vi.fn().mockResolvedValue(mockInstance) } as never);
+
+    const ctx = createMockContext({ errors: oecdDataframeQuery.errors });
+    const input = oecdDataframeQuery.input.parse({
+      canvas_id: 'canvas-001',
+      sql: 'SELECT CAST(value AS DOUBLE) FROM spilled_abc',
+    });
+    const err = (await Promise.resolve(oecdDataframeQuery.handler(input, ctx)).catch(
+      (e: unknown) => e,
+    )) as McpError;
+
+    expect(err).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'sql_execution_error' },
+    });
+    expect(err.message).toContain("Could not convert string 'n/a'");
+    // The advice has to name the data fix, never the statement-shape one.
+    const hint = (err.data as { recovery: { hint: string } }).recovery.hint;
+    expect(hint).toContain('TRY_CAST');
+    expect(hint).not.toContain('DDL');
+  });
+
   it('maps a missing canvas table to table_not_found with a recovery naming this server', async () => {
     // Byte-for-byte what the canvas throws for a table that is not staged.
     const mockInstance = buildMockInstance('canvas-001', null);
@@ -185,13 +227,15 @@ describe('oecdDataframeQuery', () => {
     expect(hint).not.toContain('describe()');
   });
 
-  it('leaves a DuckDB execution fault alone rather than calling it invalid SQL', async () => {
-    // classifyDuckdbError returns a DatabaseError for a runtime fault; its
-    // message can carry words like "Invalid", which is not the caller's cue.
+  it('leaves a DuckDB engine fault alone rather than calling it invalid SQL', async () => {
+    // The other side of the engine/data split: an IO, INTERNAL, or out-of-memory
+    // fault is the engine's, not the caller's, and arrives as a DatabaseError
+    // with no reason to dispatch on. Its message can still carry words like
+    // "Invalid", which is not the caller's cue.
     const mockInstance = buildMockInstance('canvas-001', null);
     mockInstance.query = vi
       .fn()
-      .mockRejectedValue(databaseError('Invalid Input Error: could not convert string to INT64'));
+      .mockRejectedValue(databaseError('IO Error: Invalid file handle for spilled_abc'));
     const mockCanvas = {
       acquire: vi.fn().mockResolvedValue(mockInstance),
     };

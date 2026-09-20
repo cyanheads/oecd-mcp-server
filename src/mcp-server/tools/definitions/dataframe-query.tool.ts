@@ -4,7 +4,12 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import type { CanvasInstance, QueryResult } from '@cyanheads/mcp-ts-core/canvas';
+import {
+  CanvasIdSchema,
+  type CanvasInstance,
+  DUCKDB_ERROR_REASONS,
+  type QueryResult,
+} from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 
@@ -19,12 +24,10 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
     openWorldHint: false,
   },
   input: z.object({
-    canvas_id: z
-      .string()
-      .describe(
-        'Canvas ID returned by oecd_query_dataset. ' +
-          'Identifies the DataCanvas session holding the observation tables.',
-      ),
+    canvas_id: CanvasIdSchema.describe(
+      'Canvas ID returned by oecd_query_dataset — exactly 10 characters of letters, digits, ' +
+        'hyphens, and underscores. Identifies the DataCanvas session holding the observation tables.',
+    ),
     sql: z
       .string()
       .describe(
@@ -70,6 +73,15 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
         'DDL (CREATE, DROP), DML (INSERT, UPDATE, DELETE), ' +
         'and file-reading functions (read_csv, read_parquet) are rejected.',
     },
+    {
+      reason: 'sql_execution_error',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The SQL parsed and ran, then failed on the staged observation data — a conversion, an invalid input, or a value out of range.',
+      recovery:
+        'Read the message for the offending value, then wrap the conversion in TRY_CAST or ' +
+        'filter those rows out before converting. Observation columns are staged as VARCHAR ' +
+        'unless they are numeric, and an attribute column is null on the rows that omit it.',
+    },
   ],
 
   async handler(input, ctx) {
@@ -110,7 +122,7 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
        * Canvas rejections are structured, so dispatch on the reason and the code
        * rather than on message text. A missing table is a NotFound carrying
        * `reason: 'missing_table'`; every other gate rejection is a
-       * ValidationError. Anything else — a DuckDB execution fault, a cancelled
+       * ValidationError. Anything else — a DuckDB engine fault, a cancelled
        * query — is not the caller's SQL and is left to the framework.
        */
       if (err instanceof McpError) {
@@ -121,6 +133,21 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
             `Canvas "${input.canvas_id}" holds no table` +
               (typeof table === 'string' ? ` named "${table}"` : ' matching the query'),
             { ...ctx.recoveryFor('table_not_found') },
+            { cause: err },
+          );
+        }
+        /**
+         * A statement that prepared and then failed on the data is not a
+         * rejected statement. Both arrive as ValidationError, so they are told
+         * apart by the engine reason — and they need opposite advice:
+         * `invalid_sql` says "send a read-only SELECT", which this caller
+         * already did.
+         */
+        if (err.data?.reason === DUCKDB_ERROR_REASONS.sqlExecutionError) {
+          throw ctx.fail(
+            'sql_execution_error',
+            err.message,
+            { ...ctx.recoveryFor('sql_execution_error') },
             { cause: err },
           );
         }
