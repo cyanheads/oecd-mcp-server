@@ -120,13 +120,16 @@ export type UpstreamReason =
  * Codes a definition can add nothing to, so they bubble as themselves rather
  * than being restated as an upstream reason.
  *
- * `InternalError` is what a caller's own abort arrives as, `SerializationError`
- * is a body this server could not decode, and `ValidationError` reaching here
- * means a branch above already declined to claim it. Reporting any of the three
- * as an OECD refusal would name the wrong party.
+ * `RequestCancelled` is the caller's own abort, `InternalError` is this server
+ * failing at something that is not a request, `SerializationError` is a body it
+ * could not decode, and `ValidationError` reaching here means a branch above
+ * already declined to claim it. Reporting any of the four as an OECD refusal
+ * would name the wrong party — loudest for a cancellation, where the caller
+ * walked away and OECD may never have been asked anything at all.
  */
 const OWN_FAULT_CODES: ReadonlySet<JsonRpcErrorCode> = new Set([
   JsonRpcErrorCode.InternalError,
+  JsonRpcErrorCode.RequestCancelled,
   JsonRpcErrorCode.SerializationError,
   JsonRpcErrorCode.ValidationError,
 ]);
@@ -161,25 +164,17 @@ export function upstreamRefusal(
 /**
  * Reconcile an upstream HTTP failure with what `withRetry` treats as transient.
  *
- * Two of OECD's responses are otherwise taken at face value and shouldn't be:
- * a throttled request comes back `429 Retry-After: 0`, and the honored hint
+ * One of OECD's responses is otherwise taken at face value and shouldn't be: a
+ * throttled request comes back `429 Retry-After: 0`, and the honored hint
  * collapses the backoff so all three attempts fire inside a few milliseconds
- * and every one is refused; and HTTP 500 maps to `InternalError`, which is
- * terminal, so a server-side fault fails without a single retry. Dropping the
- * empty hint and restating a 5xx as `ServiceUnavailable` puts both back on the
- * exponential backoff, which is what clears OECD's seconds-long throttle window.
+ * and every one is refused. Dropping the empty hint puts the throttle back on
+ * the exponential backoff, which is what clears OECD's seconds-long window.
  */
 export function retryableUpstreamFailure(err: unknown): unknown {
   if (!(err instanceof McpError)) return err;
   const { retryAfter, ...withoutHint } = err.data ?? {};
-  const emptyHint = typeof retryAfter === 'string' && /^0+$/.test(retryAfter.trim());
-  const status = err.data?.status;
-  const code =
-    err.code === JsonRpcErrorCode.InternalError && typeof status === 'number' && status >= 500
-      ? JsonRpcErrorCode.ServiceUnavailable
-      : err.code;
-  if (!emptyHint && code === err.code) return err;
-  return new McpError(code, err.message, emptyHint ? withoutHint : err.data, { cause: err });
+  if (typeof retryAfter !== 'string' || !/^0+$/.test(retryAfter.trim())) return err;
+  return new McpError(err.code, err.message, withoutHint, { cause: err });
 }
 
 /**
