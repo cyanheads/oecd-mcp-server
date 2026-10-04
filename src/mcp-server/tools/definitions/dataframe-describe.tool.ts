@@ -72,7 +72,6 @@ export const oecdDataframeDescribe = tool('oecd_dataframe_describe', {
       throw ctx.fail(
         'canvas_disabled',
         'DataCanvas is not enabled. Set CANVAS_PROVIDER_TYPE=duckdb to use oecd_dataframe_describe.',
-        { ...ctx.recoveryFor('canvas_disabled') },
       );
     }
 
@@ -85,7 +84,7 @@ export const oecdDataframeDescribe = tool('oecd_dataframe_describe', {
       throw ctx.fail(
         'canvas_not_found',
         `Canvas "${input.canvas_id}" not found or expired`,
-        { ...ctx.recoveryFor('canvas_not_found') },
+        undefined,
         { cause: err as Error },
       );
     }

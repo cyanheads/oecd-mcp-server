@@ -283,7 +283,6 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       throw ctx.fail(
         'invalid_flow_ref',
         `flow_ref "${input.flow_ref}" is not in the expected {agencyID},{dsd_id}@{df_id} or {agencyID},{df_id} format`,
-        { ...ctx.recoveryFor('invalid_flow_ref') },
       );
     }
 
@@ -306,12 +305,9 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     } catch (err) {
       const e = err as Error;
       if (isDataflowNotFound(e)) {
-        throw ctx.fail(
-          'dataflow_not_found',
-          `Dataflow not found: ${input.flow_ref}`,
-          { ...ctx.recoveryFor('dataflow_not_found') },
-          { cause: e },
-        );
+        throw ctx.fail('dataflow_not_found', `Dataflow not found: ${input.flow_ref}`, undefined, {
+          cause: e,
+        });
       }
       const rejection = invalidQueryText(e);
       if (rejection !== undefined) {
@@ -320,14 +316,14 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
           throw ctx.fail(
             'invalid_period',
             `OECD rejected the time range for ${input.flow_ref}: ${rejection}`,
-            { ...ctx.recoveryFor('invalid_period') },
+            undefined,
             { cause: e },
           );
         }
         throw ctx.fail(
           'invalid_key',
           `OECD rejected the dimension key "${input.key}": ${rejection}`,
-          { ...ctx.recoveryFor('invalid_key') },
+          undefined,
           { cause: e },
         );
       }
@@ -337,18 +333,13 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
         throw ctx.fail(
           reason,
           `OECD throttled the query for ${input.flow_ref}: ${throttle}`,
-          { ...ctx.recoveryFor(reason) },
+          undefined,
           { cause: e },
         );
       }
       const refusal = upstreamRefusal(e);
       if (refusal) {
-        throw ctx.fail(
-          refusal.reason,
-          refusal.message,
-          { ...ctx.recoveryFor(refusal.reason) },
-          { cause: e },
-        );
+        throw ctx.fail(refusal.reason, refusal.message, undefined, { cause: e });
       }
       throw err;
     }
@@ -357,7 +348,6 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       throw ctx.fail(
         'no_results',
         `No observations found for key "${input.key}" in ${input.flow_ref}`,
-        { ...ctx.recoveryFor('no_results') },
       );
     }
 

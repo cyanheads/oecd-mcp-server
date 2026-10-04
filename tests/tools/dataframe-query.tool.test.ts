@@ -7,7 +7,6 @@ import { DUCKDB_ERROR_REASONS } from '@cyanheads/mcp-ts-core/canvas';
 import {
   databaseError,
   JsonRpcErrorCode,
-  type McpError,
   notFound,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
@@ -15,6 +14,7 @@ import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdDataframeQuery } from '@/mcp-server/tools/definitions/dataframe-query.tool.js';
 import { setCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
+import { toolWireError } from '../helpers/error-contract.js';
 
 function buildMockInstance(canvasId: string, queryResult: unknown) {
   return {
@@ -165,14 +165,11 @@ describe('oecdDataframeQuery', () => {
     );
     setCanvas({ acquire: vi.fn().mockResolvedValue(mockInstance) } as never);
 
-    const ctx = createMockContext({ errors: oecdDataframeQuery.errors });
     const input = oecdDataframeQuery.input.parse({
       canvas_id: 'canvas-001',
       sql: 'SELECT CAST(value AS DOUBLE) FROM spilled_abc',
     });
-    const err = (await Promise.resolve(oecdDataframeQuery.handler(input, ctx)).catch(
-      (e: unknown) => e,
-    )) as McpError;
+    const err = await toolWireError(oecdDataframeQuery, input);
 
     expect(err).toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
@@ -205,14 +202,11 @@ describe('oecdDataframeQuery', () => {
     };
     setCanvas(mockCanvas as never);
 
-    const ctx = createMockContext({ errors: oecdDataframeQuery.errors });
     const input = oecdDataframeQuery.input.parse({
       canvas_id: 'canvas-001',
       sql: 'SELECT * FROM nonexistent_tbl',
     });
-    const err = (await Promise.resolve(oecdDataframeQuery.handler(input, ctx)).catch(
-      (e: unknown) => e,
-    )) as McpError;
+    const err = await toolWireError(oecdDataframeQuery, input);
 
     expect(err).toMatchObject({
       code: JsonRpcErrorCode.NotFound,

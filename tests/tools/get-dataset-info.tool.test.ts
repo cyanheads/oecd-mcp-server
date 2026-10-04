@@ -12,7 +12,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdGetDatasetInfo } from '@/mcp-server/tools/definitions/get-dataset-info.tool.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
-import { declaredRecovery } from '../helpers/error-contract.js';
+import { declaredRecovery, toolWireError } from '../helpers/error-contract.js';
 
 /** Answer every request with a fresh copy of one response — a body reads once. */
 function respondWith(build: Response): void {
@@ -115,9 +115,8 @@ describe('oecdGetDatasetInfo', () => {
   });
 
   it('throws ctx.fail(invalid_flow_ref) for malformed flow_ref', async () => {
-    const ctx = createMockContext({ errors: oecdGetDatasetInfo.errors });
     const input = oecdGetDatasetInfo.input.parse({ flow_ref: 'BAD_FORMAT' });
-    await expect(oecdGetDatasetInfo.handler(input, ctx)).rejects.toMatchObject({
+    await expect(toolWireError(oecdGetDatasetInfo, input)).resolves.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       data: {
         reason: 'invalid_flow_ref',
@@ -137,12 +136,11 @@ describe('oecdGetDatasetInfo', () => {
         { status: 429, headers: { 'retry-after': '99999' } },
       ),
     );
-    const ctx = createMockContext({ errors: oecdGetDatasetInfo.errors });
     const input = oecdGetDatasetInfo.input.parse({
       flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
     });
 
-    await expect(oecdGetDatasetInfo.handler(input, ctx)).rejects.toMatchObject({
+    await expect(toolWireError(oecdGetDatasetInfo, input)).resolves.toMatchObject({
       code: JsonRpcErrorCode.RateLimited,
       data: {
         reason: 'rate_limited',
@@ -154,12 +152,11 @@ describe('oecdGetDatasetInfo', () => {
 
   it('names an exhausted outage upstream_unavailable', async () => {
     respondWith(new Response('boom', { status: 503 }));
-    const ctx = createMockContext({ errors: oecdGetDatasetInfo.errors });
     const input = oecdGetDatasetInfo.input.parse({
       flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
     });
 
-    await expect(oecdGetDatasetInfo.handler(input, ctx)).rejects.toMatchObject({
+    await expect(toolWireError(oecdGetDatasetInfo, input)).resolves.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
       data: {
         reason: 'upstream_unavailable',
@@ -173,12 +170,11 @@ describe('oecdGetDatasetInfo', () => {
     // An Unauthorized on a keyless public API tells the caller nothing about
     // what to do next. The reason and its hint do.
     respondWith(new Response('Unauthorized', { status: 401 }));
-    const ctx = createMockContext({ errors: oecdGetDatasetInfo.errors });
     const input = oecdGetDatasetInfo.input.parse({
       flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
     });
 
-    await expect(oecdGetDatasetInfo.handler(input, ctx)).rejects.toMatchObject({
+    await expect(toolWireError(oecdGetDatasetInfo, input)).resolves.toMatchObject({
       data: {
         reason: 'upstream_error',
         recovery: { hint: declaredRecovery(oecdGetDatasetInfo, 'upstream_error') },

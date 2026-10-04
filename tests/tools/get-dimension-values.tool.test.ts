@@ -13,7 +13,7 @@ import {
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdGetDimensionValues } from '@/mcp-server/tools/definitions/get-dimension-values.tool.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
-import { declaredRecovery } from '../helpers/error-contract.js';
+import { declaredRecovery, toolWireError } from '../helpers/error-contract.js';
 
 /** OECD's own wording for the request-rate throttle, which is charged across every endpoint. */
 const THROTTLE_BODY =
@@ -224,12 +224,11 @@ describe('oecdGetDimensionValues', () => {
     // sends the caller to re-look-up a reference they may already hold.
     const fetchSpy = vi.fn();
     vi.stubGlobal('fetch', fetchSpy);
-    const ctx = createMockContext({ errors: oecdGetDimensionValues.errors });
     const input = oecdGetDimensionValues.input.parse({
       flow_ref: 'BAD',
       dimension_id: 'FREQ',
     });
-    await expect(oecdGetDimensionValues.handler(input, ctx)).rejects.toMatchObject({
+    await expect(toolWireError(oecdGetDimensionValues, input)).resolves.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       data: {
         reason: 'invalid_flow_ref',
@@ -287,13 +286,12 @@ describe('oecdGetDimensionValues', () => {
       'fetch',
       vi.fn().mockImplementation(() => Promise.resolve(throttleResponse())),
     );
-    const ctx = createMockContext({ errors: oecdGetDimensionValues.errors });
     const input = oecdGetDimensionValues.input.parse({
       flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
       dimension_id: 'FREQ',
     });
 
-    await expect(oecdGetDimensionValues.handler(input, ctx)).rejects.toMatchObject({
+    await expect(toolWireError(oecdGetDimensionValues, input)).resolves.toMatchObject({
       code: JsonRpcErrorCode.RateLimited,
       data: {
         reason: 'rate_limited',
@@ -318,13 +316,12 @@ describe('oecdGetDimensionValues', () => {
     http.install();
 
     try {
-      const ctx = createMockContext({ errors: oecdGetDimensionValues.errors });
       const input = oecdGetDimensionValues.input.parse({
         flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
         dimension_id: 'FREQ',
       });
 
-      await expect(oecdGetDimensionValues.handler(input, ctx)).rejects.toMatchObject({
+      await expect(toolWireError(oecdGetDimensionValues, input)).resolves.toMatchObject({
         code: JsonRpcErrorCode.RateLimited,
         data: {
           reason: 'rate_limited',
@@ -341,13 +338,12 @@ describe('oecdGetDimensionValues', () => {
       'fetch',
       vi.fn().mockImplementation(() => Promise.resolve(new Response('Forbidden', { status: 403 }))),
     );
-    const ctx = createMockContext({ errors: oecdGetDimensionValues.errors });
     const input = oecdGetDimensionValues.input.parse({
       flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
       dimension_id: 'FREQ',
     });
 
-    await expect(oecdGetDimensionValues.handler(input, ctx)).rejects.toMatchObject({
+    await expect(toolWireError(oecdGetDimensionValues, input)).resolves.toMatchObject({
       data: {
         reason: 'upstream_error',
         recovery: { hint: declaredRecovery(oecdGetDimensionValues, 'upstream_error') },

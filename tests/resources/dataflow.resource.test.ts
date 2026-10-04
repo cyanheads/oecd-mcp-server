@@ -8,7 +8,10 @@ import { createFetchMock, createMockContext } from '@cyanheads/mcp-ts-core/testi
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdDataflowResource } from '@/mcp-server/resources/definitions/dataflow.resource.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
-import { declaredRecovery as declaredRecoveryOf } from '../helpers/error-contract.js';
+import {
+  declaredRecovery as declaredRecoveryOf,
+  resourceWireError,
+} from '../helpers/error-contract.js';
 
 const FAKE_BASE = 'https://fake.oecd.test';
 
@@ -21,16 +24,16 @@ const resourceParams = oecdDataflowResource.params;
 if (!resourceParams) throw new Error('oecdDataflowResource must declare params');
 
 /**
- * The recovery text the resource declares for a reason. A resource re-throws
- * rather than producing an `isError` envelope, so the `McpError` a handler
- * throws is what the framework hands the SDK verbatim and what reaches the
- * client as `error.{code, data}` — asserting the throw is asserting the wire.
- * Reading the expected hint off the contract is what proves the handler spread
- * `ctx.recoveryFor(...)` onto the throw: a `ctx.fail` that omitted it would
- * still carry the reason, and only this comparison would notice.
+ * The recovery text the resource declares for a reason. A resource handler's own
+ * throw carries no hint — the framework's resource factory fills the declared
+ * one in by reason — so hints are asserted on what a `resources/read` returns.
  */
 const declaredRecovery = (reason: string): string =>
   declaredRecoveryOf(oecdDataflowResource, reason);
+
+/** The JSON-RPC error a `resources/read` of these URI segments returns. */
+const readError = (params: { agency_id: string; flow_id: string }) =>
+  resourceWireError(oecdDataflowResource, `oecd://dataflow/${params.agency_id}/${params.flow_id}`);
 
 // Real API format: positions are 0-based, enumeration is a string URN, timeDimensions is an array.
 const DSD_RESPONSE = {
@@ -129,12 +132,11 @@ describe('oecdDataflowResource', () => {
   });
 
   it('throws ctx.fail(invalid_flow_ref) for a flow_id carrying path characters', async () => {
-    const ctx = createMockContext({ errors: oecdDataflowResource.errors });
     const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_NAAG%40..%2f..%2fetc',
     });
-    await expect(oecdDataflowResource.handler(params, ctx)).rejects.toMatchObject({
+    await expect(readError(params)).resolves.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       data: {
         reason: 'invalid_flow_ref',
@@ -144,14 +146,13 @@ describe('oecdDataflowResource', () => {
   });
 
   it('throws ctx.fail(invalid_flow_ref) for a flow_id carrying a malformed percent-escape', async () => {
-    const ctx = createMockContext({ errors: oecdDataflowResource.errors });
     // decodeURIComponent throws a URIError on this, which without the contract
     // reaches the client as an unexplained internal fault.
     const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_NAAG%ZZDF_NAAG_I',
     });
-    await expect(oecdDataflowResource.handler(params, ctx)).rejects.toMatchObject({
+    await expect(readError(params)).resolves.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       data: {
         reason: 'invalid_flow_ref',
@@ -178,12 +179,11 @@ describe('oecdDataflowResource', () => {
         text: () => Promise.resolve('{}'),
       }),
     );
-    const ctx = createMockContext({ errors: oecdDataflowResource.errors });
     const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_MISSING%40DF_MISSING',
     });
-    await expect(oecdDataflowResource.handler(params, ctx)).rejects.toMatchObject({
+    await expect(readError(params)).resolves.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: {
         reason: 'dataflow_not_found',
@@ -203,12 +203,11 @@ describe('oecdDataflowResource', () => {
           Promise.resolve(new Response('Could not find requested structures', { status: 404 })),
         ),
     );
-    const ctx = createMockContext({ errors: oecdDataflowResource.errors });
     const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_X%40DF_X',
     });
-    await expect(oecdDataflowResource.handler(params, ctx)).rejects.toMatchObject({
+    await expect(readError(params)).resolves.toMatchObject({
       code: JsonRpcErrorCode.NotFound,
       data: {
         reason: 'dataflow_not_found',
@@ -232,7 +231,7 @@ describe('oecdDataflowResource', () => {
       flow_id: 'DSD_NAAG%40DF_NAAG_I',
     });
 
-    await expect(oecdDataflowResource.handler(params, ctx)).rejects.toMatchObject({
+    await expect(readError(params)).resolves.toMatchObject({
       code: JsonRpcErrorCode.Forbidden,
       data: {
         reason: 'upstream_redirect',
@@ -258,13 +257,12 @@ describe('oecdDataflowResource', () => {
           ),
         ),
     );
-    const ctx = createMockContext({ errors: oecdDataflowResource.errors });
     const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_NAAG%40DF_NAAG_I',
     });
 
-    await expect(oecdDataflowResource.handler(params, ctx)).rejects.toMatchObject({
+    await expect(readError(params)).resolves.toMatchObject({
       code: JsonRpcErrorCode.RateLimited,
       data: {
         reason: 'rate_limited',
@@ -279,13 +277,12 @@ describe('oecdDataflowResource', () => {
       'fetch',
       vi.fn().mockImplementation(() => Promise.resolve(new Response('Forbidden', { status: 403 }))),
     );
-    const ctx = createMockContext({ errors: oecdDataflowResource.errors });
     const params = resourceParams.parse({
       agency_id: 'OECD.SDD.NAD',
       flow_id: 'DSD_NAAG%40DF_NAAG_I',
     });
 
-    await expect(oecdDataflowResource.handler(params, ctx)).rejects.toMatchObject({
+    await expect(readError(params)).resolves.toMatchObject({
       data: {
         reason: 'upstream_error',
         recovery: { hint: declaredRecovery('upstream_error') },

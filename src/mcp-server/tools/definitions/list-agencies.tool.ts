@@ -114,12 +114,7 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
     } catch (err) {
       const refusal = upstreamRefusal(err);
       if (refusal) {
-        throw ctx.fail(
-          refusal.reason,
-          refusal.message,
-          { ...ctx.recoveryFor(refusal.reason) },
-          { cause: err as Error },
-        );
+        throw ctx.fail(refusal.reason, refusal.message, undefined, { cause: err as Error });
       }
       throw err;
     }

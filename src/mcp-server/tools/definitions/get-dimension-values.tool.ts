@@ -187,7 +187,6 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       throw ctx.fail(
         'invalid_flow_ref',
         `flow_ref "${input.flow_ref}" is not in the expected {agencyID},{dsd_id}@{df_id} or {agencyID},{df_id} format`,
-        { ...ctx.recoveryFor('invalid_flow_ref') },
       );
     }
 
@@ -200,12 +199,7 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
     const asUpstreamFailure = (err: unknown): unknown => {
       const refusal = upstreamRefusal(err);
       return refusal
-        ? ctx.fail(
-            refusal.reason,
-            refusal.message,
-            { ...ctx.recoveryFor(refusal.reason) },
-            { cause: err as Error },
-          )
+        ? ctx.fail(refusal.reason, refusal.message, undefined, { cause: err as Error })
         : err;
     };
 
@@ -223,9 +217,7 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       dsd = await getStructureService().fetchDataStructure(input.flow_ref, ctx.signal);
     } catch (err) {
       if (isDataflowNotFound(err as Error)) {
-        throw ctx.fail('dataflow_not_found', `Dataflow not found: ${input.flow_ref}`, {
-          ...ctx.recoveryFor('dataflow_not_found'),
-        });
+        throw ctx.fail('dataflow_not_found', `Dataflow not found: ${input.flow_ref}`);
       }
       throw asUpstreamFailure(err);
     }
@@ -235,7 +227,6 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       throw ctx.fail(
         'dimension_not_found',
         `Dimension "${input.dimension_id}" not found in dataflow ${input.flow_ref}`,
-        { ...ctx.recoveryFor('dimension_not_found') },
       );
     }
 

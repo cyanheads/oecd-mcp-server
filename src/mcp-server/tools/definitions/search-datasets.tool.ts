@@ -206,18 +206,13 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
         throw ctx.fail(
           'agency_not_found',
           `No OECD agency is published under the identifier "${input.agency_id}"`,
-          { ...ctx.recoveryFor('agency_not_found') },
+          undefined,
           { cause: err as Error },
         );
       }
       const refusal = upstreamRefusal(err);
       if (refusal) {
-        throw ctx.fail(
-          refusal.reason,
-          refusal.message,
-          { ...ctx.recoveryFor(refusal.reason) },
-          { cause: err as Error },
-        );
+        throw ctx.fail(refusal.reason, refusal.message, undefined, { cause: err as Error });
       }
       throw err;
     }
@@ -248,7 +243,6 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       throw ctx.fail(
         'no_match',
         `No dataflows matched "${input.query}"${input.agency_id ? ` in agency ${input.agency_id}` : ''}`,
-        { ...ctx.recoveryFor('no_match') },
       );
     }
 

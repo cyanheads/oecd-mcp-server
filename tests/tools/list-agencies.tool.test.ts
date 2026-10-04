@@ -8,7 +8,7 @@ import { createFetchMock, createMockContext } from '@cyanheads/mcp-ts-core/testi
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdListAgencies } from '@/mcp-server/tools/definitions/list-agencies.tool.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
-import { declaredRecovery } from '../helpers/error-contract.js';
+import { declaredRecovery, toolWireError } from '../helpers/error-contract.js';
 
 const FAKE_BASE = 'https://fake.oecd.test';
 
@@ -79,8 +79,7 @@ describe('oecdListAgencies', () => {
 
   it('throws ctx.fail(upstream_unavailable) when fetch fails', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network failure')));
-    const ctx = createMockContext({ errors: oecdListAgencies.errors });
-    await expect(oecdListAgencies.handler({}, ctx)).rejects.toMatchObject({
+    await expect(toolWireError(oecdListAgencies, {})).resolves.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
       data: {
         reason: 'upstream_unavailable',
@@ -106,9 +105,8 @@ describe('oecdListAgencies', () => {
           ),
         ),
     );
-    const ctx = createMockContext({ errors: oecdListAgencies.errors });
 
-    await expect(oecdListAgencies.handler({}, ctx)).rejects.toMatchObject({
+    await expect(toolWireError(oecdListAgencies, {})).resolves.toMatchObject({
       code: JsonRpcErrorCode.RateLimited,
       data: {
         reason: 'rate_limited',

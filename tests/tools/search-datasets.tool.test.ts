@@ -8,7 +8,7 @@ import { createMockContext, getEnrichment, runToolContract } from '@cyanheads/mc
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdSearchDatasets } from '@/mcp-server/tools/definitions/search-datasets.tool.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
-import { declaredRecovery } from '../helpers/error-contract.js';
+import { declaredRecovery, toolWireError } from '../helpers/error-contract.js';
 
 const FAKE_BASE = 'https://fake.oecd.test';
 
@@ -128,9 +128,8 @@ describe('oecdSearchDatasets', () => {
 
   it('throws ctx.fail(upstream_unavailable) when fetch fails', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('network error')));
-    const ctx = createMockContext({ errors: oecdSearchDatasets.errors });
     const input = oecdSearchDatasets.input.parse({ query: 'gdp' });
-    await expect(oecdSearchDatasets.handler(input, ctx)).rejects.toMatchObject({
+    await expect(toolWireError(oecdSearchDatasets, input)).resolves.toMatchObject({
       code: JsonRpcErrorCode.ServiceUnavailable,
       data: {
         reason: 'upstream_unavailable',
@@ -154,10 +153,9 @@ describe('oecdSearchDatasets', () => {
           ),
         ),
     );
-    const ctx = createMockContext({ errors: oecdSearchDatasets.errors });
     const input = oecdSearchDatasets.input.parse({ query: 'gdp' });
 
-    await expect(oecdSearchDatasets.handler(input, ctx)).rejects.toMatchObject({
+    await expect(toolWireError(oecdSearchDatasets, input)).resolves.toMatchObject({
       code: JsonRpcErrorCode.RateLimited,
       data: {
         reason: 'rate_limited',

@@ -90,7 +90,6 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
       throw ctx.fail(
         'canvas_disabled',
         'DataCanvas is not enabled. Set CANVAS_PROVIDER_TYPE=duckdb to use oecd_dataframe_query.',
-        { ...ctx.recoveryFor('canvas_disabled') },
       );
     }
 
@@ -106,7 +105,7 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
       throw ctx.fail(
         'canvas_not_found',
         `Canvas "${input.canvas_id}" not found or expired`,
-        { ...ctx.recoveryFor('canvas_not_found') },
+        undefined,
         { cause: err as Error },
       );
     }
@@ -132,7 +131,7 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
             'table_not_found',
             `Canvas "${input.canvas_id}" holds no table` +
               (typeof table === 'string' ? ` named "${table}"` : ' matching the query'),
-            { ...ctx.recoveryFor('table_not_found') },
+            undefined,
             { cause: err },
           );
         }
@@ -144,20 +143,10 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
          * already did.
          */
         if (err.data?.reason === DUCKDB_ERROR_REASONS.sqlExecutionError) {
-          throw ctx.fail(
-            'sql_execution_error',
-            err.message,
-            { ...ctx.recoveryFor('sql_execution_error') },
-            { cause: err },
-          );
+          throw ctx.fail('sql_execution_error', err.message, undefined, { cause: err });
         }
         if (err.code === JsonRpcErrorCode.ValidationError) {
-          throw ctx.fail(
-            'invalid_sql',
-            `SQL rejected: ${err.message}`,
-            { ...ctx.recoveryFor('invalid_sql') },
-            { cause: err },
-          );
+          throw ctx.fail('invalid_sql', `SQL rejected: ${err.message}`, undefined, { cause: err });
         }
       }
       throw err;

@@ -157,7 +157,6 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
       throw ctx.fail(
         'invalid_flow_ref',
         `flow_id segment "${params.flow_id}" carries a malformed percent-escape`,
-        { ...ctx.recoveryFor('invalid_flow_ref') },
       );
     }
     const flowRef = `${params.agency_id},${decodedFlowId}`;
@@ -168,7 +167,6 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
         'invalid_flow_ref',
         `URI segments "${params.agency_id}" and "${params.flow_id}" do not combine into a flow ` +
           'reference in the expected {agencyID},{dsd_id}@{df_id} or {agencyID},{df_id} format',
-        { ...ctx.recoveryFor('invalid_flow_ref') },
       );
     }
 
@@ -179,29 +177,19 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
       dsd = await getStructureService().fetchDataStructure(flowRef, ctx.signal);
     } catch (err) {
       if (isDataflowNotFound(err as Error)) {
-        throw ctx.fail(
-          'dataflow_not_found',
-          `Dataflow not found: ${flowRef}`,
-          { ...ctx.recoveryFor('dataflow_not_found') },
-          { cause: err as Error },
-        );
+        throw ctx.fail('dataflow_not_found', `Dataflow not found: ${flowRef}`, undefined, {
+          cause: err as Error,
+        });
       }
       const refusal = upstreamRefusal(err);
       if (refusal) {
-        throw ctx.fail(
-          refusal.reason,
-          refusal.message,
-          { ...ctx.recoveryFor(refusal.reason) },
-          { cause: err as Error },
-        );
+        throw ctx.fail(refusal.reason, refusal.message, undefined, { cause: err as Error });
       }
       throw err;
     }
 
     if (!dsd.dimensions.length) {
-      throw ctx.fail('dataflow_not_found', `Dataflow ${flowRef} returned no dimensions`, {
-        ...ctx.recoveryFor('dataflow_not_found'),
-      });
+      throw ctx.fail('dataflow_not_found', `Dataflow ${flowRef} returned no dimensions`);
     }
 
     const keyExample = dsd.dimensions.map(() => '').join('.');

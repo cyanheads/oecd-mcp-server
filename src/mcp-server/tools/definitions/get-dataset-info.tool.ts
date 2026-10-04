@@ -152,7 +152,6 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
       throw ctx.fail(
         'invalid_flow_ref',
         `flow_ref "${input.flow_ref}" is not in the expected {agencyID},{dsd_id}@{df_id} or {agencyID},{df_id} format`,
-        { ...ctx.recoveryFor('invalid_flow_ref') },
       );
     }
 
@@ -163,26 +162,17 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
       dsd = await getStructureService().fetchDataStructure(input.flow_ref, ctx.signal);
     } catch (err) {
       if (isDataflowNotFound(err as Error)) {
-        throw ctx.fail('dataflow_not_found', `Dataflow not found: ${input.flow_ref}`, {
-          ...ctx.recoveryFor('dataflow_not_found'),
-        });
+        throw ctx.fail('dataflow_not_found', `Dataflow not found: ${input.flow_ref}`);
       }
       const refusal = upstreamRefusal(err);
       if (refusal) {
-        throw ctx.fail(
-          refusal.reason,
-          refusal.message,
-          { ...ctx.recoveryFor(refusal.reason) },
-          { cause: err as Error },
-        );
+        throw ctx.fail(refusal.reason, refusal.message, undefined, { cause: err as Error });
       }
       throw err;
     }
 
     if (!dsd.dimensions.length) {
-      throw ctx.fail('dataflow_not_found', `Dataflow ${input.flow_ref} returned no dimensions`, {
-        ...ctx.recoveryFor('dataflow_not_found'),
-      });
+      throw ctx.fail('dataflow_not_found', `Dataflow ${input.flow_ref} returned no dimensions`);
     }
 
     // Build a wildcard key example
