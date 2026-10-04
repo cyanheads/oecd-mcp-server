@@ -38,6 +38,7 @@ const VALID_ARGUMENTS: Readonly<Record<string, Readonly<Record<string, unknown>>
   oecd_query_dataset: { flow_ref: FLOW_REF, key: 'A.USA..' },
   oecd_dataframe_describe: { canvas_id: CANVAS_ID },
   oecd_dataframe_query: { canvas_id: CANVAS_ID, sql: 'SELECT 1' },
+  oecd_dataframe_drop: { canvas_id: CANVAS_ID, table_name: 'spilled_abc' },
 };
 
 /** Every tool that accepts a `canvas_id`, with the rest of its arguments. */
@@ -45,6 +46,7 @@ const CANVAS_ID_TOOLS: ReadonlyArray<readonly [string, Readonly<Record<string, u
   ['oecd_query_dataset', { flow_ref: FLOW_REF, key: 'A.USA..' }],
   ['oecd_dataframe_describe', {}],
   ['oecd_dataframe_query', { sql: 'SELECT 1' }],
+  ['oecd_dataframe_drop', { table_name: 'spilled_abc' }],
 ];
 
 const TOOLS = allToolDefinitions.map((definition) => [definition.name, definition] as const);

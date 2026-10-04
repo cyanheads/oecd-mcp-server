@@ -5,6 +5,7 @@
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
+import { getServerConfig } from './config/server-config.js';
 import { allPromptDefinitions } from './mcp-server/prompts/index.js';
 import { allResourceDefinitions } from './mcp-server/resources/index.js';
 import { allToolDefinitions } from './mcp-server/tools/index.js';
@@ -32,8 +33,12 @@ await createApp({
     '→ oecd_get_dimension_values → oecd_query_dataset.\n' +
     'Large results (multi-country time-series) spill to DataCanvas; ' +
     'use oecd_dataframe_describe + oecd_dataframe_query for SQL analytics.\n' +
+    (getServerConfig().dataframeDropEnabled
+      ? 'oecd_dataframe_drop removes a staged table once the analysis no longer needs it.\n'
+      : '') +
     'All data is attributed to OECD per their terms of use.',
   setup(core) {
+    getServerConfig();
     setCanvas(core.canvas);
     initStructureService();
     initDataService();

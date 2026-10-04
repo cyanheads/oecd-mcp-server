@@ -12,6 +12,10 @@ const ServerConfigSchema = z.object({
     .default('https://sdmx.oecd.org/public/rest')
     .describe('OECD SDMX REST API base URL'),
   timeoutMs: z.coerce.number().default(30_000).describe('Per-request timeout in milliseconds'),
+  dataframeDropEnabled: z
+    .stringbool()
+    .default(false)
+    .describe('Register oecd_dataframe_drop so callers can remove staged DataCanvas tables'),
 });
 
 let _config: z.infer<typeof ServerConfigSchema> | undefined;
@@ -21,6 +25,7 @@ export function getServerConfig(): z.infer<typeof ServerConfigSchema> {
   _config ??= parseEnvConfig(ServerConfigSchema, {
     baseUrl: 'OECD_BASE_URL',
     timeoutMs: 'OECD_TIMEOUT_MS',
+    dataframeDropEnabled: 'OECD_DATAFRAME_DROP_ENABLED',
   });
   return _config;
 }

@@ -4,6 +4,7 @@
  */
 
 export { oecdDataframeDescribe } from './definitions/dataframe-describe.tool.js';
+export { oecdDataframeDrop } from './definitions/dataframe-drop.tool.js';
 export { oecdDataframeQuery } from './definitions/dataframe-query.tool.js';
 export { oecdGetDatasetInfo } from './definitions/get-dataset-info.tool.js';
 export { oecdGetDimensionValues } from './definitions/get-dimension-values.tool.js';
@@ -12,6 +13,7 @@ export { oecdQueryDataset } from './definitions/query-dataset.tool.js';
 export { oecdSearchDatasets } from './definitions/search-datasets.tool.js';
 
 import { oecdDataframeDescribe } from './definitions/dataframe-describe.tool.js';
+import { oecdDataframeDrop } from './definitions/dataframe-drop.tool.js';
 import { oecdDataframeQuery } from './definitions/dataframe-query.tool.js';
 import { oecdGetDatasetInfo } from './definitions/get-dataset-info.tool.js';
 import { oecdGetDimensionValues } from './definitions/get-dimension-values.tool.js';
@@ -27,4 +29,5 @@ export const allToolDefinitions = [
   oecdQueryDataset,
   oecdDataframeDescribe,
   oecdDataframeQuery,
+  oecdDataframeDrop,
 ];

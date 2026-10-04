@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/oecd-mcp-server</h1>
-  <p><b>Search, explore, and query 1,500+ OECD statistical datasets (national accounts, employment, trade, education, health) via SDMX via MCP. STDIO or Streamable HTTP.</b>
-  <div>7 Tools • 1 Resource</div>
+  <p><b>Search, explore, and query 1,500+ OECD statistical datasets (national accounts, employment, trade, education, health) from the OECD SDMX API via MCP. STDIO or Streamable HTTP.</b>
+  <div>8 Tools • 1 Resource</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.3.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/oecd-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/oecd-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/oecd-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.3.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/oecd-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/oecd-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/oecd-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -33,7 +33,7 @@ OECD statistical data via the SDMX 2.1 REST API — 1,500+ dataflows spanning na
 
 ### Tools
 
-Five discovery and data tools plus two SQL analytics tools for large query results:
+Five discovery and data tools plus three DataCanvas tools for large query results:
 
 | Tool | Description |
 |:-----|:------------|
@@ -44,6 +44,7 @@ Five discovery and data tools plus two SQL analytics tools for large query resul
 | `oecd_query_dataset` | Fetch observations filtered by dimension key and time range; spills large results to DataCanvas |
 | `oecd_dataframe_describe` | List DataCanvas tables and columns staged by a prior `oecd_query_dataset` spill |
 | `oecd_dataframe_query` | Run a read-only SQL SELECT against DataCanvas tables |
+| `oecd_dataframe_drop` | Drop a staged DataCanvas table or view once the analysis is done — opt-in via `OECD_DATAFRAME_DROP_ENABLED=true` |
 
 ### Resources
 
@@ -57,75 +58,64 @@ All resource data is also reachable via tools. Use `oecd_get_dataset_info` for t
 
 ### `oecd_list_agencies` <sub>tool</sub>
 
-- Returns agency IDs (e.g. `OECD.SDD.NAD`, `OECD.ELS.SPD`, `OECD.EDU.IMEP`) and dataflow counts, sorted descending by count
-- Each agency carries the name of its directorate — `OECD.CTP.TPS` is the Centre for Tax Policy and Administration, `OECD.SDD.NAD` the Statistics and Data Directorate — so a department can be picked without decoding the identifier
+- No inputs; returns every agency ID (e.g. `OECD.SDD.NAD`) with its directorate name and dataflow count, sorted by count
 - Publishers outside OECD that ship dataflows through the same catalog (`ESTAT`, `IAEG-SDGs`) carry no directorate
-- Useful for scoping `oecd_search_datasets` by department (national accounts, labour, education, etc.)
 
 ---
 
 ### `oecd_search_datasets` <sub>tool</sub>
 
-- Token-matching across dataflow names and descriptions — reaches datasets whose name never carries the term, so `inflation` returns `Economic Outlook 119` and `poverty` returns `Income inequality - Regions`
-- Each result reports `matched_in` (`name`, `description`, or `both`) and a plain-text description trimmed to 240 characters
-- Optional `agency_id` filter scopes results to a specific statistical department
-- `limit` (1–100) and `offset` page through the match list; `total_matches` reports the full count
-- Returns `flow_ref` values (e.g. `OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I`) — pass directly to `oecd_get_dataset_info` or `oecd_query_dataset`. A handful of dataflows are catalogued without a datastructure prefix and come back in the bare `{agencyID},{df_id}` form (`OECD.TAD.ARP,DF_AEI2024_DASHBOARD`); both forms are accepted everywhere a `flow_ref` is
-- Fetches and filters in-memory; the full catalog is ~5.9 MB and bounded (OECD adds datasets weekly, not continuously)
+- `query` token-matched across dataflow names and descriptions; optional `agency_id` scope; `limit` (1–100) and `offset` paging with `total_matches`
+- Each result carries its `flow_ref` — the identifier every other tool takes — and `matched_in` (`name`, `description`, or `both`)
 
 ---
 
 ### `oecd_get_dataset_info` <sub>tool</sub>
 
-- Returns all dimensions in key order (position 1, 2, 3 …) — dimension order is required to construct the dot-delimited key for `oecd_query_dataset`
-- Each dimension carries its concept name from the datastructure's concept scheme, so `INSTR_ASSET` reads as "Financial instruments and non-financial assets" rather than repeating the id. A dimension the scheme does not cover keeps the id
-- Shows codelist references for each dimension — pass to `oecd_get_dimension_values` to resolve human-readable names to SDMX codes
-- Surfaces `NonProductionDataflow` flag — marks experimental or deprecated dataflows
-- Resolves a `flow_ref` whose id prefix names no datastructure of its own by asking the dataflow for its structure — `OECD.CFE.EDS,DSD_REG_LAB@DF_RATES` is backed by `DSD_REG_LABOUR`, and answers here rather than reporting the dataflow as missing
-- Required before calling `oecd_query_dataset` on an unfamiliar dataflow
+- Takes a `flow_ref`; returns every dimension in key order with its concept name and codelist reference, plus a `key_example` for `oecd_query_dataset`
+- Fails `invalid_flow_ref` for a string that is not a flow reference and `dataflow_not_found` for one OECD does not publish
 
 ---
 
 ### `oecd_get_dimension_values` <sub>tool</sub>
 
-- Returns code + label pairs for a single dimension (e.g. `REF_AREA` → `USA`/`United States`, `DEU`/`Germany`)
-- `query` matches a case-insensitive substring against both the code and its label, so `PA` and `percent` each reach `PA` / `Percent per annum`
-- `limit` (1–500, default 50) and `offset` page the matching list. Both client surfaces carry the same page, so a 1,164-code dimension like `UNIT_MEASURE` no longer ships 66 KB of pairs to `structuredContent` to find one code
-- When matches remain beyond the page, the response reports the full match count and how to reach the rest
+- Takes a `flow_ref` and `dimension_id`; optional `query` substring-matches both code and label
+- `limit` (1–500, default 50) and `offset` page the matches, with the full match count when more remain
 
 ---
 
 ### `oecd_query_dataset` <sub>tool</sub>
 
-- Dot-delimited key (e.g. `A.USA+DEU.B1GQ_R.PC.`) with `+`-separated multi-values and empty wildcard segments; optional `start_period` / `end_period` bound the range (ISO format: `2010`, `2010-Q1`)
-- SDMX-JSON decoded into row objects — every dimension and observation attribute (`UNIT_MULT`, `OBS_STATUS`, `PRICE_BASE`, `DECIMALS`, …) becomes its own column, so an estimated or break-flagged point is distinguishable from a confirmed one
-- `value` is pre-multiplied by `value_scale` (the observation's unit multiplier) — a GDP figure OECD publishes as `26054.614` billions comes back as `26054614000000`; divide by `value_scale` for the figure as OECD published it. Every row carries `source: "OECD"`
-- Small results return every observation inline with no `canvas_id`; large results (multi-country, multi-year) spill to DataCanvas (`CANVAS_PROVIDER_TYPE=duckdb`) with `truncated: true` plus a `canvas_id` / `table_name` for `oecd_dataframe_describe` and `oecd_dataframe_query`; without DataCanvas every row still returns in `structuredContent`, but the rendered table caps at a preview slice, reported via `content_table_capped`
+- `flow_ref` plus a dot-delimited `key` (`+` for multiple values, empty segments as wildcards) and optional `start_period` / `end_period`
+- One row per observation with every dimension and attribute as its own column; `value` is pre-multiplied by `value_scale`
+- Large results spill to DataCanvas with `truncated: true`, `canvas_id`, and `table_name`; without a canvas every row stays in `structuredContent` and only the rendered table is capped (`content_table_capped`)
 
 ---
 
 ### `oecd_dataframe_describe` <sub>tool</sub>
 
-- Lists table and view names, row counts, and column names/types staged on a DataCanvas by a prior `oecd_query_dataset` spill
-- Takes the `canvas_id` `oecd_query_dataset` returned
-- Only available when `CANVAS_PROVIDER_TYPE=duckdb` is set — call before `oecd_dataframe_query` to discover exact table and column names for SQL
+- Takes the `canvas_id` `oecd_query_dataset` returned; lists each staged table and view with its row count and column names and types
 
 ---
 
 ### `oecd_dataframe_query` <sub>tool</sub>
 
-- Runs a single read-only SQL `SELECT` against the staged tables — aggregates, window functions, GROUP BY, ORDER BY, and standard DuckDB SQL
-- Writes, DDL, and system-catalog access are rejected
-- Results capped at the canvas row limit; `row_count` reports the full count before the cap
-- Only available when `CANVAS_PROVIDER_TYPE=duckdb` is set
+- `canvas_id` plus one read-only SQL `SELECT`; writes, DDL, and system-catalog access are rejected
+- Returns rows capped at the canvas row limit, with `row_count` reporting the full count
+
+---
+
+### `oecd_dataframe_drop` <sub>tool</sub>
+
+- `canvas_id` plus a `table_name` as `oecd_dataframe_describe` lists it; returns the dropped object's `kind` and the `remaining_tables`
+- Opt-in: listed but not callable unless `OECD_DATAFRAME_DROP_ENABLED=true`
 
 ---
 
 ### `oecd://dataflow/{agency_id}/{flow_id}` <sub>resource</sub>
 
-- Dimension metadata for a single OECD dataflow as `application/json` — same content as `oecd_get_dataset_info`
-- `{flow_id}` is the combined `{dsd_id}@{df_id}` string with `@` percent-encoded as `%40`, or the bare `{df_id}` for a dataflow catalogued without a datastructure prefix
-- Example: `oecd://dataflow/OECD.SDD.NAD/DSD_NAAG%40DF_NAAG_I`
+- Same content as `oecd_get_dataset_info`, as `application/json`
+- `{flow_id}` is `{dsd_id}@{df_id}` with `@` encoded as `%40` (e.g. `oecd://dataflow/OECD.SDD.NAD/DSD_NAAG%40DF_NAAG_I`), or the bare `{df_id}`
 
 ## Features
 
@@ -137,7 +127,7 @@ OECD-specific:
 - Covers 1,500+ dataflows across 20+ OECD statistical departments (national accounts, employment, inflation, trade, education, health, environment, taxation, inequality)
 - Delegated dataflows and codelist revisions resolved end to end — a dataflow OECD catalogues on one service root but defines on another follows the catalog's own link for structure, codes, and observations, and codes come from the revision the datastructure names rather than the endpoint's current latest
 - `AllDimensions` observation mode — one-pass SDMX-JSON decoding into flat row objects, no nested series key reconstruction
-- `oecd_query_dataset` materializes large observation sets (multi-country time-series) on a DuckDB DataCanvas for in-conversation SQL analytics
+- `oecd_query_dataset` materializes large observation sets (multi-country time-series) on a DuckDB DataCanvas for in-conversation SQL analytics; the three `oecd_dataframe_*` tools work on it and need `CANVAS_PROVIDER_TYPE=duckdb`
 
 Agent-friendly output:
 
@@ -284,12 +274,14 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | `OECD_BASE_URL` | OECD SDMX REST API base URL. Must be an https origin that answers directly — no redirect is followed, so a plaintext `http://` origin fails instead of being upgraded to https. | `https://sdmx.oecd.org/public/rest` |
 | `OECD_TIMEOUT_MS` | Per-request timeout in milliseconds. | `30000` |
 | `CANVAS_PROVIDER_TYPE` | Canvas engine. Set to `duckdb` so a large `oecd_query_dataset` result spills to a queryable table instead of just capping the rendered preview — unset, every row still comes back in `structuredContent`, only the rendered table is capped. | `none` |
+| `OECD_DATAFRAME_DROP_ENABLED` | Set to `true` to register `oecd_dataframe_drop`. Off, the tool is listed as disabled and clients cannot call it. | `false` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
 | `MCP_SESSION_MODE` | HTTP session posture: `stateful`, `stateless`, or `auto`. The server declares `stateless` in source — it keeps no per-session state, and a DataCanvas handle is keyed by `canvas_id` — so set this only to override that. | `stateless` |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_LOG_LEVEL` | Log level (RFC 5424). | `info` |
 | `LOGS_DIR` | Directory for log files (Node.js only). | `<project-root>/logs` |
+| `LOG_TOOL_FAILURE_PAYLOADS` | Log each failed tool call's arguments and result, redacted by key name and capped at `LOG_TOOL_FAILURE_PAYLOAD_MAX_BYTES` (default `16384`). A secret inside a free-form value is not redacted. | `false` |
 | `OTEL_ENABLED` | Enable [OpenTelemetry instrumentation](https://github.com/cyanheads/mcp-ts-core/tree/main/docs/telemetry). | `false` |
 
 See [`.env.example`](./.env.example) for the full list of optional overrides.
@@ -333,7 +325,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 |:----------|:--------|
 | `src/index.ts` | `createApp()` entry point — registers tools/resources and initializes services. |
 | `src/config/` | Server-specific environment variable parsing and validation with Zod. |
-| `src/mcp-server/tools/definitions/` | Tool definitions (`*.tool.ts`) — seven tools for OECD data discovery and retrieval. |
+| `src/mcp-server/tools/definitions/` | Tool definitions (`*.tool.ts`) — eight tools for OECD data discovery, retrieval, and DataCanvas analysis. |
 | `src/mcp-server/resources/definitions/` | Resource definitions (`*.resource.ts`) — the `oecd://dataflow` resource. |
 | `src/services/oecd-http/` | Shared OECD fetch boundary — timeout and retry-classification corrections used by both services below, the origin check every delegated service root passes before it is addressed, the refusal of any redirect off the configured host, and the classification that gives an upstream refusal the same declared reason on every tool and resource. |
 | `src/services/oecd-structure/` | OECD SDMX structure service — dataflows, data structures, codelists. |

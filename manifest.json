@@ -19,7 +19,8 @@
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
-        "NODE_ENV": "production"
+        "NODE_ENV": "production",
+        "OECD_DATAFRAME_DROP_ENABLED": "${user_config.OECD_DATAFRAME_DROP_ENABLED}"
       }
     }
   },
@@ -28,5 +29,13 @@
   },
   "tools_generated": true,
   "prompts_generated": true,
-  "user_config": {}
+  "user_config": {
+    "OECD_DATAFRAME_DROP_ENABLED": {
+      "type": "boolean",
+      "title": "Enable oecd_dataframe_drop",
+      "description": "Let callers drop staged DataCanvas tables with oecd_dataframe_drop. Registered but disabled when off.",
+      "required": false,
+      "default": false
+    }
+  }
 }

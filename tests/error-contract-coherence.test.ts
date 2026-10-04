@@ -34,7 +34,7 @@ const FLOW_REF_SURFACES: ReadonlyArray<readonly [string, WithErrors]> = [
   ['oecd_query_dataset', oecdQueryDataset],
 ];
 
-/** Every definition on the surface, including the two that reach no network. */
+/** Every definition on the surface, including the three that reach no network. */
 const ALL_DEFINITIONS: ReadonlyArray<readonly [string, WithErrors]> = [
   ...allToolDefinitions.map((t) => [t.name, t as WithErrors] as const),
   ['oecd://dataflow/{agency_id}/{flow_id}', oecdDataflowResource],
