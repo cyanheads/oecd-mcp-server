@@ -1,6 +1,6 @@
 # oecd-mcp-server - Directory Structure
 
-Generated on: 2026-09-20 15:04:21
+Generated on: 2026-10-04 05:59:10
 
 ```text
 oecd-mcp-server/
@@ -27,6 +27,7 @@ oecd-mcp-server/
 │   ├── 0.1.x/
 │   ├── 0.2.x/
 │   ├── 0.3.x/
+│   ├── 0.4.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -129,9 +130,11 @@ oecd-mcp-server/
 │   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
+│   ├── install-otel.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   └── tree.ts
 ├── src/
@@ -148,6 +151,7 @@ oecd-mcp-server/
 │   │   └── tools/
 │   │       ├── definitions/
 │   │       │   ├── dataframe-describe.tool.ts
+│   │       │   ├── dataframe-drop.tool.ts
 │   │       │   ├── dataframe-query.tool.ts
 │   │       │   ├── get-dataset-info.tool.ts
 │   │       │   ├── get-dimension-values.tool.ts
@@ -184,6 +188,7 @@ oecd-mcp-server/
 │   │       └── oecd-structure-service.test.ts
 │   ├── tools/
 │   │   ├── dataframe-describe.tool.test.ts
+│   │   ├── dataframe-drop.tool.test.ts
 │   │   ├── dataframe-query.tool.test.ts
 │   │   ├── get-dataset-info.tool.test.ts
 │   │   ├── get-dimension-values.tool.test.ts

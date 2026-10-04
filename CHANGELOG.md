@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.4.0](changelog/0.4.x/0.4.0.md) — 2026-10-03
+
+Adds the opt-in oecd_dataframe_drop tool for freeing a staged DataCanvas table, and adopts mcp-ts-core 0.13.11 — request ids in error envelopes, framework-filled recovery hints, a private canvas scratch directory, and a Docker image built without running JavaScript under emulation.
+
 ## [0.3.2](changelog/0.3.x/0.3.2.md) — 2026-09-20
 
 Adopts mcp-ts-core 0.13.6 — reason/retryable error text, URL-free error data, argument-time canvas_id and cancellation checks — alongside a dependency refresh and two defect fixes.
