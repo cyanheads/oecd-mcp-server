@@ -18,18 +18,8 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/oecd-mcp-server",
-      "runtimeHint": "bun",
+      "runtimeHint": "npx",
       "version": "0.3.2",
-      "packageArguments": [
-        {
-          "type": "positional",
-          "value": "run"
-        },
-        {
-          "type": "positional",
-          "value": "start:stdio"
-        }
-      ],
       "environmentVariables": [
         {
           "name": "MCP_LOG_LEVEL",
@@ -37,6 +27,13 @@
           "format": "string",
           "isRequired": false,
           "default": "info"
+        },
+        {
+          "name": "OECD_DATAFRAME_DROP_ENABLED",
+          "description": "Set to 'true' to register oecd_dataframe_drop, which drops a staged DataCanvas table. Registered but disabled otherwise.",
+          "format": "boolean",
+          "isRequired": false,
+          "default": "false"
         }
       ],
       "transport": {
@@ -47,19 +44,15 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@cyanheads/oecd-mcp-server",
-      "runtimeHint": "bun",
+      "runtimeHint": "npx",
       "version": "0.3.2",
-      "packageArguments": [
-        {
-          "type": "positional",
-          "value": "run"
-        },
-        {
-          "type": "positional",
-          "value": "start:http"
-        }
-      ],
       "environmentVariables": [
+        {
+          "name": "MCP_TRANSPORT_TYPE",
+          "description": "Selects the HTTP transport.",
+          "format": "string",
+          "value": "http"
+        },
         {
           "name": "MCP_HTTP_HOST",
           "description": "The hostname for the HTTP server.",
@@ -94,6 +87,13 @@
           "format": "string",
           "isRequired": false,
           "default": "info"
+        },
+        {
+          "name": "OECD_DATAFRAME_DROP_ENABLED",
+          "description": "Set to 'true' to register oecd_dataframe_drop, which drops a staged DataCanvas table. Registered but disabled otherwise.",
+          "format": "boolean",
+          "isRequired": false,
+          "default": "false"
         }
       ],
       "transport": {
