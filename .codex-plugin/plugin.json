@@ -23,7 +23,7 @@
   "interface": {
     "displayName": "oecd-mcp-server",
     "shortDescription": "Search and query 1,500+ OECD statistical datasets via SDMX. Keyless.",
-    "longDescription": "Search, explore, and query 1,500+ OECD statistical datasets (national accounts, employment, trade, education, health) via SDMX via MCP. STDIO or Streamable HTTP.",
+    "longDescription": "Search, explore, and query 1,500+ OECD statistical datasets (national accounts, employment, trade, education, health) from the OECD SDMX API via MCP. STDIO or Streamable HTTP.",
     "developerName": "cyanheads",
     "category": "Data & Analytics",
     "capabilities": ["Read"],
