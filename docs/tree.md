@@ -1,6 +1,6 @@
 # oecd-mcp-server - Directory Structure
 
-Generated on: 2026-10-04 05:59:10
+Generated on: 2026-10-24 16:06:24
 
 ```text
 oecd-mcp-server/
@@ -171,6 +171,8 @@ oecd-mcp-server/
 │   │   └── oecd-structure/
 │   │       ├── oecd-structure-service.ts
 │   │       └── types.ts
+│   ├── utils/
+│   │   └── format-table.ts
 │   └── index.ts
 ├── tests/
 │   ├── helpers/
@@ -193,9 +195,12 @@ oecd-mcp-server/
 │   │   ├── get-dataset-info.tool.test.ts
 │   │   ├── get-dimension-values.tool.test.ts
 │   │   ├── list-agencies.tool.test.ts
+│   │   ├── markdown-formatting.test.ts
+│   │   ├── query-dataset-canvas.test.ts
 │   │   ├── query-dataset.tool.test.ts
 │   │   └── search-datasets.tool.test.ts
 │   ├── error-contract-coherence.test.ts
+│   ├── startup.test.ts
 │   └── tool-input-strictness.test.ts
 ├── .dockerignore
 ├── .env.example

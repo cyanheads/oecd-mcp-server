@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.4.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/oecd-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.2.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/oecd-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/oecd-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.2-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.4.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/oecd-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/oecd-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/oecd-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -29,7 +29,7 @@
 
 ## Overview
 
-OECD statistical data via the SDMX 2.1 REST API — 1,500+ dataflows spanning national accounts, employment, trade, education, and health. Search datasets, inspect their dimensions, resolve codes, and query observations, with large multi-country time-series spilling to a queryable DataCanvas table for SQL analysis. Runs as a stdio process, a local Streamable HTTP server, or the public hosted endpoint above.
+OECD statistics across 1,500+ datasets on national accounts, employment, trade, education, and health. Search datasets, inspect their dimensions, query observations, and run SQL over large multi-country time series. No API key required.
 
 ### Tools
 
@@ -89,6 +89,7 @@ All resource data is also reachable via tools. Use `oecd_get_dataset_info` for t
 - `flow_ref` plus a dot-delimited `key` (`+` for multiple values, empty segments as wildcards) and optional `start_period` / `end_period`
 - One row per observation with every dimension and attribute as its own column; `value` is pre-multiplied by `value_scale`
 - Large results spill to DataCanvas with `truncated: true`, `canvas_id`, and `table_name`; without a canvas every row stays in `structuredContent` and only the rendered table is capped (`content_table_capped`)
+- A spill includes a `notice` naming the canvas and table: inspect columns with `oecd_dataframe_describe`, then use `oecd_dataframe_query` for SQL over the full result. Fitting results allocate no new canvas; an explicit `canvas_id` is still validated.
 
 ---
 
@@ -139,18 +140,40 @@ Agent-friendly output:
 
 ### Public Hosted Instance
 
-A public instance is available at `https://oecd.caseyjhand.com/mcp` — no installation required. Point any MCP client at it via Streamable HTTP:
+A public instance is available at `https://oecd.caseyjhand.com/mcp` — no installation required. It serves Streamable HTTP; each client takes its own config shape.
+
+For Claude Code:
+
+```sh
+claude mcp add --transport http oecd-mcp-server https://oecd.caseyjhand.com/mcp
+```
+
+For Cline (`cline_mcp_settings.json`):
 
 ```json
 {
   "mcpServers": {
     "oecd-mcp-server": {
-      "type": "streamable-http",
+      "type": "streamableHttp",
       "url": "https://oecd.caseyjhand.com/mcp"
     }
   }
 }
 ```
+
+For Cursor (`mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "oecd-mcp-server": {
+      "url": "https://oecd.caseyjhand.com/mcp"
+    }
+  }
+}
+```
+
+Claude Desktop adds remote servers under Settings → Connectors.
 
 ### Self-Hosted / Local
 
@@ -208,7 +231,7 @@ Or with Docker:
 }
 ```
 
-To enable DataCanvas SQL analytics for large query results, add `CANVAS_PROVIDER_TYPE=duckdb`:
+DataCanvas SQL analytics for large query results is on by default. To turn it off, add `CANVAS_PROVIDER_TYPE=none`:
 
 ```json
 {
@@ -219,7 +242,7 @@ To enable DataCanvas SQL analytics for large query results, add `CANVAS_PROVIDER
       "args": ["@cyanheads/oecd-mcp-server@latest"],
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
-        "CANVAS_PROVIDER_TYPE": "duckdb"
+        "CANVAS_PROVIDER_TYPE": "none"
       }
     }
   }
@@ -273,7 +296,7 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 |:---------|:------------|:--------|
 | `OECD_BASE_URL` | OECD SDMX REST API base URL. Must be an https origin that answers directly — no redirect is followed, so a plaintext `http://` origin fails instead of being upgraded to https. | `https://sdmx.oecd.org/public/rest` |
 | `OECD_TIMEOUT_MS` | Per-request timeout in milliseconds. | `30000` |
-| `CANVAS_PROVIDER_TYPE` | Canvas engine. Set to `duckdb` so a large `oecd_query_dataset` result spills to a queryable table instead of just capping the rendered preview — unset, every row still comes back in `structuredContent`, only the rendered table is capped. | `none` |
+| `CANVAS_PROVIDER_TYPE` | Canvas engine. With `duckdb`, a large `oecd_query_dataset` result spills to a queryable table instead of just capping the rendered preview; with `none`, every row still comes back in `structuredContent` and only the rendered table is capped. | `duckdb` |
 | `OECD_DATAFRAME_DROP_ENABLED` | Set to `true` to register `oecd_dataframe_drop`. Off, the tool is listed as disabled and clients cannot call it. | `false` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
 | `MCP_HTTP_PORT` | Port for HTTP server. | `3010` |
