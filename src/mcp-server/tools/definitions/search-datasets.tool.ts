@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
 import {
   getStructureService,
@@ -281,11 +282,11 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       '',
       ...result.dataflows.map((df) => {
         const entry = [
-          `- **${df.flow_ref}** (non_production: ${df.non_production}, matched_in: ${df.matched_in})`,
-          `  ${df.name}`,
-          `  Agency: ${df.agency_id}`,
+          `- **${escapeMarkdownInline(df.flow_ref)}** (non_production: ${df.non_production}, matched_in: ${df.matched_in})`,
+          `  ${escapeMarkdownInline(df.name)}`,
+          `  Agency: ${escapeMarkdownInline(df.agency_id)}`,
         ];
-        if (df.description) entry.push(`  ${df.description}`);
+        if (df.description) entry.push(`  ${escapeMarkdownInline(df.description)}`);
         return entry.join('\n');
       }),
       '',

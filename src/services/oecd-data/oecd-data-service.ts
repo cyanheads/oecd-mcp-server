@@ -47,6 +47,10 @@ const NORMALIZED_AWAY_KEY = /^(?:\.|%2e){1,2}$/i;
 
 const DATA_ACCEPT = 'application/vnd.sdmx.data+json;version=2.0';
 
+/** Plain-text query rejection shapes OECD also returns with HTTP 403. */
+const KEY_REJECTION = /^Not enough key values in query, expecting \d+ got \d+$/i;
+const DATE_REJECTION = /^Semantic Error - Invalid Date Format `[^<>\r\n]*`$/i;
+
 /**
  * Attribute whose code ID is the base-10 exponent the observation value is
  * expressed in — `0` = Units, `9` = Billions, `15` = Quadrillions (shared SDMX
@@ -123,11 +127,17 @@ function loadObservations(url: string, signal?: AbortSignal, maxRetries = 2): Pr
  */
 function dataFetchFailure(err: unknown, flowRef: string): McpError {
   const upstream = upstreamStatus(err);
+  const detail = upstream?.body.trim();
   if (upstream?.status === 404) {
     return notFound(`Dataflow not found: ${flowRef}`, { flowRef, status: 404 }, { cause: err });
   }
-  if (upstream && (upstream.status === 400 || upstream.status === 422)) {
-    const detail = upstream.body.trim();
+  if (
+    upstream &&
+    detail !== undefined &&
+    (upstream.status === 400 ||
+      upstream.status === 422 ||
+      (upstream.status === 403 && (KEY_REJECTION.test(detail) || DATE_REJECTION.test(detail))))
+  ) {
     return validationError(
       detail === ''
         ? `OECD rejected the query for ${flowRef}`

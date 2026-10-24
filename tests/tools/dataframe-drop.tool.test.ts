@@ -17,6 +17,7 @@ import {
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { createWorkerHandler } from '@cyanheads/mcp-ts-core/worker';
+import MarkdownIt from 'markdown-it';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { declaredRecovery, toolWireError } from '../helpers/error-contract.js';
 
@@ -44,9 +45,17 @@ async function loadUnderFlag(
   return { accessor, drop: oecdDataframeDrop };
 }
 
-/** Text of every `content[]` block, joined. */
+/** Text clients read after parsing the Markdown in each `content[]` block. */
 function textOf(content: unknown): string {
-  return (content as { text?: string }[]).map((c) => c.text ?? '').join('\n');
+  const source = (content as { text?: string }[]).map((c) => c.text ?? '').join('\n');
+  return new MarkdownIt()
+    .parse(source, {})
+    .flatMap((token) => token.children ?? [token])
+    .map((token) => {
+      if (token.type === 'hardbreak' || token.type === 'softbreak') return '\n';
+      return token.type === 'text' || token.type === 'code_inline' ? token.content : '';
+    })
+    .join('');
 }
 
 /** Lists the tools a client sees, through the framework's own registration path. */

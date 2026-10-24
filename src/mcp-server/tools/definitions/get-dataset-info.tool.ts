@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
 import {
   getStructureService,
@@ -12,6 +13,7 @@ import {
   parseFlowRef,
 } from '@/services/oecd-structure/oecd-structure-service.js';
 import type { OecdDataStructure } from '@/services/oecd-structure/types.js';
+import { formatTable } from '@/utils/format-table.js';
 
 export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
   description:
@@ -205,26 +207,28 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
   },
 
   format: (result) => {
-    const dimTable = [
-      '| Pos | Dimension ID | Name | Codelist |',
-      '|-----|-------------|------|----------|',
-      ...result.dimensions.map(
-        (d) => `| ${d.position} | ${d.id} | ${d.name} | ${d.codelist_ref ?? '—'} |`,
-      ),
-    ];
+    const dimRows = result.dimensions.map((d) => [
+      String(d.position),
+      d.id,
+      d.name,
+      d.codelist_ref ?? '—',
+    ]);
     if (result.time_dimension) {
-      dimTable.push(
-        `| ${result.time_dimension.position} | ${result.time_dimension.id} _(time)_ | ${result.time_dimension.name} | — |`,
-      );
+      dimRows.push([
+        String(result.time_dimension.position),
+        `${result.time_dimension.id} (time)`,
+        result.time_dimension.name,
+        '—',
+      ]);
     }
 
     const lines = [
-      `**Dataflow: ${result.flow_ref}**`,
+      `**Dataflow: ${escapeMarkdownInline(result.flow_ref)}**`,
       `non_production: ${result.non_production}`,
       '',
-      dimTable.join('\n'),
+      formatTable(['Pos', 'Dimension ID', 'Name', 'Codelist'], dimRows),
       '',
-      `**Key example (all wildcards):** \`${result.key_example || '.'}\``,
+      `**Key example (all wildcards):** ${escapeMarkdownInline(result.key_example || '.')}`,
       'Replace empty segments with codes from oecd_get_dimension_values.',
       '',
       `Source: ${result.source}`,

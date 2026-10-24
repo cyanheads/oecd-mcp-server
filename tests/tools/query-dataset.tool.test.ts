@@ -381,6 +381,41 @@ describe('oecdQueryDataset', () => {
 
   // ── Error contract ──────────────────────────────────────────────────────────
 
+  it.each([
+    [
+      'Not enough key values in query, expecting 5 got 3',
+      'invalid_key',
+      'oecd_get_dataset_info',
+      'expecting 5 got 3',
+    ],
+    [
+      'Semantic Error - Invalid Date Format `last year`',
+      'invalid_period',
+      'ISO code',
+      'Invalid Date Format \\`last year\\`',
+    ],
+  ])(
+    'dispatches a recognized HTTP 403 rejection to %s',
+    async (body, reason, recovery, visibleDetail) => {
+      respond(body, { status: 403 });
+      const output = await runToolContract(oecdQueryDataset, {
+        flow_ref: FLOW_REF,
+        key: 'A.USA..',
+      });
+      expect(output.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.ValidationError,
+          data: { reason, recovery: { hint: expect.stringContaining(recovery) } },
+        },
+      });
+      const text = textOf(output.content);
+      expect(text).toContain(visibleDetail);
+      expect(text).toContain(recovery);
+      expect(text).toContain(`reason ${reason}`);
+      expect(http.calls).toHaveLength(1);
+    },
+  );
+
   it('throws ctx.fail(invalid_flow_ref) for malformed flow_ref', async () => {
     const ctx = createMockContext({ errors: oecdQueryDataset.errors });
     const input = oecdQueryDataset.input.parse({ flow_ref: 'BAD', key: '.' });
@@ -687,7 +722,7 @@ describe('oecdQueryDataset', () => {
     expect(text).toContain('Source: OECD');
   });
 
-  it('formats a spilled result with the canvas handle and the retrieval path', () => {
+  it('formats a spilled result with the handle and truncation disclosure; enrichment carries the route', () => {
     const output = {
       rows: [{ FREQ: 'Annual', value: 26054.614, value_scale: 1, source: 'OECD' }],
       row_count: 500,
@@ -702,7 +737,7 @@ describe('oecdQueryDataset', () => {
 
     expect(text).toContain('canvas-001');
     expect(text).toContain('spilled_abc');
-    expect(text).toContain('oecd_dataframe_query');
+    expect(text).not.toContain('oecd_dataframe_query');
     expect(text).toContain('500 observations');
     expect(text).toContain('Truncated — showing the first 1 of 500 rows');
   });

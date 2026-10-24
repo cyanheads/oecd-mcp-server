@@ -6,6 +6,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
 import {
   getStructureService,
@@ -13,6 +14,7 @@ import {
   parseFlowRef,
 } from '@/services/oecd-structure/oecd-structure-service.js';
 import type { OecdCode, OecdDataStructure } from '@/services/oecd-structure/types.js';
+import { formatTable } from '@/utils/format-table.js';
 
 /** Codes returned when the caller names no page size. */
 const DEFAULT_LIMIT = 50;
@@ -320,11 +322,12 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
 
   format: (result) => {
     const lines = [
-      `**Dimension: ${result.dimension_id}** (flow: ${result.flow_ref})`,
+      `**Dimension: ${escapeMarkdownInline(result.dimension_id)}** (flow: ${escapeMarkdownInline(result.flow_ref)})`,
       `${result.code_count} ${result.code_count === 1 ? 'code' : 'codes'} in this page`,
-      '| Code | Name |',
-      '|------|------|',
-      ...result.codes.map((c) => `| ${c.id} | ${c.name} |`),
+      formatTable(
+        ['Code', 'Name'],
+        result.codes.map((c) => [c.id, c.name]),
+      ),
       '',
       `Source: ${result.source}`,
     ];

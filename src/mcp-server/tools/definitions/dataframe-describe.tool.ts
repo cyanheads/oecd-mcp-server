@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema, type CanvasInstance } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 
 export const oecdDataframeDescribe = tool('oecd_dataframe_describe', {
@@ -54,7 +55,7 @@ export const oecdDataframeDescribe = tool('oecd_dataframe_describe', {
     {
       reason: 'canvas_disabled',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'DataCanvas is not configured — CANVAS_PROVIDER_TYPE is unset.',
+      when: 'DataCanvas is not configured — CANVAS_PROVIDER_TYPE=none.',
       recovery: 'Set CANVAS_PROVIDER_TYPE=duckdb to enable DataCanvas, then retry.',
     },
     {
@@ -105,12 +106,14 @@ export const oecdDataframeDescribe = tool('oecd_dataframe_describe', {
 
   format: (result) => {
     const sections = result.tables.map((t) => {
-      const colList = t.columns.map((c) => `  - ${c.name}: ${c.type}`).join('\n');
-      return `**${t.name}** (${t.kind}, ${t.row_count} rows)\n${colList}`;
+      const colList = t.columns
+        .map((c) => `  - ${escapeMarkdownInline(c.name)}: ${escapeMarkdownInline(c.type)}`)
+        .join('\n');
+      return `**${escapeMarkdownInline(t.name)}** (${escapeMarkdownInline(t.kind)}, ${t.row_count} rows)\n${colList}`;
     });
 
     const lines = [
-      `**DataCanvas ${result.canvas_id}** — ${result.table_count} table(s)`,
+      `**DataCanvas ${escapeMarkdownInline(result.canvas_id)}** — ${result.table_count} table(s)`,
       '',
       ...(sections.length > 0 ? sections : ['_(no tables staged)_']),
     ];

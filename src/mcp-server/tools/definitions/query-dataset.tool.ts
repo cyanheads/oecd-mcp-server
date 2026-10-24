@@ -6,6 +6,7 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema, type ColumnSchema, spillover } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 import { getDataService, invalidQueryText } from '@/services/oecd-data/oecd-data-service.js';
 import type { OecdDataResult } from '@/services/oecd-data/types.js';
@@ -14,6 +15,7 @@ import {
   isDataflowNotFound,
   parseFlowRef,
 } from '@/services/oecd-structure/oecd-structure-service.js';
+import { formatTable } from '@/utils/format-table.js';
 
 /** A decoded observation row as it leaves the handler. */
 type OutputRow = Record<string, string | number | null>;
@@ -82,7 +84,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     'Fetch observations from an OECD dataflow filtered by a dimension key and optional time range. ' +
     'Returns decoded rows (one per observation) with dimension and attribute labels, and values ' +
     'already scaled by the observation unit multiplier. ' +
-    'Large multi-country time-series spill to a DataCanvas table — follow up with oecd_dataframe_query; ' +
+    'Large multi-country time-series spill to a DataCanvas table — inspect columns with oecd_dataframe_describe, then query the full table with SQL using oecd_dataframe_query; ' +
     'without DataCanvas every row still comes back, but the rendered table stops at a preview slice. ' +
     'Call oecd_get_dataset_info first to learn the dimension order for constructing the key.',
   annotations: {
@@ -155,7 +157,9 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     table_name: z
       .string()
       .optional()
-      .describe('Canvas table name holding the full result — present when canvas_id is set.'),
+      .describe(
+        'Canvas table name holding the full result — present when canvas_id is set. Inspect columns with oecd_dataframe_describe, then query this table with SQL using oecd_dataframe_query.',
+      ),
     truncated: z
       .boolean()
       .optional()
@@ -168,6 +172,12 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
   }),
   enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'How to inspect and query the staged result, including its canvas_id and table name; present only after a spill.',
+      ),
     content_table_capped: z
       .boolean()
       .optional()
@@ -353,9 +363,12 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
 
     ctx.log.info('OECD data fetched', { rowCount: dataResult.rows.length });
 
-    // Try to spill to canvas if available and result is large
+    const inlineRows = dataResult.rows as OutputRow[];
+    const shown = previewRowCount(inlineRows);
+
+    // Explicit IDs must still be validated when the result fits inline.
     const canvas = getCanvas();
-    if (canvas) {
+    if (canvas && (input.canvas_id !== undefined || shown < inlineRows.length)) {
       const instance = await canvas.acquire(input.canvas_id, ctx);
       /**
        * Declare the schema rather than letting the provider sniff it. Attribute
@@ -373,9 +386,21 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
         previewChars: PREVIEW_CHARS,
         schema,
         signal: ctx.signal,
+      }).catch(async (err: unknown) => {
+        if (instance.isNew) {
+          try {
+            await canvas.drop(instance.canvasId, ctx);
+          } catch (cleanupError) {
+            ctx.log.warning('Failed to release a canvas after staging failed', { cleanupError });
+          }
+        }
+        throw err;
       });
 
       if (result.spilled) {
+        ctx.enrich({
+          notice: `The full result is in table "${result.handle.tableName}" on canvas "${instance.canvasId}". Call oecd_dataframe_describe with this canvas_id to inspect columns, then oecd_dataframe_query with this canvas_id and SQL to query the full table.`,
+        });
         return {
           rows: result.previewRows as OutputRow[],
           row_count: result.handle.rowCount,
@@ -397,8 +422,6 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
      * budget, so a caller with nowhere to spill still gets a bounded
      * `content[]` instead of the whole result twice.
      */
-    const inlineRows = dataResult.rows as OutputRow[];
-    const shown = previewRowCount(inlineRows);
     if (shown < inlineRows.length) {
       ctx.enrich({ content_table_capped: true, content_table_rows: shown });
     }
@@ -423,13 +446,11 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     const allKeys = [...new Set(result.rows.flatMap((r) => Object.keys(r)))];
     const shown = previewRowCount(result.rows as OutputRow[]);
     const visible = result.rows.slice(0, shown);
-    const header = `| ${allKeys.join(' | ')} |`;
-    const divider = `| ${allKeys.map(() => '---').join(' | ')} |`;
-    const rows = visible.map((r) => `| ${allKeys.map((k) => String(r[k] ?? '')).join(' | ')} |`);
+    const rows = visible.map((r) => allKeys.map((k) => String(r[k] ?? '')));
 
     const periodRange =
       result.query_start_period || result.query_end_period
-        ? ` | Period: ${result.query_start_period ?? '…'} – ${result.query_end_period ?? '…'}`
+        ? ` | Period: ${escapeMarkdownInline(result.query_start_period ?? '…')} – ${escapeMarkdownInline(result.query_end_period ?? '…')}`
         : '';
 
     const scaled = result.rows.some(
@@ -444,8 +465,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     const note =
       result.truncated && result.canvas_id
         ? `\n> Truncated — showing the first ${shown} of ${result.row_count} rows. The rest is on DataCanvas ` +
-          `(canvas_id: \`${result.canvas_id}\`, table: \`${result.table_name}\`). ` +
-          'Use **oecd_dataframe_query** to reach it.\n'
+          `(canvas_id: ${escapeMarkdownInline(result.canvas_id)}, table: ${escapeMarkdownInline(String(result.table_name))}).\n`
         : shown < result.rows.length
           ? `\n> Truncated for display — this table shows the first ${shown} of ${result.row_count} rows, ` +
             'but `structuredContent.rows` carries every one of them. To make the result itself ' +
@@ -456,15 +476,13 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
 
     const lines = [
       `**OECD Dataset Query** — ${result.row_count} observations`,
-      `Query: \`${result.query_flow_ref}\` key=\`${result.query_key}\`${periodRange}`,
+      `Query: ${escapeMarkdownInline(result.query_flow_ref)} key=${escapeMarkdownInline(result.query_key)}${periodRange}`,
       note,
       scaled
         ? '> Values are scaled by the observation unit multiplier — divide `value` by `value_scale` for the figure as OECD published it.\n'
         : '',
       '',
-      visible.length > 0 ? header : '_(no rows)_',
-      visible.length > 0 ? divider : '',
-      ...rows,
+      visible.length > 0 ? formatTable(allKeys, rows) : '_(no rows)_',
       '',
       `Source: ${result.source}`,
     ];

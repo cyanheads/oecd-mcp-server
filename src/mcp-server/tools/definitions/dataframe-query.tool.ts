@@ -12,6 +12,7 @@ import {
 } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { getCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
+import { formatTable } from '@/utils/format-table.js';
 
 export const oecdDataframeQuery = tool('oecd_dataframe_query', {
   description:
@@ -46,7 +47,7 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
     {
       reason: 'canvas_disabled',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'DataCanvas is not configured — CANVAS_PROVIDER_TYPE is unset.',
+      when: 'DataCanvas is not configured — CANVAS_PROVIDER_TYPE=none.',
       recovery: 'Set CANVAS_PROVIDER_TYPE=duckdb to enable DataCanvas, then retry.',
     },
     {
@@ -173,18 +174,12 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
     }
 
     const cols = result.column_names;
-    const header = `| ${cols.join(' | ')} |`;
-    const divider = `| ${cols.map(() => '---').join(' | ')} |`;
-    const rows = result.rows
-      .slice(0, 50)
-      .map((r) => `| ${cols.map((c) => String(r[c] ?? '')).join(' | ')} |`);
+    const rows = result.rows.slice(0, 50).map((r) => cols.map((c) => String(r[c] ?? '')));
 
     const lines = [
       `**Query Result** — ${result.row_count} rows`,
       '',
-      header,
-      divider,
-      ...rows,
+      formatTable(cols, rows),
       result.row_count > 50 ? `\n_(Showing 50 of ${result.row_count} rows)_` : '',
     ];
     return [{ type: 'text', text: lines.join('\n') }];

@@ -358,6 +358,49 @@ describe('OecdDataService.fetchData — flow reference forms', () => {
 // ── Upstream boundary ─────────────────────────────────────────────────────────
 
 describe('OecdDataService.fetchData — upstream failures', () => {
+  it.each([
+    'Forbidden',
+    '<html>Semantic Error - Invalid Date Format `last year`</html>',
+    'Access denied: Not enough key values in query, expecting 5 got 3',
+    'Semantic Error - Invalid Date Format `<html>last year</html>`',
+    'Not enough key values in query,\nexpecting 5 got 3',
+    'Semantic Error - Invalid\r\nDate Format `last year`',
+  ])('keeps an unrelated 403 refusal upstream: %s', async (body) => {
+    respondOnce(body, { status: 403 });
+    const error = await service()
+      .fetchData(FLOW_REF, 'A.USA..')
+      .catch((e: unknown) => e);
+    expect(http.calls).toHaveLength(1);
+    expect(invalidQueryText(error)).toBeUndefined();
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.Forbidden });
+  });
+
+  it('accepts outer HTTP line endings without accepting breaks inside a rejection', async () => {
+    respondOnce('\r\nSemantic Error - Invalid Date Format `last year`\r\n', { status: 403 });
+    const error = await service()
+      .fetchData(FLOW_REF, 'A.USA..')
+      .catch((e: unknown) => e);
+    expect(invalidQueryText(error)).toBe('Semantic Error - Invalid Date Format `last year`');
+  });
+
+  it.each([400, 422, 403])('preserves query rejections at HTTP %i', async (status) => {
+    for (const body of [
+      'Not enough key values in query, expecting 5 got 3',
+      'Semantic Error - Invalid Date Format `last year`',
+    ]) {
+      http.reset();
+      respondOnce(body, { status });
+      const error = await service()
+        .fetchData(FLOW_REF, 'A.USA..')
+        .catch((e: unknown) => e);
+      expect(http.calls).toHaveLength(1);
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        data: { status, body },
+      });
+      expect(invalidQueryText(error)).toBe(body);
+    }
+  });
   it('retries a 503 instead of spending a single attempt', async () => {
     http.route(
       {

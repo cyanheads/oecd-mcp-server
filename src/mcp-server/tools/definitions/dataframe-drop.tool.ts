@@ -7,6 +7,7 @@
 import { disabledTool, tool, z } from '@cyanheads/mcp-ts-core';
 import { CanvasIdSchema, type CanvasInstance } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { getCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 
@@ -46,7 +47,7 @@ const oecdDataframeDropDefinition = tool('oecd_dataframe_drop', {
     {
       reason: 'canvas_disabled',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'DataCanvas is not configured — CANVAS_PROVIDER_TYPE is unset.',
+      when: 'DataCanvas is not configured — CANVAS_PROVIDER_TYPE=none.',
       recovery: 'Set CANVAS_PROVIDER_TYPE=duckdb to enable DataCanvas, then retry.',
     },
     {
@@ -117,12 +118,12 @@ const oecdDataframeDropDefinition = tool('oecd_dataframe_drop', {
   format: (result) => {
     const remaining =
       result.remaining_tables.length > 0
-        ? `${result.remaining_tables.length} remain: ${result.remaining_tables.join(', ')}`
+        ? `${result.remaining_tables.length} remain: ${result.remaining_tables.map(escapeMarkdownInline).join(', ')}`
         : 'No tables remain on this canvas.';
     return [
       {
         type: 'text',
-        text: `Dropped ${result.kind} **${result.table_name}** from DataCanvas ${result.canvas_id}. ${remaining}`,
+        text: `Dropped ${result.kind} **${escapeMarkdownInline(result.table_name)}** from DataCanvas ${escapeMarkdownInline(result.canvas_id)}. ${remaining}`,
       },
     ];
   },

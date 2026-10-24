@@ -11,6 +11,7 @@ import {
   getStructureService,
 } from '@/services/oecd-structure/oecd-structure-service.js';
 import type { OecdDataflow } from '@/services/oecd-structure/types.js';
+import { formatTable } from '@/utils/format-table.js';
 
 export const oecdListAgencies = tool('oecd_list_agencies', {
   description:
@@ -152,10 +153,9 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
     const lines = [
       `**OECD Agencies** (${result.total_agencies} agencies, ${result.total_dataflows} total dataflows)`,
       '',
-      '| Agency | Directorate | Dataflows |',
-      '|--------|-------------|-----------|',
-      ...result.agencies.map(
-        (a) => `| ${a.agency_id} | ${a.directorate ?? '—'} | ${a.dataflow_count} |`,
+      formatTable(
+        ['Agency', 'Directorate', 'Dataflows'],
+        result.agencies.map((a) => [a.agency_id, a.directorate ?? '—', String(a.dataflow_count)]),
       ),
       '',
       `Source: ${result.source}`,
