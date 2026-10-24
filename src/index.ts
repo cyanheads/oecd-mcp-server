@@ -5,13 +5,21 @@
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
+import { normalizeEnv, parseConfig, resetConfig } from '@cyanheads/mcp-ts-core/config';
 import { getServerConfig } from './config/server-config.js';
 import { allPromptDefinitions } from './mcp-server/prompts/index.js';
 import { allResourceDefinitions } from './mcp-server/resources/index.js';
-import { allToolDefinitions } from './mcp-server/tools/index.js';
 import { setCanvas } from './services/canvas-accessor/canvas-accessor.js';
 import { initDataService } from './services/oecd-data/oecd-data-service.js';
 import { initStructureService } from './services/oecd-structure/oecd-structure-service.js';
+
+parseConfig();
+// DataCanvas defaults on; set CANVAS_PROVIDER_TYPE=none to disable it.
+process.env.CANVAS_PROVIDER_TYPE = normalizeEnv(process.env).CANVAS_PROVIDER_TYPE ?? 'duckdb';
+resetConfig();
+
+// Tool registration reads server settings, so load .env before evaluating the definitions.
+const { allToolDefinitions } = await import('./mcp-server/tools/index.js');
 
 await createApp({
   name: 'oecd-mcp-server',
