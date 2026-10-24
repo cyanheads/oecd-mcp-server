@@ -19,6 +19,7 @@
       "env": {
         "MCP_TRANSPORT_TYPE": "stdio",
         "MCP_AUTH_MODE": "none",
+        "CANVAS_PROVIDER_TYPE": "none",
         "NODE_ENV": "production",
         "OECD_DATAFRAME_DROP_ENABLED": "${user_config.OECD_DATAFRAME_DROP_ENABLED}"
       }
