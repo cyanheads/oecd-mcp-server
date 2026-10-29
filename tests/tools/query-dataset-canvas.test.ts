@@ -206,11 +206,15 @@ describe('query dataset real canvas lifecycle', () => {
     };
     expect(result.rows).toEqual([]);
     expect(canvas.countForTenant(ctx)).toBe(1);
+    const steps =
+      'Call oecd_dataframe_describe with this canvas_id to inspect columns, then oecd_dataframe_query with this canvas_id and SQL to query the full table.';
     expect(result.notice).toBe(
-      `The full result is in table "${result.table_name}" on canvas "${result.canvas_id}". Call oecd_dataframe_describe with this canvas_id to inspect columns, then oecd_dataframe_query with this canvas_id and SQL to query the full table.`,
+      `The full result is in table \`${result.table_name}\` on canvas \`${result.canvas_id}\`. ${steps}`,
     );
+    // content[] reads back through a CommonMark parse with both identifiers verbatim.
     const text = textOf(output);
-    expect(text.split(result.notice), text).toHaveLength(2);
+    const rendered = `The full result is in table ${result.table_name} on canvas ${result.canvas_id}. ${steps}`;
+    expect(text.split(rendered), text).toHaveLength(2);
     expect(text.match(/oecd_dataframe_describe/g)).toHaveLength(1);
     expect(text.match(/oecd_dataframe_query/g)).toHaveLength(1);
     expect(text).toContain('Truncated — showing the first 0 of 3 rows');
@@ -251,11 +255,19 @@ describe('query dataset real canvas lifecycle', () => {
         schema: [{ name: 'value', type: 'DOUBLE' }],
       });
     const original = provider.registerTable.bind(provider);
-    const failure = new Error('Deliberate failure after registration');
-    vi.spyOn(provider, 'registerTable').mockImplementation(async (...args) => {
-      await original(...args);
-      throw failure;
-    });
+    const failure = new Error('Deliberate failure mid-registration');
+    // The source fails after the first row reaches the table, inside the registration.
+    vi.spyOn(provider, 'registerTable').mockImplementation(
+      async (canvasId, name, rows, context, options) => {
+        async function* failMidway() {
+          for await (const row of rows) {
+            yield row;
+            throw failure;
+          }
+        }
+        return await original(canvasId, name, failMidway(), context, options);
+      },
+    );
     respond(true);
     await expect(
       oecdQueryDataset.handler({ ...input, canvas_id: existing?.canvasId }, ctx),
