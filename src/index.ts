@@ -35,6 +35,7 @@ await createApp({
   tools: allToolDefinitions,
   resources: allResourceDefinitions,
   prompts: allPromptDefinitions,
+  skills: 'skills',
   instructions:
     'OECD Statistics MCP server — keyless access to 1,500+ OECD dataflows via SDMX 2.1.\n' +
     'Workflow: oecd_list_agencies → oecd_search_datasets → oecd_get_dataset_info ' +
@@ -44,6 +45,7 @@ await createApp({
     (getServerConfig().dataframeDropEnabled
       ? 'oecd_dataframe_drop removes a staged table once the analysis no longer needs it.\n'
       : '') +
+    'The oecd-guide skill (skill://oecd-guide/SKILL.md) covers key construction, confirming which series a dataflow carries, and reading results without mixing breakdowns or aggregates.\n' +
     'All data is attributed to OECD per their terms of use.',
   setup(core) {
     getServerConfig();

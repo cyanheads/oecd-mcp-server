@@ -1,13 +1,13 @@
 <div align="center">
   <h1>@cyanheads/oecd-mcp-server</h1>
   <p><b>Search, explore, and query 1,500+ OECD statistical datasets (national accounts, employment, trade, education, health) from the OECD SDMX API via MCP. STDIO or Streamable HTTP.</b>
-  <div>8 Tools • 1 Resource</div>
+  <div>8 Tools • 1 Resource • 1 Skill</div>
   </p>
 </div>
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-0.5.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/oecd-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.3.1-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/oecd-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/oecd-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-0.5.0-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/oecd-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.4.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/@cyanheads/oecd-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/@cyanheads/oecd-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.4-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -53,6 +53,12 @@ Five discovery and data tools plus three DataCanvas tools for large query result
 | `oecd://dataflow/{agency_id}/{flow_id}` | Dimension metadata for a single OECD dataflow — same content as `oecd_get_dataset_info` |
 
 All resource data is also reachable via tools. Use `oecd_get_dataset_info` for the same content.
+
+### Skill
+
+| Skill | Description |
+|:------|:------------|
+| [`oecd-guide`](./skills/oecd-guide/SKILL.md) | Building SDMX keys, confirming which series a dataflow carries, and reading results without mixing breakdowns, units, or country aggregates. Served over MCP at `skill://oecd-guide/SKILL.md` |
 
 ## Capability reference
 
@@ -102,7 +108,7 @@ All resource data is also reachable via tools. Use `oecd_get_dataset_info` for t
 ### `oecd_dataframe_query` <sub>tool</sub>
 
 - `canvas_id` plus one read-only SQL `SELECT`; writes, DDL, and system-catalog access are rejected
-- Returns rows capped at the canvas row limit, with `row_count` reporting the full count
+- Returns rows capped at the canvas row limit, with `row_count` reporting the rows returned
 
 ---
 
@@ -128,7 +134,7 @@ OECD-specific:
 - Covers 1,500+ dataflows across 20+ OECD statistical departments (national accounts, employment, inflation, trade, education, health, environment, taxation, inequality)
 - Delegated dataflows and codelist revisions resolved end to end — a dataflow OECD catalogues on one service root but defines on another follows the catalog's own link for structure, codes, and observations, and codes come from the revision the datastructure names rather than the endpoint's current latest
 - `AllDimensions` observation mode — one-pass SDMX-JSON decoding into flat row objects, no nested series key reconstruction
-- `oecd_query_dataset` materializes large observation sets (multi-country time-series) on a DuckDB DataCanvas for in-conversation SQL analytics; the three `oecd_dataframe_*` tools work on it and need `CANVAS_PROVIDER_TYPE=duckdb`
+- `oecd_query_dataset` materializes large observation sets (multi-country time-series) on a DuckDB DataCanvas for in-conversation SQL analytics; the `oecd_dataframe_*` tools work on it; DataCanvas is on by default and `CANVAS_PROVIDER_TYPE=none` disables it
 
 Agent-friendly output:
 
@@ -138,155 +144,32 @@ Agent-friendly output:
 
 ## Getting started
 
-### Public Hosted Instance
-
-A public instance is available at `https://oecd.caseyjhand.com/mcp` — no installation required. It serves Streamable HTTP; each client takes its own config shape.
-
-For Claude Code:
+Connect to the hosted instance, no install:
 
 ```sh
 claude mcp add --transport http oecd-mcp-server https://oecd.caseyjhand.com/mcp
 ```
 
-For Cline (`cline_mcp_settings.json`):
+Or run it locally:
 
-```json
-{
-  "mcpServers": {
-    "oecd-mcp-server": {
-      "type": "streamableHttp",
-      "url": "https://oecd.caseyjhand.com/mcp"
-    }
-  }
-}
+```sh
+claude mcp add oecd-mcp-server -- npx -y @cyanheads/oecd-mcp-server
 ```
 
-For Cursor (`mcp.json`):
+For other clients, add this to the MCP config file:
 
 ```json
 {
   "mcpServers": {
     "oecd-mcp-server": {
-      "url": "https://oecd.caseyjhand.com/mcp"
-    }
-  }
-}
-```
-
-Claude Desktop adds remote servers under Settings → Connectors.
-
-### Self-Hosted / Local
-
-Add the following to your MCP client configuration file.
-
-```json
-{
-  "mcpServers": {
-    "oecd-mcp-server": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["@cyanheads/oecd-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
-    }
-  }
-}
-```
-
-Or with npx (no Bun required):
-
-```json
-{
-  "mcpServers": {
-    "oecd-mcp-server": {
-      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@cyanheads/oecd-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "MCP_LOG_LEVEL": "info"
-      }
+      "args": ["-y", "@cyanheads/oecd-mcp-server"]
     }
   }
 }
 ```
 
-Or with Docker:
-
-```json
-{
-  "mcpServers": {
-    "oecd-mcp-server": {
-      "type": "stdio",
-      "command": "docker",
-      "args": [
-        "run", "-i", "--rm",
-        "-e", "MCP_TRANSPORT_TYPE=stdio",
-        "ghcr.io/cyanheads/oecd-mcp-server:latest"
-      ]
-    }
-  }
-}
-```
-
-DataCanvas SQL analytics for large query results is on by default. To turn it off, add `CANVAS_PROVIDER_TYPE=none`:
-
-```json
-{
-  "mcpServers": {
-    "oecd-mcp-server": {
-      "type": "stdio",
-      "command": "bunx",
-      "args": ["@cyanheads/oecd-mcp-server@latest"],
-      "env": {
-        "MCP_TRANSPORT_TYPE": "stdio",
-        "CANVAS_PROVIDER_TYPE": "none"
-      }
-    }
-  }
-}
-```
-
-For Streamable HTTP, set the transport and start the server:
-
-```sh
-MCP_TRANSPORT_TYPE=http MCP_HTTP_PORT=3010 bun run start:http
-# Server listens at http://localhost:3010/mcp
-```
-
-### Prerequisites
-
-- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
-- No API key required — OECD SDMX is a free, public API.
-
-### Installation
-
-1. **Clone the repository:**
-
-```sh
-git clone https://github.com/cyanheads/oecd-mcp-server.git
-```
-
-2. **Navigate into the directory:**
-
-```sh
-cd oecd-mcp-server
-```
-
-3. **Install dependencies:**
-
-```sh
-bun install
-```
-
-4. **Configure environment:**
-
-```sh
-cp .env.example .env
-# edit .env — most vars are optional; no API key required
-```
+No API key is needed — OECD SDMX is a free, public API. DataCanvas SQL analytics over large query results is on by default; set `CANVAS_PROVIDER_TYPE=none` to get capped inline previews instead. For Docker or a source build, see [Running the server](#running-the-server).
 
 ## Configuration
 
@@ -313,6 +196,16 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Local development
 
+Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+
+- **Clone and install:**
+
+  ```sh
+  git clone https://github.com/cyanheads/oecd-mcp-server.git
+  cd oecd-mcp-server && bun install
+  cp .env.example .env   # optional — every variable has a default
+  ```
+
 - **Build and run:**
 
   ```sh
@@ -336,11 +229,10 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 ### Docker
 
 ```sh
-docker build -t oecd-mcp-server .
-docker run --rm -p 3010:3010 oecd-mcp-server
+docker run --rm -p 3010:3010 ghcr.io/cyanheads/oecd-mcp-server:latest
 ```
 
-The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/oecd-mcp-server`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
+The image defaults to HTTP transport, stateless session mode, and logs to `/var/log/oecd-mcp-server`. To run it over stdio from an MCP client, use `"command": "docker"` with `"args": ["run", "-i", "--rm", "-e", "MCP_TRANSPORT_TYPE=stdio", "ghcr.io/cyanheads/oecd-mcp-server:latest"]`. To build locally, `docker build -t oecd-mcp-server .`; OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
 
 ## Project structure
 
@@ -354,6 +246,7 @@ The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `
 | `src/services/oecd-structure/` | OECD SDMX structure service — dataflows, data structures, codelists. |
 | `src/services/oecd-data/` | OECD SDMX data service — observations, SDMX-JSON decoding, DataCanvas spillover. |
 | `src/services/canvas-accessor/` | DataCanvas accessor — registers and exposes the framework canvas instance to tools. |
+| `skills/` | Published agent skill (`oecd-guide`), served over MCP and shipped in the npm package and Docker image. |
 | `tests/` | Unit and integration tests mirroring `src/`. |
 
 ## Development guide
