@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-10-28
+
+Publishes the oecd-guide Agent Skill over MCP at skill://oecd-guide/SKILL.md and moves to mcp-ts-core 0.13.18, which stops per-request HTTP memory growth under Bun.
+
 ## [0.5.0](changelog/0.5.x/0.5.0.md) — 2026-10-24 · ⚠️ Breaking
 
 OECD query recovery and DataCanvas lifecycle
