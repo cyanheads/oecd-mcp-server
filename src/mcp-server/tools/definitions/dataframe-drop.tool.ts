@@ -16,7 +16,7 @@ const oecdDataframeDropDefinition = tool('oecd_dataframe_drop', {
     'Drop one table or view from a DataCanvas staged by oecd_query_dataset, freeing it once the ' +
     'analysis no longer needs it. The canvas and its other tables stay queryable. ' +
     'Call oecd_dataframe_describe first for the exact table names. ' +
-    'Only available when CANVAS_PROVIDER_TYPE=duckdb is set.',
+    'Unavailable when the server runs with DataCanvas disabled.',
   annotations: {
     readOnlyHint: false,
     destructiveHint: true,

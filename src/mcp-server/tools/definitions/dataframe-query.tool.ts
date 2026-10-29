@@ -18,7 +18,7 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
   description:
     'Run a read-only SQL SELECT against OECD observation tables staged on a DataCanvas by oecd_query_dataset. ' +
     'Call oecd_dataframe_describe first to discover exact table and column names, then use this tool for aggregation, filtering, GROUP BY, JOIN, and window functions. ' +
-    'Only available when CANVAS_PROVIDER_TYPE=duckdb is set.',
+    'Unavailable when the server runs with DataCanvas disabled.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -40,7 +40,7 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
     rows: z
       .array(z.record(z.string(), z.unknown()))
       .describe('Result rows from the SQL query (capped at the canvas row limit).'),
-    row_count: z.number().describe('Full result count before any row cap.'),
+    row_count: z.number().describe('Number of rows returned, after the canvas row cap.'),
     column_names: z.array(z.string()).describe('Column names in the result, in order.'),
   }),
   errors: [

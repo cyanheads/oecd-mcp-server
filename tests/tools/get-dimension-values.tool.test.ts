@@ -10,6 +10,7 @@ import {
   getEnrichment,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
+import MarkdownIt from 'markdown-it';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdGetDimensionValues } from '@/mcp-server/tools/definitions/get-dimension-values.tool.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
@@ -529,6 +530,36 @@ describe('oecdGetDimensionValues filtering', () => {
     // Distinct from the dimension-has-no-codelist notice.
     expect((result.structuredContent as { notice: string }).notice).not.toContain(
       'no fixed codelist',
+    );
+  });
+
+  it('escapes the caller query inside the notice so both surfaces read it as written', async () => {
+    stubLargeCodelist();
+
+    const query = '*rate* [x](y) #';
+    const result = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+      dimension_id: 'FREQ',
+      query,
+    });
+
+    // structuredContent carries the notice as authored Markdown, query escaped.
+    expect(result.structuredContent).toMatchObject({
+      code_count: 0,
+      effectiveQuery: query,
+      notice:
+        'No code in FREQ matches "\\*rate\\* \\[x\\](y) \\#". Try a shorter term, or omit query to page the full 1164-code list.',
+    });
+    // content[] carries that same string, and a CommonMark parse reads the query back verbatim.
+    const raw = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    expect(raw).toContain((result.structuredContent as { notice: string }).notice);
+    const rendered = new MarkdownIt()
+      .parse(raw, {})
+      .flatMap((token) => token.children ?? [token])
+      .map((token) => (token.type === 'text' || token.type === 'code_inline' ? token.content : ''))
+      .join('');
+    expect(rendered).toContain(
+      'No code in FREQ matches "*rate* [x](y) #". Try a shorter term, or omit query to page the full 1164-code list.',
     );
   });
 

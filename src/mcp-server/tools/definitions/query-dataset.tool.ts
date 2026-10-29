@@ -123,9 +123,10 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       ),
     canvas_id: CanvasIdSchema.optional().describe(
       'Canvas ID from a prior oecd_query_dataset call — exactly 10 characters of letters, digits, ' +
-        'hyphens, and underscores — to stage this result alongside that one. Omit to let the ' +
-        'server mint a canvas if this result needs one; a canvas_id comes back only when the ' +
-        'result was large enough to spill, never on a result that fits inline.',
+        'hyphens, and underscores — to stage this result alongside that one if it spills; a ' +
+        'result that fits inline comes back inline and leaves that canvas unchanged. Omit to let ' +
+        'the server mint a canvas if this result needs one; a canvas_id comes back only when the ' +
+        'result was large enough to spill.',
     ),
   }),
   output: z.object({
@@ -213,8 +214,9 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       code: JsonRpcErrorCode.NotFound,
       when: 'The dataflow exists but no observations matched the key and time range.',
       recovery:
-        'Broaden the key (use empty segments as wildcards), extend the time range, ' +
-        'or verify codes with oecd_get_dimension_values.',
+        'Broaden the key (use empty segments as wildcards) or extend the time range. A code ' +
+        'oecd_get_dimension_values lists may not occur in this dataflow: to see which series it ' +
+        'carries, leave the uncertain segments empty and request a single recent period.',
     },
     {
       reason: 'invalid_key',
@@ -398,9 +400,15 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       });
 
       if (result.spilled) {
-        ctx.enrich({
-          notice: `The full result is in table "${result.handle.tableName}" on canvas "${instance.canvasId}". Call oecd_dataframe_describe with this canvas_id to inspect columns, then oecd_dataframe_query with this canvas_id and SQL to query the full table.`,
-        });
+        /**
+         * A notice is authored Markdown, and the canvas_id can be the caller's.
+         * Both identifiers are code spans: neither can hold a backtick (canvas IDs
+         * are `[A-Za-z0-9_-]{10}`, generated table names `spilled_<hex>`), so the
+         * notice reads the same on both surfaces and copies without escapes.
+         */
+        ctx.enrich.notice(
+          `The full result is in table \`${result.handle.tableName}\` on canvas \`${instance.canvasId}\`. Call oecd_dataframe_describe with this canvas_id to inspect columns, then oecd_dataframe_query with this canvas_id and SQL to query the full table.`,
+        );
         return {
           rows: result.previewRows as OutputRow[],
           row_count: result.handle.rowCount,

@@ -13,7 +13,7 @@ export const oecdDataframeDescribe = tool('oecd_dataframe_describe', {
   description:
     'List tables and columns staged on a DataCanvas by a prior oecd_query_dataset spill. ' +
     'Call this before oecd_dataframe_query to discover exact table and column names for SQL. ' +
-    'Only available when CANVAS_PROVIDER_TYPE=duckdb is set.',
+    'Unavailable when the server runs with DataCanvas disabled.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,

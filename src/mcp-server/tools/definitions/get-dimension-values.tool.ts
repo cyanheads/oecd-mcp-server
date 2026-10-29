@@ -285,8 +285,9 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
     if (filter) ctx.enrich.echo(filter);
 
     if (filter && matched.length === 0) {
+      // A notice is authored Markdown — the caller's text inside it is escaped.
       ctx.enrich.notice(
-        `No code in ${input.dimension_id} matches "${filter}". ` +
+        `No code in ${escapeMarkdownInline(input.dimension_id)} matches "${escapeMarkdownInline(filter)}". ` +
           `Try a shorter term, or omit query to page the full ${codes.length}-code list.`,
       );
     } else if (page.length < matched.length) {
