@@ -95,7 +95,7 @@ All resource data is also reachable via tools. Use `oecd_get_dataset_info` for t
 - `flow_ref` plus a dot-delimited `key` (`+` for multiple values, empty segments as wildcards) and optional `start_period` / `end_period`
 - One row per observation with every dimension and attribute as its own column; `value` is pre-multiplied by `value_scale`
 - Large results spill to DataCanvas with `truncated: true`, `canvas_id`, and `table_name`; without a canvas every row stays in `structuredContent` and only the rendered table is capped (`content_table_capped`)
-- A spill includes a `notice` naming the canvas and table: inspect columns with `oecd_dataframe_describe`, then use `oecd_dataframe_query` for SQL over the full result. Fitting results allocate no new canvas; an explicit `canvas_id` is still validated.
+- A spill includes a `notice` naming the canvas and table: inspect columns with `oecd_dataframe_describe`, then use `oecd_dataframe_query` for SQL over the full result. Fitting results allocate no new canvas; an explicit `canvas_id` is checked before the download, so a stale one fails as `canvas_not_found` without spending an OECD request.
 
 ---
 
@@ -108,7 +108,9 @@ All resource data is also reachable via tools. Use `oecd_get_dataset_info` for t
 ### `oecd_dataframe_query` <sub>tool</sub>
 
 - `canvas_id` plus one read-only SQL `SELECT`; writes, DDL, and system-catalog access are rejected
-- Returns rows capped at the canvas row limit, with `row_count` reporting the rows returned
+- `limit` (default 100) returns up to 1,000 rows per call, within 1 MiB of row data; a `limit` from 1,001 to 10,000 is served at 1,000 with a notice
+- `truncated: true` marks a result with more rows than it returned, and its `notice` names how to reach the rest; `row_count` counts the rows returned
+- A query still running after 30 seconds is stopped with `query_timeout`
 
 ---
 

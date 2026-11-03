@@ -4,7 +4,7 @@ description: Build SDMX keys, confirm which series an OECD dataflow actually car
 license: Apache-2.0
 metadata:
   author: cyanheads
-  version: "1.0"
+  version: "1.1"
 ---
 
 ## Scope
@@ -36,7 +36,7 @@ Flows whose refs share a `dsd_id` normally share a key layout. A key built for `
 
 **Wildcarding the country segment includes aggregates.** Rows for G7, G20, OECD, OECD Europe, Euro area, European Union, and USMCA come back beside the countries. Exclude them before you average countries, or use the aggregate row itself.
 
-**Rows carry labels, not codes.** Every dimension column holds its label: `REF_AREA` is `United States`, not `USA`. A SQL filter on a code silently matches zero rows. Copy label strings from a returned row, since some are unexpected (`China (People’s Republic of)`, `Türkiye`, `Korea`). To turn a label back into a key code, search for it with `oecd_get_dimension_values`.
+**Rows carry labels, not codes.** Every dimension column holds its label: `REF_AREA` is `United States`, not `USA`. A SQL filter on a code silently matches zero rows. Copy label strings from a returned row, since some are unexpected (`China (People’s Republic of)`, `Türkiye`, `Korea`). To turn a label back into a key code, search for it with `oecd_get_dimension_values`. Regional labels repeat across countries (`Amazonas` in Brazil and Peru, `North West` in Bulgaria, Romania, and South Africa), so in a regional flow group, partition, and join on `COUNTRY` together with `REF_AREA`; on `REF_AREA` alone, different regions merge into one.
 
 **`invalid_key` means the key itself is malformed:** too few segments (`expecting 13 got 5`) or a character SDMX doesn't allow. Extra trailing empty segments are ignored, and an extra non-empty one comes back as `no_results`. A misspelled or unavailable code (`US` for `USA`) also comes back as `no_results`. When you get `no_results`, probe as above. Re-reading the codelist can't tell you what the flow holds.
 
@@ -46,7 +46,7 @@ Flows whose refs share a `dsd_id` normally share a key layout. A key built for `
 
 **A spilled preview is not the result.** When `truncated` is true, `rows` holds only the leading rows. In a seven-country pull, the 145-row preview held four countries, two of them only partly, and none of the other three. Compute only in SQL against the staged table.
 
-**SQL output is capped.** `oecd_dataframe_query` returns at most 10,000 rows by default. Its `row_count` reports the capped count, not the full one, and there is no truncation flag. The text rendering shows the first 50 rows. Aggregate in SQL, or run `COUNT(*)` when the total matters.
+**SQL output is capped.** `oecd_dataframe_query` returns up to `limit` rows: 100 by default and at most 1,000 per call, within 1 MiB of row data. `row_count` counts the rows returned, not the result. `truncated: true` means the result has more rows than came back, and its notice names the ways to the rest: aggregate in SQL, page with `ORDER BY … LIMIT … OFFSET`, select fewer or narrower columns when the 1 MiB budget cut it, or raise `limit` when it is below 1,000. Run `COUNT(*)` when the total matters. A query still running after 30 seconds is stopped with `query_timeout`; filter rows, select fewer columns, or aggregate so it finishes sooner.
 
 **Data downloads are rationed.** OECD allows 60 data downloads per hour per client. The server is the client OECD sees, so on a shared deployment every caller draws on the same budget. Put several countries in one key segment (`CAN+FRA+DEU+ITA+JPN+GBR+USA`) and make one call, not one per country. Probe with a single period. Space calls a few seconds apart: a burst of back-to-back calls, structure lookups included, can return `rate_limited`. `download_limit` clears only when you request less: fewer codes or a shorter range. `rate_limited` clears if you wait.
 
@@ -66,4 +66,4 @@ Flows whose refs share a `dsd_id` normally share a key layout. A key built for `
 
 **Finding the flow that holds X.** Search with OECD's terms, drop flows with `non_production` true, then compare names. When two flows share a `dsd_id`, probe the one whose name matches the country set you need, and read its area list: a flow named for OECD countries can also carry partner economies and the G20.
 
-**Large pulls and SQL.** Results too large to return inline are staged as a DataCanvas table, and the response carries a `canvas_id`. Call `oecd_dataframe_describe` with it for the staged table and column names before writing SQL, then `oecd_dataframe_query` with a read-only query. Pass the same `canvas_id` back to stage further results beside the first. Only a result that spills is staged: one that fits inline comes back inline, and the canvas is unchanged. The tables expire with the canvas. Every column is VARCHAR except `value` and `value_scale`, which are DOUBLE. Tables from different flows on one canvas join on label columns such as `REF_AREA`. If a call returns `canvas_not_found`, re-run the query; on `oecd_query_dataset`, drop the stale `canvas_id` argument, or the retry fails the same way.
+**Large pulls and SQL.** Results too large to return inline are staged as a DataCanvas table, and the response carries a `canvas_id`. Call `oecd_dataframe_describe` with it for the staged table and column names before writing SQL, then `oecd_dataframe_query` with a read-only query. Pass the same `canvas_id` back to stage further results beside the first. Only a result that spills is staged: one that fits inline comes back inline, and the canvas is unchanged. The tables expire with the canvas. Every column is VARCHAR except `value` and `value_scale`, which are DOUBLE. Tables from different flows on one canvas join on label columns such as `REF_AREA`. `canvas_not_found` means the id was mistyped or the canvas expired, taking its tables with it; `oecd_query_dataset` checks the id before downloading, so that failure spends no download. Re-run without the stale `canvas_id`: a result that spills returns a fresh one, and each table you need beside it is re-staged by re-running its query with the new id.
