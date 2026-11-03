@@ -4,8 +4,13 @@
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { CanvasIdSchema, type ColumnSchema, spillover } from '@cyanheads/mcp-ts-core/canvas';
-import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import {
+  CanvasIdSchema,
+  type CanvasInstance,
+  type ColumnSchema,
+  spillover,
+} from '@cyanheads/mcp-ts-core/canvas';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 import { getDataService, invalidQueryText } from '@/services/oecd-data/oecd-data-service.js';
@@ -253,6 +258,13 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
         'start_period / end_period span — because waiting will not clear this limit.',
     },
     {
+      reason: 'canvas_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'The canvas_id has expired or was never created. It is checked before anything is fetched from OECD.',
+      recovery:
+        'Check the canvas_id was copied exactly, or retry without it; a result that spills comes back with a fresh canvas_id. An expired canvas takes its tables with it, so re-run the queries that staged them, passing the new canvas_id.',
+    },
+    {
       reason: 'upstream_timeout',
       code: JsonRpcErrorCode.Timeout,
       retryable: true,
@@ -296,6 +308,33 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
         'invalid_flow_ref',
         `flow_ref "${input.flow_ref}" is not in the expected {agencyID},{dsd_id}@{df_id} or {agencyID},{df_id} format`,
       );
+    }
+
+    /**
+     * Resolve a caller's canvas before the download, so a stale or mistyped id
+     * fails without spending an OECD download. Resolving an existing id mints
+     * nothing, and the instance is reused if the result spills. The re-raise is
+     * what puts this tool's recovery on the wire: the framework's own hint on
+     * the acquire failure would otherwise win, and it points back at this same
+     * call. No fallback to a fresh canvas — the caller passed the id to keep
+     * tables together for a join.
+     */
+    const canvas = getCanvas();
+    let callerCanvas: CanvasInstance | undefined;
+    if (canvas && input.canvas_id !== undefined) {
+      try {
+        callerCanvas = await canvas.acquire(input.canvas_id, ctx);
+      } catch (err) {
+        if (err instanceof McpError && err.data?.reason === 'canvas_not_found') {
+          throw ctx.fail(
+            'canvas_not_found',
+            `Canvas "${input.canvas_id}" not found or expired`,
+            undefined,
+            { cause: err },
+          );
+        }
+        throw err;
+      }
     }
 
     ctx.log.info('Querying OECD dataset', {
@@ -368,10 +407,9 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     const inlineRows = dataResult.rows as OutputRow[];
     const shown = previewRowCount(inlineRows);
 
-    // Explicit IDs must still be validated when the result fits inline.
-    const canvas = getCanvas();
-    if (canvas && (input.canvas_id !== undefined || shown < inlineRows.length)) {
-      const instance = await canvas.acquire(input.canvas_id, ctx);
+    // Only a result that spills needs a canvas, so an omitted id mints one only here.
+    if (canvas && shown < inlineRows.length) {
+      const instance = callerCanvas ?? (await canvas.acquire(undefined, ctx));
       /**
        * Declare the schema rather than letting the provider sniff it. Attribute
        * columns are sparse — one that resolves on no row inside the sniff window

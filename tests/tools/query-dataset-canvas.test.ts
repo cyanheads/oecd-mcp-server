@@ -12,6 +12,7 @@ import {
   DEFAULT_CANVAS_REGISTRY_OPTIONS,
   DuckdbProvider,
 } from '@cyanheads/mcp-ts-core/canvas';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   createFetchMock,
   createMockContext,
@@ -24,6 +25,7 @@ import { oecdDataframeQuery } from '@/mcp-server/tools/definitions/dataframe-que
 import { oecdQueryDataset } from '@/mcp-server/tools/definitions/query-dataset.tool.js';
 import { setCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 import { initDataService } from '@/services/oecd-data/oecd-data-service.js';
+import { declaredRecovery } from '../helpers/error-contract.js';
 
 const input = { flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I', key: 'A.USA..' };
 const ctx = createMockContext({ tenantId: 'default', errors: oecdQueryDataset.errors });
@@ -55,7 +57,11 @@ function respond(large = false): void {
     },
   };
   http.reset();
-  http.route({ match: /^https:\/\/fake.oecd.test\/data\//, respond: () => Response.json(payload) });
+  http.route(
+    { match: /^https:\/\/fake.oecd.test\/data\//, respond: () => Response.json(payload) },
+    // Matches everything else, so `http.calls` counts every request issued, not only data ones.
+    { match: () => true, respond: () => Promise.reject(new Error('unmocked fetch')) },
+  );
 }
 
 function textOf(output: Awaited<ReturnType<typeof runToolContract>>): string {
@@ -137,23 +143,69 @@ describe('query dataset real canvas lifecycle', () => {
     expect(canvas.countForTenant(ctx)).toBe(2);
   });
 
-  it('still rejects malformed, unknown and expired explicit IDs for inline rows', async () => {
+  it('rejects a malformed canvas_id at argument validation, before any OECD request', async () => {
     const malformed = await runToolContract(oecdQueryDataset, { ...input, canvas_id: 'x' });
     expect(malformed.isError).toBe(true);
-    expect(textOf(malformed)).toContain('canvas_id');
-    const unknown = await runToolContract(oecdQueryDataset, { ...input, canvas_id: 'unknown001' });
-    expect(unknown.structuredContent).toMatchObject({
-      error: { data: { reason: 'canvas_not_found' } },
+    expect(malformed.structuredContent).toMatchObject({
+      error: { code: JsonRpcErrorCode.InvalidParams, data: { reason: 'invalid_arguments' } },
     });
+    expect(textOf(malformed)).toContain('canvas_id');
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it.each(['unknown', 'expired'] as const)(
+    'fails an %s canvas_id as canvas_not_found before any OECD request, with its own recovery',
+    async (kind) => {
+      let canvasId = 'unknown001';
+      if (kind === 'expired') {
+        canvasId = (await canvas.acquire(undefined, ctx)).canvasId;
+        now += DEFAULT_CANVAS_REGISTRY_OPTIONS.ttlMs + 1;
+      }
+      const output = await runToolContract(oecdQueryDataset, { ...input, canvas_id: canvasId });
+      expect(http.calls).toHaveLength(0);
+      expect(output.isError).toBe(true);
+      const hint = declaredRecovery(oecdQueryDataset, 'canvas_not_found');
+      expect(output.structuredContent).toMatchObject({
+        error: {
+          code: JsonRpcErrorCode.NotFound,
+          message: expect.stringContaining(canvasId),
+          data: { reason: 'canvas_not_found', recovery: { hint } },
+        },
+      });
+      const text = textOf(output);
+      expect(text).toContain(canvasId);
+      expect(text).toContain(hint);
+    },
+  );
+
+  it('ignores an explicit canvas_id when DataCanvas is disabled and returns the result inline', async () => {
+    setCanvas(undefined);
+    const output = await runToolContract(oecdQueryDataset, { ...input, canvas_id: 'unknown001' });
+    expect(output.isError).toBeUndefined();
+    expect(output.structuredContent).toMatchObject({ row_count: 3 });
+    expect(output.structuredContent).not.toHaveProperty('canvas_id');
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it('stages a spill on an explicit canvas beside its tables, even with the pool full', async () => {
     const existing = await canvas.acquire(undefined, ctx);
-    now += DEFAULT_CANVAS_REGISTRY_OPTIONS.ttlMs + 1;
-    const expired = await runToolContract(oecdQueryDataset, {
+    await existing.registerTable('keep', [{ value: 17 }], {
+      schema: [{ name: 'value', type: 'DOUBLE' }],
+    });
+    await canvas.acquire(undefined, ctx);
+    respond(true);
+    const output = await runToolContract(oecdQueryDataset, {
       ...input,
       canvas_id: existing.canvasId,
     });
-    expect(expired.structuredContent).toMatchObject({
-      error: { data: { reason: 'canvas_not_found' } },
-    });
+    expect(output.isError).toBeUndefined();
+    const result = output.structuredContent as { table_name: string };
+    expect(result).toMatchObject({ canvas_id: existing.canvasId, row_count: 3, truncated: true });
+    expect(canvas.countForTenant(ctx)).toBe(2);
+    expect((await existing.describe()).map((table) => table.name).sort()).toEqual(
+      ['keep', result.table_name].sort(),
+    );
+    expect(http.calls).toHaveLength(1);
   });
 
   it.each([
