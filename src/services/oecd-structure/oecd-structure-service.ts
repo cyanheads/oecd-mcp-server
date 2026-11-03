@@ -13,7 +13,7 @@ import {
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { externalServiceRootOf } from '@/services/oecd-http/external-service-root.js';
-import { fetchOecd } from '@/services/oecd-http/oecd-http.js';
+import { fetchOecd, readJsonBody } from '@/services/oecd-http/oecd-http.js';
 import type {
   OecdCode,
   OecdDataflow,
@@ -101,7 +101,7 @@ async function fetchJson(url: string, signal?: AbortSignal): Promise<unknown> {
     operation: 'oecdStructureFetch',
     ...(signal ? { signal } : {}),
   });
-  return res.json() as Promise<unknown>;
+  return readJsonBody(res);
 }
 
 /**
@@ -146,6 +146,8 @@ function swallowNotFound(err: unknown): undefined {
  * resolve a delegation without depending on structure-service initialization.
  * A failed lookup resolves to undefined: this runs only when the caller already
  * holds a real error to report, and a second failure must not replace the first.
+ * The caller's own abort is the exception — it is the outcome now, and the
+ * error held from before it would report a call nobody is waiting on.
  *
  * One attempt, deliberately unretried. The caller reaches here holding a
  * failure it wants settled faster than a retry loop would settle it, so
@@ -164,7 +166,10 @@ export async function fetchExternalServiceRoot(
   const payload = await fetchJson(
     `${baseUrl}/dataflow/${parts.agencyId}/${dataflowIdOf(parts)}`,
     signal,
-  ).catch(() => undefined);
+  ).catch((err: unknown) => {
+    if (signal?.aborted) throw err;
+    return;
+  });
 
   return payload === undefined ? undefined : externalServiceRootOf(payload, baseUrl);
 }
@@ -400,8 +405,10 @@ export class OecdStructureService {
    * dimension, so the names live one request away in the concept scheme. A
    * scheme that fails to fetch, or one that omits a concept, leaves the
    * dimension on its id. A missing label is a tolerable gap; failing the whole
-   * dataset-info call over one is not. A datastructure whose dimensions carry
-   * no parseable `conceptIdentity` issues no request at all.
+   * dataset-info call over one is not. The caller's own abort is not a scheme
+   * failing to fetch: it ends the call as the cancellation it is, rather than
+   * returning a structure nobody is waiting for. A datastructure whose
+   * dimensions carry no parseable `conceptIdentity` issues no request at all.
    */
   private async applyConceptNames(
     structure: OecdDataStructure,
@@ -423,7 +430,10 @@ export class OecdStructureService {
                 signal,
                 structure.serviceRoot,
                 ref.version,
-              ).catch(() => new Map<string, string>()),
+              ).catch((err: unknown) => {
+                if (signal?.aborted) throw err;
+                return new Map<string, string>();
+              }),
             ] as const,
         ),
       ),

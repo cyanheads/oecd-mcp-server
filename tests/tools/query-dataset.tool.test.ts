@@ -14,9 +14,12 @@ import {
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { getServerConfig } from '@/config/server-config.js';
 import { oecdQueryDataset } from '@/mcp-server/tools/definitions/query-dataset.tool.js';
 import { setCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 import { initDataService } from '@/services/oecd-data/oecd-data-service.js';
+import { type BodyStub, type StubAnswer, startBodyStub } from '../helpers/body-stub.js';
+import { declaredRecovery } from '../helpers/error-contract.js';
 
 const FAKE_BASE = 'https://fake.oecd.test';
 const FLOW_REF = 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I';
@@ -592,6 +595,69 @@ describe('oecdQueryDataset', () => {
     expect(failure.reason).toBe('upstream_unavailable');
     expect(failure.hint).toContain('Retry after a short pause');
   }, 15_000);
+
+  /**
+   * A body that starts arriving and then fails, over a real socket — a fetch
+   * fake hands back a finished `Response`, so the deadline over the body would
+   * never run. The classification itself is tabled at the service; these prove
+   * the tool carries it to the declared reason.
+   */
+  describe('a response body that does not arrive whole', () => {
+    let answer: StubAnswer;
+    let stub: BodyStub;
+    let configured: { baseUrl: string; timeoutMs: number };
+
+    beforeEach(async () => {
+      http.restore();
+      stub = await startBodyStub(() => answer);
+      const config = getServerConfig();
+      configured = { baseUrl: config.baseUrl, timeoutMs: config.timeoutMs };
+      Object.assign(config, { baseUrl: stub.origin, timeoutMs: 300 });
+      initDataService();
+    });
+
+    afterEach(async () => {
+      Object.assign(getServerConfig(), configured);
+      await stub.close();
+    });
+
+    it('maps a body that outlasts the deadline to upstream_timeout after one request', async () => {
+      answer = { kind: 'stalled-body' };
+
+      const output = await runToolContract(oecdQueryDataset, {
+        flow_ref: FLOW_REF,
+        key: 'A.USA..',
+      });
+      const hint = declaredRecovery(oecdQueryDataset, 'upstream_timeout');
+
+      expect(stub.requests).toHaveLength(1);
+      expect(stub.requests[0]?.bodyStarted).toBe(true);
+      expect(output.isError).toBe(true);
+      expect((output.structuredContent as { error: unknown }).error).toMatchObject({
+        code: JsonRpcErrorCode.Timeout,
+        data: { reason: 'upstream_timeout', recovery: { hint }, retryable: true },
+      });
+      expect(textOf(output.content)).toContain(hint);
+      expect(textOf(output.content)).toContain('(reason upstream_timeout · retryable)');
+    });
+
+    it('maps a connection dropped mid-body to upstream_unavailable once the retries run out', async () => {
+      answer = { kind: 'dropped-body' };
+
+      const output = await runToolContract(oecdQueryDataset, {
+        flow_ref: FLOW_REF,
+        key: 'A.USA..',
+      });
+      const hint = declaredRecovery(oecdQueryDataset, 'upstream_unavailable');
+
+      expect(stub.requests).toHaveLength(3);
+      expect((output.structuredContent as { error: unknown }).error).toMatchObject({
+        code: JsonRpcErrorCode.ServiceUnavailable,
+        data: { reason: 'upstream_unavailable', recovery: { hint } },
+      });
+      expect(textOf(output.content)).toContain(hint);
+    }, 15_000);
+  });
 
   it('names a status it does not model upstream_error rather than passing the code bare', async () => {
     respond('Forbidden', { status: 403 });

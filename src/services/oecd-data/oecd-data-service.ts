@@ -7,13 +7,12 @@ import {
   JsonRpcErrorCode,
   McpError,
   notFound,
-  serializationError,
   serviceUnavailable,
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
-import { fetchOecd, upstreamStatus } from '@/services/oecd-http/oecd-http.js';
+import { fetchOecd, readJsonBody, upstreamStatus } from '@/services/oecd-http/oecd-http.js';
 import {
   fetchExternalServiceRoot,
   parseFlowRef,
@@ -83,6 +82,23 @@ const HANDLED_STATUSES = [
   500,
 ];
 
+/**
+ * Withhold the retry from a deadline that fired while the body was arriving.
+ *
+ * By then OECD has answered — the headers are in and the observations are
+ * streaming — and the answer is larger than `OECD_TIMEOUT_MS` lets through.
+ * Repeating the request repeats that download from the start: another of the
+ * data downloads OECD allows each hour, and most likely another full timeout,
+ * twice over before the caller hears anything. One request, then
+ * `upstream_timeout`, whose recovery is to ask for less. A deadline that fires
+ * before the headers says nothing about the size of the answer and keeps its
+ * retries.
+ */
+function unretriedBodyTimeout(err: unknown): unknown {
+  if (!(err instanceof McpError) || err.code !== JsonRpcErrorCode.Timeout) return err;
+  return new McpError(err.code, err.message, { ...err.data, retryable: false }, { cause: err });
+}
+
 /** Fetch and parse one observations response. */
 async function fetchDataJson(url: string, signal?: AbortSignal): Promise<unknown> {
   const res = await fetchOecd(url, {
@@ -91,14 +107,8 @@ async function fetchDataJson(url: string, signal?: AbortSignal): Promise<unknown
     operation: 'oecdDataFetch',
     ...(signal ? { signal } : {}),
   });
-  return res.json().catch((err: unknown) => {
-    throw serializationError(
-      'OECD data API returned a body that is not SDMX-JSON',
-      {},
-      {
-        cause: err,
-      },
-    );
+  return readJsonBody(res).catch((err: unknown) => {
+    throw unretriedBodyTimeout(err);
   });
 }
 
@@ -122,8 +132,10 @@ function loadObservations(url: string, signal?: AbortSignal, maxRetries = 2): Pr
  * OECD answers a wrong-arity key and an unparseable period with a 4xx whose
  * plain-text body names the mistake; that text is the whole value of the
  * response, so it rides through on the message and on `data.body`. Everything
- * else keeps the classification `fetchOecd` produced — a retried-and-exhausted
- * 503 stays `ServiceUnavailable`, a caller abort stays an abort.
+ * else keeps the classification the request produced — a retried-and-exhausted
+ * 503 stays `ServiceUnavailable`, a caller abort stays an abort — and a failure
+ * that carries none, such as a connection dropped while the body was arriving,
+ * is the outage it looks like.
  */
 function dataFetchFailure(err: unknown, flowRef: string): McpError {
   const upstream = upstreamStatus(err);
@@ -212,9 +224,11 @@ function mayLiveElsewhere(err: unknown): boolean {
  * classification, so such a failure surfaces on the first attempt rather than
  * after two backoffs. It is withheld, not spent: a 500 the lookup does not
  * explain is a genuine fault and gets its remaining attempts afterwards. A 429,
- * a 503, or a timeout is never held back — none of them says anything about
- * where a dataflow lives, so the lookup has nothing cheaper to offer and the
- * ordinary budget is what clears them.
+ * a 503, or a timeout before the headers is never held back — none of them says
+ * anything about where a dataflow lives, so the lookup has nothing cheaper to
+ * offer and the ordinary budget is what clears them. A timeout while the body
+ * is arriving gets no retries at any root; {@link fetchDataJson} has already
+ * opted it out.
  */
 function probeConfiguredRoot(url: string, signal?: AbortSignal): Promise<unknown> {
   return withRetry(

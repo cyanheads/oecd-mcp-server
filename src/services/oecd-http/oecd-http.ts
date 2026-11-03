@@ -1,13 +1,18 @@
 /**
  * @fileoverview Shared HTTP boundary for the OECD SDMX endpoints — one fetch
- * path for the structure and data services, carrying the retry-classification
- * corrections both of them need, the rule that holds every request to the
- * configured host, and the readers that turn a terminal failure into the
- * upstream reason every definition declares for it.
+ * path and one body reader for the structure and data services, carrying the
+ * retry-classification corrections both of them need, the rule that holds every
+ * request to the configured host, and the readers that turn a terminal failure
+ * into the upstream reason every definition declares for it.
  * @module services/oecd-http/oecd-http
  */
 
-import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import {
+  JsonRpcErrorCode,
+  McpError,
+  serializationError,
+  serviceUnavailable,
+} from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, requestContextService } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 
@@ -178,6 +183,24 @@ export function retryableUpstreamFailure(err: unknown): unknown {
 }
 
 /**
+ * Restate a cancellation the caller never asked for as the transient fault it
+ * is, or return undefined when the failure was something else.
+ *
+ * `fetchWithTimeout` reports an `AbortError` raised while neither its deadline
+ * nor the caller's signal has fired as `RequestCancelled`
+ * (cyanheads/mcp-ts-core#799) — a code `withRetry` never retries and every
+ * definition here bubbles as the caller's own abort. With the caller's signal
+ * still live, nobody withdrew the request: the runtime dropped it, which is the
+ * same fault as a reset connection, and `ServiceUnavailable` puts it on the
+ * retry path a reset takes.
+ */
+function unrequestedCancellation(err: unknown, signal?: AbortSignal): McpError | undefined {
+  if (!(err instanceof McpError) || err.code !== JsonRpcErrorCode.RequestCancelled) return;
+  if (signal?.aborted) return;
+  return serviceUnavailable(err.message, {}, { cause: err });
+}
+
+/**
  * Call one OECD endpoint.
  *
  * `fetchWithTimeout` maps the HTTP status onto the error code and captures the
@@ -225,8 +248,34 @@ export function fetchOecd(url: string, options: OecdFetchOptions): Promise<Respo
       ...(options.signal ? { signal: options.signal } : {}),
     },
   ).catch((err: unknown) => {
-    throw refusedRedirect(err, url) ?? retryableUpstreamFailure(err);
+    throw (
+      refusedRedirect(err, url) ??
+      unrequestedCancellation(err, options.signal) ??
+      retryableUpstreamFailure(err)
+    );
   });
+}
+
+/**
+ * Read a response body to the end, then decode it as JSON.
+ *
+ * Two steps because they fail for different reasons. {@link fetchOecd}'s
+ * deadline covers the body as well as the headers, so the read rejects with the
+ * classification `fetchWithTimeout` gave the failure — `Timeout` when the
+ * deadline fires mid-body, `RequestCancelled` when the caller aborts, the
+ * runtime's own error when the connection drops — and it keeps that
+ * classification here, so the retry loop and the tool boundary treat it as they
+ * would the same failure before the headers. Only a body that arrived whole and
+ * is not JSON becomes `SerializationError`: a retry would fetch the same bytes,
+ * and the fault is in what OECD sent, not in whether it was reachable.
+ */
+export async function readJsonBody(res: Response): Promise<unknown> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    throw serializationError('OECD answered with a body that is not JSON', {}, { cause: err });
+  }
 }
 
 /**

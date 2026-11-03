@@ -99,12 +99,12 @@ describe('oecdGetDimensionValues', () => {
         .mockResolvedValueOnce({
           ok: true,
           json: () => Promise.resolve(DSD_RESPONSE),
-          text: () => Promise.resolve(''),
+          text: () => Promise.resolve(JSON.stringify(DSD_RESPONSE)),
         })
         .mockResolvedValueOnce({
           ok: true,
           json: () => Promise.resolve(CODELIST_RESPONSE),
-          text: () => Promise.resolve(''),
+          text: () => Promise.resolve(JSON.stringify(CODELIST_RESPONSE)),
         }),
     );
 
@@ -130,7 +130,7 @@ describe('oecdGetDimensionValues', () => {
       vi.fn().mockResolvedValueOnce({
         ok: true,
         json: () => Promise.resolve(DSD_RESPONSE),
-        text: () => Promise.resolve(''),
+        text: () => Promise.resolve(JSON.stringify(DSD_RESPONSE)),
       }),
     );
 
@@ -157,12 +157,12 @@ describe('oecdGetDimensionValues', () => {
         .mockResolvedValueOnce({
           ok: true,
           json: () => Promise.resolve(DSD_RESPONSE),
-          text: () => Promise.resolve(''),
+          text: () => Promise.resolve(JSON.stringify(DSD_RESPONSE)),
         })
         .mockResolvedValueOnce({
           ok: true,
           json: () => Promise.resolve(CODELIST_RESPONSE),
-          text: () => Promise.resolve(''),
+          text: () => Promise.resolve(JSON.stringify(CODELIST_RESPONSE)),
         }),
     );
 
@@ -268,7 +268,7 @@ describe('oecdGetDimensionValues', () => {
       vi.fn().mockResolvedValueOnce({
         ok: true,
         json: () => Promise.resolve(DSD_RESPONSE),
-        text: () => Promise.resolve(''),
+        text: () => Promise.resolve(JSON.stringify(DSD_RESPONSE)),
       }),
     );
     const ctx = createMockContext({ errors: oecdGetDimensionValues.errors });
@@ -377,7 +377,7 @@ describe('oecdGetDimensionValues', () => {
       vi.fn().mockResolvedValueOnce({
         ok: true,
         json: () => Promise.resolve(DSD_RESPONSE),
-        text: () => Promise.resolve(''),
+        text: () => Promise.resolve(JSON.stringify(DSD_RESPONSE)),
       }),
     );
 
@@ -427,12 +427,12 @@ function stubLargeCodelist() {
       .mockResolvedValueOnce({
         ok: true,
         json: () => Promise.resolve(DSD_RESPONSE),
-        text: () => Promise.resolve(''),
+        text: () => Promise.resolve(JSON.stringify(DSD_RESPONSE)),
       })
       .mockResolvedValue({
         ok: true,
         json: () => Promise.resolve(LARGE_CODELIST_RESPONSE),
-        text: () => Promise.resolve(''),
+        text: () => Promise.resolve(JSON.stringify(LARGE_CODELIST_RESPONSE)),
       }),
   );
 }
@@ -621,12 +621,12 @@ describe('oecdGetDimensionValues filtering', () => {
         .mockResolvedValueOnce({
           ok: true,
           json: () => Promise.resolve(DSD_RESPONSE),
-          text: () => Promise.resolve(''),
+          text: () => Promise.resolve(JSON.stringify(DSD_RESPONSE)),
         })
         .mockResolvedValueOnce({
           ok: true,
           json: () => Promise.resolve(CODELIST_RESPONSE),
-          text: () => Promise.resolve(''),
+          text: () => Promise.resolve(JSON.stringify(CODELIST_RESPONSE)),
         }),
     );
 

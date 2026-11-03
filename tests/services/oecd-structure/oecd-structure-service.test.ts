@@ -6,6 +6,7 @@
 import { JsonRpcErrorCode, McpError, notFound } from '@cyanheads/mcp-ts-core/errors';
 import { createFetchMock } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getServerConfig } from '@/config/server-config.js';
 import {
   directorateCode,
   fetchExternalServiceRoot,
@@ -15,6 +16,10 @@ import {
   OecdStructureService,
   parseFlowRef,
 } from '@/services/oecd-structure/oecd-structure-service.js';
+import { type BodyStub, onResponseHeaders, startBodyStub } from '../../helpers/body-stub.js';
+
+/** The runtime's own `fetch`, held before any suite replaces it. */
+const realFetch = globalThis.fetch;
 
 // ── parseFlowRef ──────────────────────────────────────────────────────────────
 
@@ -180,10 +185,7 @@ describe('OecdStructureService.fetchDataflows', () => {
   it('returns parsed dataflows on success', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve(MOCK_DATAFLOWS_RESPONSE),
-      }),
+      vi.fn(() => Promise.resolve(Response.json(MOCK_DATAFLOWS_RESPONSE))),
     );
 
     // Re-init with a fake base URL so config isn't needed
@@ -467,10 +469,7 @@ describe('OecdStructureService.fetchDataStructure', () => {
   it('returns parsed dimensions and time dimension', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve(MOCK_DATASTRUCTURE_RESPONSE),
-      }),
+      vi.fn(() => Promise.resolve(Response.json(MOCK_DATASTRUCTURE_RESPONSE))),
     );
 
     const svc = new OecdStructureService('https://fake.oecd.test');
@@ -492,10 +491,9 @@ describe('OecdStructureService.fetchDataStructure', () => {
   it('carries no version for an enumeration URN that names none', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: () =>
-          Promise.resolve({
+      vi.fn(() =>
+        Promise.resolve(
+          Response.json({
             data: {
               dataStructures: [
                 {
@@ -518,7 +516,8 @@ describe('OecdStructureService.fetchDataStructure', () => {
               ],
             },
           }),
-      }),
+        ),
+      ),
     );
 
     const svc = new OecdStructureService('https://fake.oecd.test');
@@ -535,10 +534,9 @@ describe('OecdStructureService.fetchDataStructure', () => {
     // Anything outside the SDMX shape is left unpinned rather than addressed.
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: () =>
-          Promise.resolve({
+      vi.fn(() =>
+        Promise.resolve(
+          Response.json({
             data: {
               dataStructures: [
                 {
@@ -561,7 +559,8 @@ describe('OecdStructureService.fetchDataStructure', () => {
               ],
             },
           }),
-      }),
+        ),
+      ),
     );
 
     const svc = new OecdStructureService('https://fake.oecd.test');
@@ -573,10 +572,7 @@ describe('OecdStructureService.fetchDataStructure', () => {
   it('throws when dataStructures array is empty', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve({ data: { dataStructures: [] } }),
-      }),
+      vi.fn(() => Promise.resolve(Response.json({ data: { dataStructures: [] } }))),
     );
 
     const svc = new OecdStructureService('https://fake.oecd.test');
@@ -1167,6 +1163,171 @@ describe('fetchExternalServiceRoot', () => {
   });
 });
 
+// ── The response body ─────────────────────────────────────────────────────────
+
+/**
+ * Failures before the body and while it arrives, over a real socket — a fetch
+ * fake hands back a finished `Response`, so the deadline over the body would
+ * never run. Every row counts the requests its outcome cost.
+ */
+describe('OecdStructureService — the response body', () => {
+  const config = getServerConfig();
+  const configuredTimeoutMs = config.timeoutMs;
+  const stubs: BodyStub[] = [];
+
+  /** A fresh stub, stopped after the test. */
+  async function stubbed(answer: Parameters<typeof startBodyStub>[0]): Promise<BodyStub> {
+    const stub = await startBodyStub(answer);
+    stubs.push(stub);
+    return stub;
+  }
+
+  /** Paths the stub was asked for, without their query strings. */
+  function pathsOf(stub: BodyStub): string[] {
+    return stub.requests.map((request) => request.path.split('?')[0] ?? '');
+  }
+
+  beforeEach(() => {
+    // Earlier suites stub `fetch` without putting it back; these need the real one.
+    vi.stubGlobal('fetch', realFetch);
+    config.timeoutMs = 300;
+  });
+
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    config.timeoutMs = configuredTimeoutMs;
+    await Promise.all(stubs.splice(0).map((stub) => stub.close()));
+  });
+
+  it('keeps the retries on a deadline that fires before the headers', async () => {
+    const stub = await stubbed(() => ({ kind: 'no-headers' }));
+
+    const error = await new OecdStructureService(stub.origin)
+      .fetchDataflows('OECD.STI.PIE')
+      .catch((e: Error) => e);
+
+    expect(stub.requests).toHaveLength(3);
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.Timeout });
+  }, 15_000);
+
+  it('retries a deadline that fires while the body is arriving', async () => {
+    const stub = await stubbed(() => ({ kind: 'stalled-body' }));
+
+    const error = await new OecdStructureService(stub.origin)
+      .fetchDataflows('OECD.STI.PIE')
+      .catch((e: Error) => e);
+
+    expect(stub.requests).toHaveLength(3);
+    expect(stub.requests.every((request) => request.bodyStarted)).toBe(true);
+    await Promise.all(stub.requests.map((request) => request.closed));
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      message: 'Failed to fetch OECD dataflows for agency OECD.STI.PIE',
+    });
+  }, 15_000);
+
+  it('reports the caller’s abort mid-body as RequestCancelled, with no further attempt', async () => {
+    const stub = await stubbed(() => ({ kind: 'stalled-body' }));
+    const caller = new AbortController();
+    const restoreFetch = onResponseHeaders(() => caller.abort());
+
+    try {
+      const error = await new OecdStructureService(stub.origin)
+        .fetchDataflows('OECD.STI.PIE', caller.signal)
+        .catch((e: Error) => e);
+
+      expect(stub.requests).toHaveLength(1);
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.RequestCancelled,
+        data: { errorSource: 'FetchAborted' },
+        message: 'Failed to fetch OECD dataflows for agency OECD.STI.PIE',
+      });
+      expect((error as Error).cause).toMatchObject({ message: expect.stringMatching(/aborted/) });
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  it('retries a connection dropped mid-body and reports it as an outage', async () => {
+    const stub = await stubbed(() => ({ kind: 'dropped-body' }));
+
+    const error = await new OecdStructureService(stub.origin)
+      .fetchDataflows('OECD.STI.PIE')
+      .catch((e: Error) => e);
+
+    expect(stub.requests).toHaveLength(3);
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+  }, 15_000);
+
+  it('reports a complete body that is not JSON as a SerializationError after one request', async () => {
+    const stub = await stubbed(() => ({ body: '<html>Service notice</html>', kind: 'complete' }));
+
+    const error = await new OecdStructureService(stub.origin)
+      .fetchDataflows('OECD.STI.PIE')
+      .catch((e: Error) => e);
+
+    // Not an outage: the same request returns the same bytes.
+    expect(stub.requests).toHaveLength(1);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.SerializationError,
+      message: 'Failed to fetch OECD dataflows for agency OECD.STI.PIE',
+    });
+  });
+
+  it('rejects a delegation lookup the caller aborted rather than resolving nothing', async () => {
+    const stub = await stubbed(() => ({ kind: 'stalled-body' }));
+    const caller = new AbortController();
+    const restoreFetch = onResponseHeaders(() => caller.abort());
+
+    try {
+      const outcome = await fetchExternalServiceRoot(
+        stub.origin,
+        EXT_FLOW_REF,
+        caller.signal,
+      ).catch((e: Error) => e);
+
+      expect(pathsOf(stub)).toEqual(['/dataflow/OECD.STI.PIE/DSD_TIVA_MAINLV@DF_MAINLV']);
+      expect(outcome).toMatchObject({
+        code: JsonRpcErrorCode.RequestCancelled,
+        message: expect.stringMatching(/was aborted\.$/),
+      });
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  it('ends a datastructure read the caller aborted during the dimension names', async () => {
+    const stub = await stubbed((path) =>
+      path.startsWith('/datastructure/')
+        ? { body: JSON.stringify(NAMELESS_DSD_RESPONSE), kind: 'complete' }
+        : { kind: 'stalled-body' },
+    );
+    const caller = new AbortController();
+    const restoreFetch = onResponseHeaders((response) => {
+      if (new URL(response.url).pathname.startsWith('/conceptscheme/')) caller.abort();
+    });
+
+    try {
+      const outcome = await new OecdStructureService(stub.origin)
+        .fetchDataStructure(NAMAIN_FLOW_REF, caller.signal)
+        .catch((e: Error) => e);
+
+      // Not the structure with its dimensions left on their ids: the names
+      // are best-effort, the caller's abort is not a name that failed to load.
+      expect(pathsOf(stub)).toEqual([
+        '/datastructure/OECD.SDD.NAD/DSD_NAMAIN1',
+        '/conceptscheme/OECD.SDD.NAD/CS_NA/1.0',
+      ]);
+      expect(outcome).toMatchObject({
+        code: JsonRpcErrorCode.RequestCancelled,
+        message: expect.stringMatching(/CS_NA version 1\.0$/),
+      });
+    } finally {
+      restoreFetch();
+    }
+  });
+});
+
 // ── fetchDirectorates ─────────────────────────────────────────────────────────
 
 const AGENCY_SCHEME_RESPONSE = {
@@ -1257,10 +1418,7 @@ describe('OecdStructureService.fetchCodelist', () => {
   it('returns parsed codes', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve(MOCK_CODELIST_RESPONSE),
-      }),
+      vi.fn(() => Promise.resolve(Response.json(MOCK_CODELIST_RESPONSE))),
     );
 
     const svc = new OecdStructureService('https://fake.oecd.test');
@@ -1274,10 +1432,7 @@ describe('OecdStructureService.fetchCodelist', () => {
   it('returns empty array when codelist has no codes', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve({ data: { codelists: [{ codes: [] }] } }),
-      }),
+      vi.fn(() => Promise.resolve(Response.json({ data: { codelists: [{ codes: [] }] } }))),
     );
 
     const svc = new OecdStructureService('https://fake.oecd.test');
@@ -1314,10 +1469,7 @@ describe('OecdStructureService.fetchCodelist', () => {
   it('returns empty array when codelists array is empty', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        json: () => Promise.resolve({ data: { codelists: [] } }),
-      }),
+      vi.fn(() => Promise.resolve(Response.json({ data: { codelists: [] } }))),
     );
 
     const svc = new OecdStructureService('https://fake.oecd.test');

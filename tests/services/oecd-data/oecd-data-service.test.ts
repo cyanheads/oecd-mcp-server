@@ -10,8 +10,15 @@ import type { AddressInfo } from 'node:net';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createFetchMock } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { getServerConfig } from '@/config/server-config.js';
 import { invalidQueryText, OecdDataService } from '@/services/oecd-data/oecd-data-service.js';
 import { throttleText } from '@/services/oecd-http/oecd-http.js';
+import {
+  type BodyStub,
+  onResponseHeaders,
+  type StubAnswer,
+  startBodyStub,
+} from '../../helpers/body-stub.js';
 
 const BASE = 'https://fake.oecd.test';
 const FLOW_REF = 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I';
@@ -125,6 +132,9 @@ const LOCAL_UNIT_MULT_RESPONSE = {
     ],
   },
 };
+
+/** The runtime's own `fetch`, held before the harness replaces it. */
+const realFetch = globalThis.fetch;
 
 const http = createFetchMock();
 
@@ -578,6 +588,110 @@ describe('OecdDataService.fetchData — upstream failures', () => {
   });
 });
 
+// ── The response body ─────────────────────────────────────────────────────────
+
+/**
+ * Failures before the body and while it arrives, over a real socket — a fetch
+ * fake hands back a finished `Response`, so the deadline over the body would
+ * never run. Every row counts the requests its outcome cost.
+ */
+describe('OecdDataService.fetchData — the response body', () => {
+  const config = getServerConfig();
+  const configuredTimeoutMs = config.timeoutMs;
+  const stubs: BodyStub[] = [];
+
+  /** A service whose configured root is a fresh stub answering every request with `answer`. */
+  async function stubbedService(
+    answer: StubAnswer,
+  ): Promise<{ stub: BodyStub; svc: OecdDataService }> {
+    const stub = await startBodyStub(() => answer);
+    stubs.push(stub);
+    return { stub, svc: new OecdDataService(stub.origin) };
+  }
+
+  beforeEach(() => {
+    http.restore();
+    config.timeoutMs = 300;
+  });
+
+  afterEach(async () => {
+    config.timeoutMs = configuredTimeoutMs;
+    await Promise.all(stubs.splice(0).map((stub) => stub.close()));
+  });
+
+  it('keeps the retries on a deadline that fires before the headers', async () => {
+    const { stub, svc } = await stubbedService({ kind: 'no-headers' });
+
+    const error = await svc.fetchData(FLOW_REF, 'A.USA..').catch((e: Error) => e);
+
+    expect(stub.requests).toHaveLength(3);
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.Timeout });
+  }, 15_000);
+
+  it('spends one request on a deadline that fires while the body is arriving', async () => {
+    const { stub, svc } = await stubbedService({ kind: 'stalled-body' });
+
+    const error = await svc.fetchData(FLOW_REF, 'A.USA..').catch((e: Error) => e);
+
+    // A repeat would download the same answer from the start, against the
+    // same deadline.
+    expect(stub.requests).toHaveLength(1);
+    expect(stub.requests[0]?.bodyStarted).toBe(true);
+    await stub.requests[0]?.closed;
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      message: `Failed to fetch OECD data for ${FLOW_REF}`,
+    });
+  }, 15_000);
+
+  it('reports the caller’s abort mid-body as RequestCancelled, with no further attempt', async () => {
+    const { stub, svc } = await stubbedService({ kind: 'stalled-body' });
+    const caller = new AbortController();
+    const restoreFetch = onResponseHeaders(() => caller.abort());
+
+    try {
+      const error = await svc
+        .fetchData(FLOW_REF, 'A.USA..', undefined, undefined, caller.signal)
+        .catch((e: Error) => e);
+
+      expect(stub.requests).toHaveLength(1);
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.RequestCancelled,
+        data: { errorSource: 'FetchAborted' },
+        message: `Failed to fetch OECD data for ${FLOW_REF}`,
+      });
+      expect((error as Error).cause).toMatchObject({ message: expect.stringMatching(/aborted/) });
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  it('retries a connection dropped mid-body and reports it as an outage', async () => {
+    const { stub, svc } = await stubbedService({ kind: 'dropped-body' });
+
+    const error = await svc.fetchData(FLOW_REF, 'A.USA..').catch((e: Error) => e);
+
+    expect(stub.requests).toHaveLength(3);
+    expect(stub.requests.every((request) => request.bodyStarted)).toBe(true);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      message: `Failed to fetch OECD data for ${FLOW_REF}`,
+    });
+  }, 15_000);
+
+  it('reports a complete body that is not JSON as a SerializationError after one request', async () => {
+    const { stub, svc } = await stubbedService({
+      body: '<html>Service notice</html>',
+      kind: 'complete',
+    });
+
+    const error = await svc.fetchData(FLOW_REF, 'A.USA..').catch((e: Error) => e);
+
+    expect(stub.requests).toHaveLength(1);
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.SerializationError });
+  });
+});
+
 // ── Delegated service roots ───────────────────────────────────────────────────
 
 /**
@@ -842,4 +956,89 @@ describe('OecdDataService.fetchData — delegated service roots', () => {
     expect(result.rowCount).toBe(3);
     expect(attempts).toBe(2);
   }, 15_000);
+
+  describe('the response body', () => {
+    const config = getServerConfig();
+    const configuredTimeoutMs = config.timeoutMs;
+    const stubs: BodyStub[] = [];
+
+    beforeEach(() => {
+      config.timeoutMs = 300;
+    });
+
+    afterEach(async () => {
+      config.timeoutMs = configuredTimeoutMs;
+      await Promise.all(stubs.splice(0).map((stub) => stub.close()));
+    });
+
+    it('spends one request at the delegated root on a body that outlasts the deadline', async () => {
+      /**
+       * The delegation is https-only and pinned to the base URL's origin, so the
+       * probe and the catalog lookup stay on the harness while the delegated
+       * request is carried to a real socket — the body deadline runs only
+       * against a body that is actually streaming.
+       */
+      const stub = await startBodyStub(() => ({ kind: 'stalled-body' }));
+      stubs.push(stub);
+      http.route(
+        {
+          match: DATA_URL,
+          respond: () =>
+            new Response('Object reference not set to an instance of an object.', {
+              status: 500,
+            }),
+        },
+        {
+          match: DELEGATED_DATA_URL,
+          respond: (request) => realFetch(`${stub.origin}/stalled`, { signal: request.signal }),
+        },
+      );
+      routeCatalog(`${BASE}/sti-public/rest/dataflow/OECD.SDD.NAD/DSD_NAAG@DF_NAAG_I/1.1`);
+
+      const error = await service()
+        .fetchData(FLOW_REF, 'A.USA..')
+        .catch((e: Error) => e);
+
+      expect(http.calls.map((c) => c.request.url)).toEqual([
+        DATA_URL,
+        CATALOG_URL,
+        DELEGATED_DATA_URL,
+      ]);
+      expect(stub.requests).toHaveLength(1);
+      expect(stub.requests[0]?.bodyStarted).toBe(true);
+      expect(error).toMatchObject({ code: JsonRpcErrorCode.Timeout });
+    }, 15_000);
+
+    it('reports a caller abort during the catalog lookup as RequestCancelled, not the failure it held', async () => {
+      http.restore();
+      const stub = await startBodyStub((path) =>
+        path.startsWith('/data/')
+          ? { body: 'Could not find Dataflow and/or DSD', kind: 'complete', status: 404 }
+          : { kind: 'stalled-body' },
+      );
+      stubs.push(stub);
+      const caller = new AbortController();
+      const restoreFetch = onResponseHeaders((response) => {
+        if (new URL(response.url).pathname.startsWith('/dataflow/')) caller.abort();
+      });
+
+      try {
+        const error = await new OecdDataService(stub.origin)
+          .fetchData(FLOW_REF, 'A.USA..', undefined, undefined, caller.signal)
+          .catch((e: Error) => e);
+
+        expect(stub.requests.map((r) => r.path.split('?')[0])).toEqual([
+          '/data/OECD.SDD.NAD,DSD_NAAG%40DF_NAAG_I/A.USA..',
+          '/dataflow/OECD.SDD.NAD/DSD_NAAG@DF_NAAG_I',
+        ]);
+        // Not the NotFound the data endpoint answered before the abort.
+        expect(error).toMatchObject({
+          code: JsonRpcErrorCode.RequestCancelled,
+          message: expect.stringMatching(/was aborted\.$/),
+        });
+      } finally {
+        restoreFetch();
+      }
+    });
+  });
 });

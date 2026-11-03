@@ -1,8 +1,8 @@
 /**
  * @fileoverview Tests for the shared OECD fetch boundary — the rule that holds
  * every request to the host it was addressed to, the retry classification that
- * rule sits alongside, and the reader that decides which failures are OECD's to
- * answer for.
+ * rule sits alongside, the body reader both services share, and the reader that
+ * decides which failures are OECD's to answer for.
  * @module tests/services/oecd-http/oecd-http.test
  */
 
@@ -10,12 +10,15 @@ import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { getServerConfig } from '@/config/server-config.js';
 import {
   fetchOecd,
+  readJsonBody,
   retryableUpstreamFailure,
   upstreamRefusal,
 } from '@/services/oecd-http/oecd-http.js';
+import { type BodyStub, onResponseHeaders, startBodyStub } from '../../helpers/body-stub.js';
 
 const STRUCTURE_ACCEPT = 'application/vnd.sdmx.structure+json;version=1.0';
 
@@ -46,11 +49,12 @@ async function probe(
 }
 
 /** Call the boundary the way the structure service does. */
-function call(url: string): Promise<Response> {
+function call(url: string, signal?: AbortSignal): Promise<Response> {
   return fetchOecd(url, {
     accept: STRUCTURE_ACCEPT,
     expectedStatuses: [404],
     operation: 'test',
+    ...(signal ? { signal } : {}),
   });
 }
 
@@ -119,6 +123,155 @@ describe('fetchOecd redirect handling', () => {
 
     expect(oecd.paths).toHaveLength(2);
     expect(error).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+  });
+});
+
+/**
+ * The response body over a real socket — a fetch fake hands back a finished
+ * `Response`, so the deadline over the body would never run.
+ */
+describe('readJsonBody', () => {
+  const config = getServerConfig();
+  const configuredTimeoutMs = config.timeoutMs;
+  const stubs: BodyStub[] = [];
+
+  /** Fetch from a fresh stub and read the body the way both services do. */
+  async function readFrom(
+    answer: Parameters<typeof startBodyStub>[0],
+    signal?: AbortSignal,
+  ): Promise<{ outcome: unknown; stub: BodyStub }> {
+    const stub = await startBodyStub(answer);
+    stubs.push(stub);
+    const outcome = await call(`${stub.origin}/dataflow`, signal)
+      .then(readJsonBody)
+      .catch((e: unknown) => e);
+    return { outcome, stub };
+  }
+
+  afterEach(async () => {
+    config.timeoutMs = configuredTimeoutMs;
+    await Promise.all(stubs.splice(0).map((stub) => stub.close()));
+  });
+
+  it('decodes a complete JSON body', async () => {
+    const { outcome } = await readFrom(() => ({
+      body: '{"data":{"dataflows":[]}}',
+      kind: 'complete',
+    }));
+
+    expect(outcome).toEqual({ data: { dataflows: [] } });
+  });
+
+  it('reports a complete body that is not JSON as a SerializationError', async () => {
+    const { outcome } = await readFrom(() => ({
+      body: '<html>Service notice</html>',
+      kind: 'complete',
+    }));
+
+    expect(outcome).toBeInstanceOf(McpError);
+    expect(outcome).toMatchObject({
+      code: JsonRpcErrorCode.SerializationError,
+      message: 'OECD answered with a body that is not JSON',
+    });
+    expect((outcome as McpError).cause).toBeInstanceOf(SyntaxError);
+  });
+
+  it('keeps the deadline’s Timeout when the body stalls past it', async () => {
+    config.timeoutMs = 300;
+
+    const { outcome, stub } = await readFrom(() => ({ kind: 'stalled-body' }));
+
+    expect(outcome).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { errorSource: 'FetchTimeout' },
+    });
+    // The headers and the opening of the body were sent before the deadline,
+    // and the client tore the stalled stream down rather than leaving it open.
+    expect(stub.requests[0]?.bodyStarted).toBe(true);
+    await stub.requests[0]?.closed;
+  });
+
+  it('keeps the caller’s RequestCancelled when the abort lands mid-body', async () => {
+    const caller = new AbortController();
+    const restoreFetch = onResponseHeaders(() => caller.abort());
+
+    try {
+      const { outcome, stub } = await readFrom(() => ({ kind: 'stalled-body' }), caller.signal);
+
+      expect(outcome).toMatchObject({
+        code: JsonRpcErrorCode.RequestCancelled,
+        data: { errorSource: 'FetchAborted' },
+      });
+      expect((outcome as Error).message).toMatch(/was aborted\.$/);
+      expect(stub.requests).toHaveLength(1);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  it('lets a connection dropped mid-body through as the runtime’s own error', async () => {
+    const { outcome, stub } = await readFrom(() => ({ kind: 'dropped-body' }));
+
+    expect(stub.requests[0]?.bodyStarted).toBe(true);
+    // Unclassified — which is what puts it on the retry path an outage takes,
+    // rather than on the SerializationError path no retry repeats.
+    expect(outcome).toBeInstanceOf(Error);
+    expect(outcome).not.toBeInstanceOf(McpError);
+  });
+});
+
+/**
+ * `fetchWithTimeout` reports an `AbortError` that neither its deadline nor the
+ * caller raised as `RequestCancelled` (cyanheads/mcp-ts-core#799). The header
+ * phase is the only place it does, and a fetch fake reaches it.
+ */
+describe('fetchOecd cancellation', () => {
+  const URL_UNDER_TEST = 'https://fake.oecd.test/dataflow';
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.each([
+    ['a live caller signal', () => new AbortController().signal],
+    ['no caller signal', () => undefined],
+  ])('retries an abort nobody requested, with %s, as an outage', async (_label, signalOf) => {
+    const fetchFake = vi
+      .fn()
+      .mockRejectedValue(new DOMException('The operation was aborted.', 'AbortError'));
+    vi.stubGlobal('fetch', fetchFake);
+
+    const error = await withRetry(() => call(URL_UNDER_TEST, signalOf()), {
+      baseDelayMs: 1,
+      maxRetries: 2,
+    }).catch((e: unknown) => e);
+
+    expect(fetchFake).toHaveBeenCalledTimes(3);
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.ServiceUnavailable });
+    expect(upstreamRefusal(error)?.reason).toBe('upstream_unavailable');
+  });
+
+  it('keeps the caller’s own abort as RequestCancelled, with no retry', async () => {
+    const caller = new AbortController();
+    const fetchFake = vi.fn().mockImplementation(() => {
+      caller.abort();
+      return Promise.reject(new DOMException('The operation was aborted.', 'AbortError'));
+    });
+    vi.stubGlobal('fetch', fetchFake);
+
+    const error = await withRetry(() => call(URL_UNDER_TEST, caller.signal), {
+      baseDelayMs: 1,
+      maxRetries: 2,
+      signal: caller.signal,
+    }).catch((e: unknown) => e);
+
+    expect(fetchFake).toHaveBeenCalledTimes(1);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.RequestCancelled,
+      data: { errorSource: 'FetchAborted' },
+    });
+    expect((error as Error).message).toMatch(/was aborted\.$/);
+    expect(upstreamRefusal(error)).toBeUndefined();
   });
 });
 
