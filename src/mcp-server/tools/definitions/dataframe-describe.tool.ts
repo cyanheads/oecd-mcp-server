@@ -63,7 +63,7 @@ export const oecdDataframeDescribe = tool('oecd_dataframe_describe', {
       code: JsonRpcErrorCode.NotFound,
       when: 'The canvas_id has expired or was never created.',
       recovery:
-        'Re-run oecd_query_dataset to create a fresh canvas, then pass the returned canvas_id here.',
+        'The canvas and its tables are gone. Re-run the oecd_query_dataset calls that staged them — a result that spills comes back with a fresh canvas_id — then pass that canvas_id here.',
     },
   ],
 
