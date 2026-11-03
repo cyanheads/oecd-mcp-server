@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.6.1](changelog/0.6.x/0.6.1.md) — 2026-11-02 · 🛡️ Security
+
+oecd_dataframe_query returns 100 rows by default (up to 1,000 per call, within 1 MiB, stopped after 30 seconds) and flags truncated results; oecd_query_dataset checks an explicit canvas_id before the download; failures while reading OECD response bodies keep their reason.
+
 ## [0.6.0](changelog/0.6.x/0.6.0.md) — 2026-10-28
 
 Publishes the oecd-guide Agent Skill over MCP at skill://oecd-guide/SKILL.md and moves to mcp-ts-core 0.13.18, which stops per-request HTTP memory growth under Bun.
