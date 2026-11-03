@@ -25,6 +25,7 @@ import {
   validationError,
 } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import { ErrorHandler, escapeMarkdownInline, logger } from '@cyanheads/mcp-ts-core/utils';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { oecdDataframeQuery } from '@/mcp-server/tools/definitions/dataframe-query.tool.js';
 import { setCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
@@ -680,6 +681,137 @@ describe('oecdDataframeQuery deadline', () => {
     expect(textOf(result)).toContain('Canvas query was cancelled');
     expect(textOf(result)).not.toContain('query_timeout');
   });
+});
+
+describe('oecdDataframeQuery engine error messages', () => {
+  /** The most characters of an engine error's message one reply or log record carries. */
+  const ENGINE_MESSAGE_CAP = 2000;
+  const CUT_MARKER = '… [cut at 2000 characters]';
+  /** Closes every engine message below, so a message relayed whole carries it and a cut one does not. */
+  const TAIL = 'END-OF-ENGINE-MESSAGE';
+
+  /** An engine message exactly `length` characters long, ending in {@link TAIL}. */
+  const engineMessage = (length: number) =>
+    `Engine Error: ${'v'.repeat(length - 'Engine Error: '.length - TAIL.length)}${TAIL}`;
+
+  /** Each path an engine message leaves the handler by: the error the canvas throws, and how the reply carries it. */
+  const PATHS = [
+    {
+      path: 'sql_execution_error',
+      engineError: (message: string) =>
+        validationError(
+          message,
+          { reason: DUCKDB_ERROR_REASONS.sqlExecutionError },
+          { cause: new Error(message) },
+        ),
+      code: JsonRpcErrorCode.ValidationError,
+      prefix: '',
+      data: { reason: 'sql_execution_error' },
+    },
+    {
+      path: 'invalid_sql',
+      engineError: (message: string) =>
+        validationError(
+          message,
+          { reason: 'invalid_sql', binderMessage: message },
+          { cause: new Error(message) },
+        ),
+      code: JsonRpcErrorCode.ValidationError,
+      prefix: 'SQL rejected: ',
+      data: { reason: 'invalid_sql' },
+    },
+    {
+      path: 'an engine fault',
+      engineError: (message: string) =>
+        databaseError(message, { engine: 'duckdb' }, { cause: new Error(message) }),
+      code: JsonRpcErrorCode.DatabaseError,
+      prefix: '',
+      data: { engine: 'duckdb' },
+    },
+  ];
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    setCanvas(undefined);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each(PATHS)(
+    'relays at most 2,000 characters of an engine error as $path, on both surfaces',
+    async ({ engineError, code, prefix, data }) => {
+      const message = engineMessage(ENGINE_MESSAGE_CAP + 1000);
+      canvasAnswering(() => Promise.reject(engineError(message)));
+
+      const result = await runToolContract(oecdDataframeQuery, { canvas_id: CANVAS_ID, sql: SQL });
+
+      const relayed = `${prefix}${message.slice(0, ENGINE_MESSAGE_CAP)}${CUT_MARKER}`;
+      const error = structuredOf(result).error;
+      expect(result.isError).toBe(true);
+      expect(error?.code).toBe(code);
+      expect(error?.message).toBe(relayed);
+      expect(error?.data).toMatchObject(data);
+      expect(textOf(result)).toContain(escapeMarkdownInline(relayed));
+      expect(JSON.stringify(result)).not.toContain(TAIL);
+    },
+  );
+
+  it.each(PATHS)(
+    'relays an engine error of exactly 2,000 characters as $path unchanged',
+    async ({ engineError, code, prefix }) => {
+      const message = engineMessage(ENGINE_MESSAGE_CAP);
+      canvasAnswering(() => Promise.reject(engineError(message)));
+
+      const result = await runToolContract(oecdDataframeQuery, { canvas_id: CANVAS_ID, sql: SQL });
+
+      const error = structuredOf(result).error;
+      expect(error?.code).toBe(code);
+      expect(error?.message).toBe(`${prefix}${message}`);
+      expect(textOf(result)).toContain(escapeMarkdownInline(`${prefix}${message}`));
+    },
+  );
+
+  it('relays at most 2,000 characters of an engine error without splitting a surrogate pair', async () => {
+    // The pair straddles the cap: its high half is character 2,000.
+    const message = `${'v'.repeat(ENGINE_MESSAGE_CAP - 1)}😀${'v'.repeat(100)}`;
+    canvasAnswering(() =>
+      Promise.reject(validationError(message, { reason: DUCKDB_ERROR_REASONS.sqlExecutionError })),
+    );
+
+    const result = await runToolContract(oecdDataframeQuery, { canvas_id: CANVAS_ID, sql: SQL });
+
+    expect(structuredOf(result).error?.message).toBe(
+      `${'v'.repeat(ENGINE_MESSAGE_CAP - 1)}${CUT_MARKER}`,
+    );
+  });
+
+  it.each(PATHS)(
+    'logs at most 2,000 characters of an engine error as $path',
+    async ({ engineError }) => {
+      const message = engineMessage(ENGINE_MESSAGE_CAP + 1000);
+      canvasAnswering(() => Promise.reject(engineError(message)));
+      let failure: unknown;
+      try {
+        await oecdDataframeQuery.handler(
+          oecdDataframeQuery.input.parse({ canvas_id: CANVAS_ID, sql: SQL }),
+          createMockContext({ errors: oecdDataframeQuery.errors }),
+        );
+      } catch (err) {
+        failure = err;
+      }
+      const record = vi.spyOn(logger, 'error').mockImplementation(() => {});
+
+      // The record the tool boundary writes for a failed call.
+      ErrorHandler.handleError(failure, { operation: 'tool:oecd_dataframe_query' });
+
+      expect(record).toHaveBeenCalledTimes(1);
+      const logged = JSON.stringify(record.mock.calls);
+      expect(logged).toContain(message.slice(0, ENGINE_MESSAGE_CAP));
+      expect(logged).not.toContain(TAIL);
+    },
+  );
 });
 
 /** A real DuckDB canvas, so `truncated` is the provider's own flag rather than a fixture's. */

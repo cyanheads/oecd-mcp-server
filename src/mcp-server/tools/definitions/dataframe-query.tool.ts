@@ -38,10 +38,30 @@ const ROW_BUDGET_BYTES = 1_048_576;
 /** How long a query may run before it is stopped — inside a 60 s client request timeout. */
 const QUERY_DEADLINE_MS = 30_000;
 
+/**
+ * Characters of a SQL engine error message relayed to the caller and written to
+ * the log — several times what a DuckDB message needs to name the column,
+ * value, or position at fault.
+ */
+const ENGINE_MESSAGE_MAX_CHARS = 2000;
+
 /** The SQL paging clause, as every notice prints it. */
 const PAGING = '`ORDER BY … LIMIT … OFFSET`';
 
 const utf8Bytes = (text: string) => Buffer.byteLength(text, 'utf8');
+
+/**
+ * An engine error message as this tool relays it: whole when it fits
+ * {@link ENGINE_MESSAGE_MAX_CHARS}, otherwise that many leading characters — one
+ * fewer when the cut would split a surrogate pair — and a marker saying so.
+ */
+function relayedEngineMessage(message: string): string {
+  if (message.length <= ENGINE_MESSAGE_MAX_CHARS) return message;
+  const last = message.charCodeAt(ENGINE_MESSAGE_MAX_CHARS - 1);
+  const end =
+    last >= 0xd800 && last <= 0xdbff ? ENGINE_MESSAGE_MAX_CHARS - 1 : ENGINE_MESSAGE_MAX_CHARS;
+  return `${message.slice(0, end)}… [cut at ${ENGINE_MESSAGE_MAX_CHARS} characters]`;
+}
 
 /** A cell as the table shows it: nested values as JSON, null as empty. */
 function cellText(value: unknown): string {
@@ -253,6 +273,13 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
           );
         }
         /**
+         * Engine text leaves here at most ENGINE_MESSAGE_MAX_CHARS long. A
+         * message cut to fit leaves its engine error off the cause chain, whose
+         * every message and stack the log record writes whole.
+         */
+        const message = relayedEngineMessage(err.message);
+        const chain = message === err.message ? { cause: err } : undefined;
+        /**
          * A statement that prepared and then failed on the data is not a
          * rejected statement. Both arrive as ValidationError, so they are told
          * apart by the engine reason — and they need opposite advice:
@@ -260,11 +287,13 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
          * already did.
          */
         if (err.data?.reason === DUCKDB_ERROR_REASONS.sqlExecutionError) {
-          throw ctx.fail('sql_execution_error', err.message, undefined, { cause: err });
+          throw ctx.fail('sql_execution_error', message, undefined, chain);
         }
         if (err.code === JsonRpcErrorCode.ValidationError) {
-          throw ctx.fail('invalid_sql', `SQL rejected: ${err.message}`, undefined, { cause: err });
+          throw ctx.fail('invalid_sql', `SQL rejected: ${message}`, undefined, chain);
         }
+        // The same code and data, so it classifies as the engine's own error would.
+        if (chain === undefined) throw new McpError(err.code, message, err.data);
       }
       throw err;
     }
