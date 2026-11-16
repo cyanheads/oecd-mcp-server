@@ -1,10 +1,11 @@
 /**
  * @fileoverview A loopback HTTP server for exercising the body half of an OECD
- * exchange. A fetch fake hands back a finished `Response`, so the deadline
- * `fetchWithTimeout` keeps over the body never runs against it; this server
- * answers over a real socket and can withhold the headers, send them and then
- * stall the body, drop the connection partway through the body, or send a whole
- * body that is not JSON.
+ * exchange over a real socket, so each failure reaches the boundary in the
+ * shape the runtime's own network stack gives it. That proves the
+ * classification against what Bun's and Node's `fetch` actually throw, where a
+ * fake would prove only what it was written to throw. The server can withhold
+ * the headers, send them and then stall the body, drop the connection partway
+ * through the body, or send a whole body that is not JSON.
  * @module tests/helpers/body-stub
  */
 

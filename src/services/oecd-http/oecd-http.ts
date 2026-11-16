@@ -1,9 +1,10 @@
 /**
  * @fileoverview Shared HTTP boundary for the OECD SDMX endpoints — one fetch
- * path and one body reader for the structure and data services, carrying the
- * retry-classification corrections both of them need, the rule that holds every
- * request to the configured host, and the readers that turn a terminal failure
- * into the upstream reason every definition declares for it.
+ * path, one body reader, and one decoder guard for the structure and data
+ * services, carrying the retry-classification corrections both of them need,
+ * the rule that holds every request to the configured host, the per-request
+ * share of the call's upstream budget, and the readers that turn a terminal
+ * failure into the upstream reason every definition declares for it.
  * @module services/oecd-http/oecd-http
  */
 
@@ -11,7 +12,7 @@ import {
   JsonRpcErrorCode,
   McpError,
   serializationError,
-  serviceUnavailable,
+  timeout,
 } from '@cyanheads/mcp-ts-core/errors';
 import { fetchWithTimeout, requestContextService } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
@@ -31,8 +32,18 @@ export interface OecdFetchOptions {
   expectedStatuses: number[];
   /** Operation label for correlated logging. */
   operation: string;
-  /** Caller cancellation, composed with the configured timeout. */
-  signal?: AbortSignal;
+}
+
+/**
+ * The share of a call's upstream budget one request may spend. A retry ladder
+ * hands each attempt its `RetryAttempt`, which has this shape; a lone request
+ * gets the budget's own remainder and the caller's signal.
+ */
+export interface RequestWindow {
+  /** Milliseconds left of the call's budget as the request starts. */
+  readonly remainingMs: number;
+  /** Caller cancellation — composed, inside a ladder, with the ladder's deadline. */
+  readonly signal?: AbortSignal | undefined;
 }
 
 /**
@@ -71,25 +82,58 @@ function refusedRedirect(err: unknown, url: string): McpError | undefined {
 }
 
 /**
- * The refusal {@link refusedRedirect} wrote, read back off a failure that has
- * since been relabelled. Returns undefined for every other failure.
+ * The innermost link of a failure's cause chain that `matches` accepts, or
+ * undefined when none does.
  *
  * Both services restate an upstream failure with a message of their own before
  * a handler sees it — "Failed to fetch OECD dataflows" — which keeps the code
- * and the data but drops the sentence naming `OECD_BASE_URL`. {@link upstreamRefusal}
- * reads it back from the cause chain so a host that redirects is reported as the
- * configuration it is, rather than as the outage it is not.
+ * and the data but drops the sentence the failure was raised with. A relabel
+ * copies the code and the data forward, so every link from the original up
+ * matches; only the innermost still carries that sentence.
+ */
+function originalFailure(err: unknown, matches: (e: McpError) => boolean): McpError | undefined {
+  let found: McpError | undefined;
+  for (let cur: unknown = err; cur instanceof Error; cur = (cur as { cause?: unknown }).cause) {
+    if (cur instanceof McpError && matches(cur)) found = cur;
+  }
+  return found;
+}
+
+/**
+ * The refusal {@link refusedRedirect} wrote, read back off a failure that has
+ * since been relabelled, so a host that redirects is reported as the
+ * configuration it is rather than as the outage it is not. Returns undefined
+ * for every other failure.
  */
 function refusedRedirectText(err: unknown): string | undefined {
-  let text: string | undefined;
-  for (let cur: unknown = err; cur instanceof Error; cur = (cur as { cause?: unknown }).cause) {
-    if (!(cur instanceof McpError) || cur.code !== JsonRpcErrorCode.Forbidden) continue;
-    // Deepest match wins: a relabel copies the code and the data forward, so
-    // every link from here up matches — only the innermost still carries the
-    // sentence.
-    if (redirectStatus(cur) !== undefined) text = cur.message;
-  }
-  return text;
+  return originalFailure(
+    err,
+    (e) => e.code === JsonRpcErrorCode.Forbidden && redirectStatus(e) !== undefined,
+  )?.message;
+}
+
+/**
+ * The text OECD answered a refusal with, as a caller should read it.
+ *
+ * OECD words a refusal in plain text or JSON, and that wording stays. A body of
+ * markup came from something in front of the API — a proxy's or a CDN's error
+ * page — where only the `<title>` says anything and the rest is layout; a page
+ * with no title contributes nothing, and the status speaks for itself. The body
+ * is the bounded capture `fetchWithTimeout` keeps, never the whole response.
+ */
+function refusalText(body: string): string {
+  const text = body.trim();
+  if (!text.startsWith('<')) return text;
+  const lower = text.toLowerCase();
+  const open = lower.indexOf('<title');
+  const start = open < 0 ? -1 : lower.indexOf('>', open);
+  const end = start < 0 ? -1 : lower.indexOf('</title', start);
+  return end < 0
+    ? ''
+    : text
+        .slice(start + 1, end)
+        .replace(/\s+/g, ' ')
+        .trim();
 }
 
 /**
@@ -119,37 +163,38 @@ export type UpstreamReason =
   | 'upstream_error'
   | 'upstream_redirect'
   | 'upstream_timeout'
-  | 'upstream_unavailable';
-
-/**
- * Codes a definition can add nothing to, so they bubble as themselves rather
- * than being restated as an upstream reason.
- *
- * `RequestCancelled` is the caller's own abort, `InternalError` is this server
- * failing at something that is not a request, `SerializationError` is a body it
- * could not decode, and `ValidationError` reaching here means a branch above
- * already declined to claim it. Reporting any of the four as an OECD refusal
- * would name the wrong party — loudest for a cancellation, where the caller
- * walked away and OECD may never have been asked anything at all.
- */
-const OWN_FAULT_CODES: ReadonlySet<JsonRpcErrorCode> = new Set([
-  JsonRpcErrorCode.InternalError,
-  JsonRpcErrorCode.RequestCancelled,
-  JsonRpcErrorCode.SerializationError,
-  JsonRpcErrorCode.ValidationError,
-]);
+  | 'upstream_unavailable'
+  | 'upstream_unreadable';
 
 /**
  * The declared reason an upstream failure carries, with the text to report, or
  * undefined when the failure is not OECD's to answer for.
  *
  * Handlers call this last, after the branches that recognise a failure their own
- * caller can fix — a missing dataflow, a rejected key. What is left is the
- * upstream's answer, and every surface names it the same way: a refused
- * redirect, a throttle, a timeout, an outage, or a status this server does not
- * model. That last bucket is `upstream_error` rather than a bare code because a
+ * caller can fix — a missing dataflow, a rejected key. What is left is OECD's
+ * answer, and every surface names it the same way: a refused redirect, a
+ * throttle, a timeout, an outage, a body this server cannot read, or a status it
+ * does not model.
+ *
+ * A failure is OECD's answer when it carries an upstream HTTP status, whatever
+ * code that status mapped to — a structure endpoint's 422 is `ValidationError`
+ * and still OECD's refusal — or when it is a `SerializationError`, which here is
+ * only ever raised over a body OECD sent: one that is not JSON, JSON whose fields
+ * have the wrong type, or an identifier outside the SDMX character set.
+ *
+ * Three failures bubble as themselves. `RequestCancelled` is the caller's own
+ * abort, where OECD may never have been asked anything; `InternalError` is this
+ * server failing at something that is not a request; and a `ValidationError`
+ * with no status was raised before any request left, as for an `OECD_BASE_URL`
+ * that is not http or https.
+ *
+ * The unmodelled bucket is `upstream_error` rather than a bare code because a
  * `Forbidden`, an `Unauthorized`, or an `InvalidParams` on a keyless public API
- * says nothing about what to do next; the reason and its hint do.
+ * says nothing about what to do next; the reason and its hint do, and the
+ * message carries the status and OECD's own text for the report the hint asks
+ * for. A `ServiceUnavailable` the framework marked `retryable: false` — a 501,
+ * a method OECD does not implement — lands there too rather than under the
+ * retryable `upstream_unavailable`.
  */
 export function upstreamRefusal(
   err: unknown,
@@ -158,12 +203,33 @@ export function upstreamRefusal(
   if (redirect !== undefined) return { message: redirect, reason: 'upstream_redirect' };
   const throttle = throttleText(err);
   if (throttle !== undefined) return { message: throttle, reason: 'rate_limited' };
-  if (!(err instanceof McpError) || OWN_FAULT_CODES.has(err.code)) return;
+  if (!(err instanceof McpError)) return;
+  if (err.code === JsonRpcErrorCode.SerializationError) {
+    const original = originalFailure(err, (e) => e.code === JsonRpcErrorCode.SerializationError);
+    const message =
+      original === undefined || original === err
+        ? err.message
+        : `${err.message}: ${original.message}`;
+    return { message, reason: 'upstream_unreadable' };
+  }
+  if (
+    err.code === JsonRpcErrorCode.RequestCancelled ||
+    err.code === JsonRpcErrorCode.InternalError
+  ) {
+    return;
+  }
+  const upstream = upstreamStatus(err);
+  if (err.code === JsonRpcErrorCode.ValidationError && upstream === undefined) return;
   if (err.code === JsonRpcErrorCode.Timeout)
     return { message: err.message, reason: 'upstream_timeout' };
-  if (err.code === JsonRpcErrorCode.ServiceUnavailable)
+  if (err.code === JsonRpcErrorCode.ServiceUnavailable && err.data?.retryable !== false)
     return { message: err.message, reason: 'upstream_unavailable' };
-  return { message: err.message, reason: 'upstream_error' };
+  if (upstream === undefined) return { message: err.message, reason: 'upstream_error' };
+  const text = refusalText(upstream.body);
+  return {
+    message: `${err.message} — OECD answered HTTP ${upstream.status}${text ? `: ${text}` : ''}`,
+    reason: 'upstream_error',
+  };
 }
 
 /**
@@ -183,24 +249,6 @@ export function retryableUpstreamFailure(err: unknown): unknown {
 }
 
 /**
- * Restate a cancellation the caller never asked for as the transient fault it
- * is, or return undefined when the failure was something else.
- *
- * `fetchWithTimeout` reports an `AbortError` raised while neither its deadline
- * nor the caller's signal has fired as `RequestCancelled`
- * (cyanheads/mcp-ts-core#799) — a code `withRetry` never retries and every
- * definition here bubbles as the caller's own abort. With the caller's signal
- * still live, nobody withdrew the request: the runtime dropped it, which is the
- * same fault as a reset connection, and `ServiceUnavailable` puts it on the
- * retry path a reset takes.
- */
-function unrequestedCancellation(err: unknown, signal?: AbortSignal): McpError | undefined {
-  if (!(err instanceof McpError) || err.code !== JsonRpcErrorCode.RequestCancelled) return;
-  if (signal?.aborted) return;
-  return serviceUnavailable(err.message, {}, { cause: err });
-}
-
-/**
  * Call one OECD endpoint.
  *
  * `fetchWithTimeout` maps the HTTP status onto the error code and captures the
@@ -210,6 +258,11 @@ function unrequestedCancellation(err: unknown, signal?: AbortSignal): McpError |
  * 422 becomes terminal and never enters the retry loop, while 408, 429, and 5xx
  * still get their attempts. A caller signal that is already aborted short-
  * circuits before any request is issued.
+ *
+ * The request gets `OECD_TIMEOUT_MS`, or what is left of the call's upstream
+ * budget when that is less, so no request outlives the call it belongs to. One
+ * that would start with nothing left is never sent: it fails as `Timeout` at
+ * once, unless the caller has already aborted, which `fetchWithTimeout` reports.
  *
  * `redirect: 'manual'` is what holds every request to the host it was addressed
  * to. `externalServiceRoot()` pins a delegated root to the configured base URL's
@@ -235,24 +288,28 @@ function unrequestedCancellation(err: unknown, signal?: AbortSignal): McpError |
  * a different origin, so it now fails with an actionable error instead of being
  * upgraded in silence.
  */
-export function fetchOecd(url: string, options: OecdFetchOptions): Promise<Response> {
-  const config = getServerConfig();
+export function fetchOecd(
+  url: string,
+  options: OecdFetchOptions,
+  window: RequestWindow,
+): Promise<Response> {
+  if (window.remainingMs <= 0 && !window.signal?.aborted) {
+    return Promise.reject(
+      timeout('No time was left in the upstream budget of this call to send the OECD request'),
+    );
+  }
   return fetchWithTimeout(
     url,
-    config.timeoutMs,
+    Math.min(getServerConfig().timeoutMs, window.remainingMs),
     requestContextService.createRequestContext({ operation: options.operation }),
     {
       headers: { Accept: options.accept, 'Accept-Language': ACCEPT_LANGUAGE },
       expectedStatuses: options.expectedStatuses,
       redirect: 'manual',
-      ...(options.signal ? { signal: options.signal } : {}),
+      ...(window.signal ? { signal: window.signal } : {}),
     },
   ).catch((err: unknown) => {
-    throw (
-      refusedRedirect(err, url) ??
-      unrequestedCancellation(err, options.signal) ??
-      retryableUpstreamFailure(err)
-    );
+    throw refusedRedirect(err, url) ?? retryableUpstreamFailure(err);
   });
 }
 
@@ -262,19 +319,61 @@ export function fetchOecd(url: string, options: OecdFetchOptions): Promise<Respo
  * Two steps because they fail for different reasons. {@link fetchOecd}'s
  * deadline covers the body as well as the headers, so the read rejects with the
  * classification `fetchWithTimeout` gave the failure — `Timeout` when the
- * deadline fires mid-body, `RequestCancelled` when the caller aborts, the
- * runtime's own error when the connection drops — and it keeps that
+ * deadline fires mid-body, `RequestCancelled` when the caller aborts,
+ * `ServiceUnavailable` when the connection drops — and it keeps that
  * classification here, so the retry loop and the tool boundary treat it as they
  * would the same failure before the headers. Only a body that arrived whole and
- * is not JSON becomes `SerializationError`: a retry would fetch the same bytes,
- * and the fault is in what OECD sent, not in whether it was reachable.
+ * is not JSON fails in {@link parseJsonBody}.
  */
 export async function readJsonBody(res: Response): Promise<unknown> {
-  const text = await res.text();
+  return parseJsonBody(await res.text(), res.headers);
+}
+
+/**
+ * Decode a body that arrived whole as JSON, for a reader that needs the text
+ * as well as what it parses to.
+ *
+ * A body that is not JSON becomes `SerializationError`: a retry would fetch the
+ * same bytes, and the fault is in what OECD sent, not in whether it was
+ * reachable. The message names the content type the response declared, which
+ * is what tells a truncated SDMX-JSON document from an HTML page some proxy
+ * answered in OECD's place.
+ */
+export function parseJsonBody(text: string, headers: Headers): unknown {
   try {
     return JSON.parse(text);
   } catch (err) {
-    throw serializationError('OECD answered with a body that is not JSON', {}, { cause: err });
+    throw serializationError(
+      `OECD answered with a body that is not JSON (declared content type: ${headers.get('content-type') ?? 'none'})`,
+      {},
+      { cause: err },
+    );
+  }
+}
+
+/**
+ * Run a decoder over a JSON body OECD sent, restating a mistyped field as the
+ * unreadable answer it is.
+ *
+ * The decoders read the parsed body through casts, so a field of the wrong type
+ * — a map where SDMX puts a list, a null entry — surfaces as the `TypeError` the
+ * first operation on it raises, with that operation's wording (`rawFlows.map is
+ * not a function`). Nothing else a decoder does can raise one, so it is the
+ * same failure as a body that is not JSON at all: `SerializationError`, after
+ * the one request, which {@link upstreamRefusal} names `upstream_unreadable`.
+ * Every other throw — a decoder's deliberate not-found included — passes
+ * through as it was.
+ */
+export function decodeUpstream<T>(decode: () => T): T {
+  try {
+    return decode();
+  } catch (err) {
+    if (!(err instanceof TypeError)) throw err;
+    throw serializationError(
+      'OECD answered with JSON whose fields do not have the SDMX shape',
+      {},
+      { cause: err },
+    );
   }
 }
 

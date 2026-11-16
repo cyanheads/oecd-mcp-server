@@ -69,6 +69,25 @@ describe('invalid_flow_ref is one failure with one answer', () => {
   });
 });
 
+describe('invalid_key is one failure with one answer', () => {
+  it('reads the same on oecd_query_dataset and oecd_get_dimension_values', () => {
+    const query = declaredError(oecdQueryDataset, 'invalid_key');
+    const dimensions = declaredError(oecdGetDimensionValues, 'invalid_key');
+
+    expect(dimensions.code).toBe(JsonRpcErrorCode.ValidationError);
+    expect(dimensions.code).toBe(query.code);
+    expect(dimensions.retryable).toBe(query.retryable);
+    for (const entry of [query, dimensions]) {
+      // Both check the key's characters themselves; a wrong segment count fails either way.
+      expect(entry.when).toContain('outside the SDMX key set');
+      expect(entry.when).toMatch(/\bsegments\b/);
+      expect(entry.recovery).toMatch(
+        /^Use oecd_get_dataset_info to check dimension order and count, then rebuild the\b/,
+      );
+    }
+  });
+});
+
 describe('every OECD-reaching definition names an upstream failure the same way', () => {
   const UPSTREAM: ReadonlyArray<readonly [string, JsonRpcErrorCode, boolean | undefined]> = [
     ['rate_limited', JsonRpcErrorCode.RateLimited, true],
@@ -76,6 +95,7 @@ describe('every OECD-reaching definition names an upstream failure the same way'
     ['upstream_unavailable', JsonRpcErrorCode.ServiceUnavailable, true],
     ['upstream_redirect', JsonRpcErrorCode.Forbidden, false],
     ['upstream_error', JsonRpcErrorCode.ServiceUnavailable, undefined],
+    ['upstream_unreadable', JsonRpcErrorCode.ServiceUnavailable, false],
   ];
 
   for (const [reason, code, retryable] of UPSTREAM) {
@@ -87,6 +107,42 @@ describe('every OECD-reaching definition names an upstream failure the same way'
       expect(entry.recovery.split(/\s+/).length).toBeGreaterThan(4);
     });
   }
+
+  it('tells the caller of an unreadable answer what changes the next one', () => {
+    for (const [name, def] of OECD_REACHING) {
+      const recovery = declaredError(def, 'upstream_unreadable').recovery;
+      if (name === 'oecd_query_dataset') {
+        // The one surface whose caller shapes the request: a narrower one is a different body.
+        expect(recovery).toMatch(/\bkey\b/);
+        expect(recovery).toMatch(/\bperiod\b/);
+        expect(recovery).not.toContain('OECD_BASE_URL');
+      } else {
+        // A fixed artefact comes back the same, so the fault is reported, not retried.
+        expect(recovery).toContain('OECD_BASE_URL');
+      }
+    }
+  });
+
+  it('describes the timeout as the request or the call running past its budget, everywhere', () => {
+    const when = declaredError(oecdGetDatasetInfo, 'upstream_timeout').when;
+
+    expect(when).toContain('OECD_TIMEOUT_MS');
+    expect(when).toContain('50 seconds');
+    for (const [, def] of OECD_REACHING) {
+      const entry = declaredError(def, 'upstream_timeout');
+      expect(entry.when).toBe(when);
+      // A raised OECD_TIMEOUT_MS only helps a client that waits for it.
+      expect(entry.recovery).toMatch(/past 50 seconds also needs a client that waits that long/);
+    }
+  });
+
+  it('asks for the HTTP status and OECD text an upstream_error carries, everywhere', () => {
+    for (const [, def] of OECD_REACHING) {
+      expect(declaredError(def, 'upstream_error').recovery).toContain(
+        'report the HTTP status and OECD text this error carries',
+      );
+    }
+  });
 
   it('declares download_limit only where the caller has a request to shrink', () => {
     const declaring = OECD_REACHING.filter(([, def]) =>

@@ -3,7 +3,6 @@
  * @module mcp-server/tools/definitions/dataframe-query.tool
  */
 
-import { Buffer } from 'node:buffer';
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import {
   CanvasIdSchema,
@@ -15,25 +14,23 @@ import { config } from '@cyanheads/mcp-ts-core/config';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
+import { applyCountLimit, type CountLimit, capOf, countLimitSchema } from '@/utils/count-limit.js';
 import { formatTable } from '@/utils/format-table.js';
 
-type Row = Record<string, unknown>;
-
-/** Rows one call returns when the caller sets no `limit`. */
-const DEFAULT_LIMIT = 100;
-
-/** Most rows one call returns; a larger `limit` is served at this. */
+/** Most rows one call returns, whatever `limit` asks for. */
 const MAX_ROWS_PER_CALL = 1000;
 
-/** Largest `limit` accepted at all — the ceiling against absurd input. */
-const LIMIT_CEILING = 10_000;
-
 /**
- * UTF-8 bytes of row data each surface may carry in one response: the size
- * bound beside `limit`'s count bound, so a response stays bounded whatever the
- * result holds.
+ * Rows per call: 100 by default, served up to 1,000. The canvas rejects a
+ * `rowLimit` above its own configured cap as a ValidationError, which the catch
+ * below would report as `invalid_sql`, so the cap is the smaller of the two —
+ * read per call, since the canvas cap is configuration.
  */
-const ROW_BUDGET_BYTES = 1_048_576;
+const LIMIT: CountLimit = {
+  cap: () => Math.min(MAX_ROWS_PER_CALL, config.canvas.defaultRowLimit),
+  defaultValue: 100,
+  tool: 'oecd_dataframe_query',
+};
 
 /** How long a query may run before it is stopped — inside a 60 s client request timeout. */
 const QUERY_DEADLINE_MS = 30_000;
@@ -47,8 +44,6 @@ const ENGINE_MESSAGE_MAX_CHARS = 2000;
 
 /** The SQL paging clause, as every notice prints it. */
 const PAGING = '`ORDER BY … LIMIT … OFFSET`';
-
-const utf8Bytes = (text: string) => Buffer.byteLength(text, 'utf8');
 
 /**
  * An engine error message as this tool relays it: whole when it fits
@@ -69,37 +64,9 @@ function cellText(value: unknown): string {
   return typeof value === 'object' ? JSON.stringify(value) : String(value);
 }
 
-/**
- * Bytes `row` adds to the larger of the two surfaces: its JSON in
- * `structuredContent.rows` with its separator, or its line in the rendered
- * table — a Markdown table row, or, when a multi-line cell turns the table into
- * a JSON block, a pretty-printed array (its compact JSON plus 7 bytes of
- * indentation per cell and 11 per row). The rendered side is only measured
- * when the JSON side still fits `remaining`, since the row is out either way.
- */
-function rowBytes(row: Row, columns: readonly string[], remaining: number): number {
-  const json = utf8Bytes(JSON.stringify(row)) + 1;
-  if (json > remaining) return json;
-  const cells = columns.map((column) => cellText(row[column]));
-  const markdown = utf8Bytes(`| ${cells.map(escapeMarkdownInline).join(' | ')} |`) + 1;
-  const jsonBlock = utf8Bytes(JSON.stringify(cells)) + 7 * cells.length + 11;
-  return Math.max(json, markdown, jsonBlock);
-}
-
-/** Number of leading rows whose bytes fit {@link ROW_BUDGET_BYTES} on both surfaces. */
-function rowsWithinBudget(rows: readonly Row[], columns: readonly string[]): number {
-  // The enclosing brackets of `rows`, less the separator the last row does not carry.
-  let spent = 1;
-  for (const [index, row] of rows.entries()) {
-    spent += rowBytes(row, columns, ROW_BUDGET_BYTES - spent);
-    if (spent > ROW_BUDGET_BYTES) return index;
-  }
-  return rows.length;
-}
-
 export const oecdDataframeQuery = tool('oecd_dataframe_query', {
   description:
-    'Run a read-only SQL SELECT against OECD observation tables staged on a DataCanvas by oecd_query_dataset. Call oecd_dataframe_describe first to discover exact table and column names, then use this tool for aggregation, filtering, GROUP BY, JOIN, and window functions. Returns up to `limit` rows (default 100, at most 1,000 per call) and at most 1 MiB of row data; truncated: true marks a result with more rows than came back, and its notice says how to reach the rest. A query still running after 30 seconds is stopped. Unavailable when the server runs with DataCanvas disabled.',
+    'Run a read-only SQL SELECT against OECD observation tables staged on a DataCanvas by oecd_query_dataset. Call oecd_dataframe_describe first to discover exact table and column names, then use this tool for aggregation, filtering, GROUP BY, JOIN, and window functions. Returns up to `limit` rows (default 100, at most 1,000 per call); truncated: true marks a result with more rows than came back, and its notice says how to reach the rest. A query still running after 30 seconds is stopped. Unavailable when the server runs with DataCanvas disabled.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -116,21 +83,16 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
         'Read-only SELECT statement. Reference tables by the names returned by oecd_dataframe_describe. ' +
           'Only SELECT statements are allowed — DDL, DML, and file-reading functions are rejected.',
       ),
-    limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(LIMIT_CEILING)
-      .default(DEFAULT_LIMIT)
-      .describe(
-        'Most rows to return. Default 100; served up to 1,000 per call, so a value from 1,001 to 10,000 returns at most 1,000 rows and a notice saying so. Fewer come back when the rows would pass 1 MiB of row data. For more rows than one call returns, aggregate in SQL or page with ORDER BY … LIMIT … OFFSET.',
-      ),
+    limit: countLimitSchema(
+      LIMIT,
+      'Most rows to return; for more than one call returns, aggregate in SQL or page with ORDER BY … LIMIT … OFFSET.',
+    ),
   }),
   output: z.object({
     rows: z
       .array(z.record(z.string(), z.unknown()))
       .describe(
-        'Result rows in query order: at most limit rows (1,000 per call) and at most 1 MiB of row data. When truncated is true the result has more rows than these.',
+        'Result rows in query order: at most limit rows, and at most 1,000 per call. When truncated is true the result has more rows than these.',
       ),
     row_count: z
       .number()
@@ -140,7 +102,7 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
       .boolean()
       .optional()
       .describe(
-        'True when the result has more rows than this call returned — cut at limit or at the 1 MiB row-data budget; the notice says how to reach the rest. Omitted (never false) when rows is the complete result.',
+        'True when the result has more rows than this call returned — cut at limit; the notice says how to reach the rest. Omitted (never false) when rows is the complete result.',
       ),
   }),
   enrichment: {
@@ -185,11 +147,9 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
     {
       reason: 'sql_execution_error',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The SQL parsed and ran, then failed on the staged observation data — a conversion, an invalid input, or a value out of range.',
+      when: 'The SQL parsed and ran, then failed on the staged observation data — a conversion, an invalid input, a value out of range, or an integer division or modulo by zero.',
       recovery:
-        'Read the message for the offending value, then wrap the conversion in TRY_CAST or ' +
-        'filter those rows out before converting. Observation columns are staged as VARCHAR ' +
-        'unless they are numeric, and an attribute column is null on the rows that omit it.',
+        'Read the message for the offending value, then wrap the conversion in TRY_CAST, or the expression in TRY(…) (a division or modulo by zero included), or filter those rows out first. Observation columns are staged as VARCHAR unless they are numeric, and an attribute column is null on the rows that omit it.',
     },
     {
       reason: 'query_timeout',
@@ -210,13 +170,9 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
       );
     }
 
-    /**
-     * The canvas rejects a rowLimit above its own configured cap as a
-     * ValidationError, which the catch below would report as invalid_sql — so
-     * the most this call serves is the smaller of the two.
-     */
-    const maxRows = Math.min(MAX_ROWS_PER_CALL, config.canvas.defaultRowLimit);
-    const rowLimit = Math.min(input.limit, maxRows);
+    const maxRows = capOf(LIMIT);
+    const limit = applyCountLimit(input.limit, LIMIT, ctx);
+    const rowLimit = limit.applied;
 
     ctx.log.info('Running DataCanvas SQL', {
       canvasId: input.canvas_id,
@@ -298,29 +254,15 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
       throw err;
     }
 
-    const firstRow = queryResult.rows[0];
+    const { rows } = queryResult;
+    const firstRow = rows[0];
     const columnNames = firstRow !== undefined ? Object.keys(firstRow) : queryResult.columns;
-    const fit = rowsWithinBudget(queryResult.rows, columnNames);
-    const rows = queryResult.rows.slice(0, fit);
-    const budgetCut = fit < queryResult.rows.length;
-    const truncated = budgetCut || queryResult.truncated === true;
+    const truncated = queryResult.truncated === true;
 
     /** One notice — the framework keeps only the last one written. */
     const notes: string[] = [];
-    if (input.limit > maxRows) {
-      notes.push(
-        `\`limit\` ${input.limit} is above the per-call maximum of ${maxRows}; served ${maxRows}.`,
-      );
-    }
-    if (budgetCut && fit === 0) {
-      notes.push(
-        'No rows returned: the first row alone is larger than the 1 MiB row-data budget. Select fewer or narrower columns, or aggregate.',
-      );
-    } else if (budgetCut) {
-      notes.push(
-        `Stopped at ${fit} rows, the most that fit the 1 MiB row-data budget. To reach the rest, select fewer or narrower columns, aggregate, or page ${fit} rows at a time with ${PAGING}.`,
-      );
-    } else if (truncated) {
+    if (limit.notice) notes.push(limit.notice);
+    if (truncated) {
       notes.push(
         rowLimit < maxRows
           ? `More rows match than the ${rows.length} returned. To reach the rest, aggregate, page with ${PAGING}, or raise \`limit\` (up to ${maxRows}).`

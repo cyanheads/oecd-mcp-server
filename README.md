@@ -71,7 +71,9 @@ All resource data is also reachable via tools. Use `oecd_get_dataset_info` for t
 
 ### `oecd_search_datasets` <sub>tool</sub>
 
-- `query` token-matched across dataflow names and descriptions; optional `agency_id` scope; `limit` (1–100) and `offset` paging with `total_matches`
+- Each `query` token must start a word in a dataflow's name or description: matching is a case-insensitive prefix, and a word starts after any character that is not a letter or digit, or at a lowercase-to-uppercase step (`markers` matches `RioMarkers`). A token that opens on such a character, like `&` or `-oecd`, matches anywhere it occurs, so `&` finds `R&D`. `tiva` finds `(TiVA)` but not `activation`, and `employment` does not reach a flow that only mentions unemployment
+- Results rank in three tiers: name matches first, then tokens split across name and description, then description-only, in catalog order within each tier. Optional `agency_id` scope
+- `limit` defaults to 20 and takes any value up to 2,000; a larger one is served at 2,000 with a `notice`. `offset` pages the ranked list, and every response carries `total_matches`
 - Each result carries its `flow_ref` — the identifier every other tool takes — and `matched_in` (`name`, `description`, or `both`)
 
 ---
@@ -86,16 +88,20 @@ All resource data is also reachable via tools. Use `oecd_get_dataset_info` for t
 ### `oecd_get_dimension_values` <sub>tool</sub>
 
 - Takes a `flow_ref` and `dimension_id`; optional `query` substring-matches both code and label
-- `limit` (1–500, default 50) and `offset` page the matches, with the full match count when more remain
+- A codelist is shared across dataflows and can list codes a flow holds no data for. `available_only` lists only the codes with data, from OECD's availability record; `key` (the `oecd_query_dataset` form) lists the codes with data given the key's other segments, and implies `available_only`. Either adds `time_range`, `observation_count`, and `available_only: true` to the result. An availability read that fails falls back to the whole codelist with `available_only: false` and a `notice` naming the failure. A key holding a character outside the SDMX key set, or with too few segments, fails `invalid_key`
+- Availability costs one structure request, sent alongside the codelist read, and no data download. A delegated dataflow's availability is read on the root its data lives on, the one its catalog entry points to. A cold call sends 3 requests without the flag (dataflow reference, concept scheme, codelist) and 4 with it, or 5 for a delegated dataflow whose datastructure `/public/rest` also holds, which adds the datastructure route; a repeat call is served from the structure cache with no request
+- `limit` (default 50) and `offset` page the matches, with the full match count when more remain; a `limit` above 10,000 is served at 10,000 with a `notice`
 
 ---
 
 ### `oecd_query_dataset` <sub>tool</sub>
 
 - `flow_ref` plus a dot-delimited `key` (`+` for multiple values, empty segments as wildcards) and optional `start_period` / `end_period`
-- One row per observation with every dimension and attribute as its own column; `value` is pre-multiplied by `value_scale`
+- One row per observation, sorted by dimension code in key order and then by `TIME_PERIOD`. A row carries `value` (pre-multiplied by `value_scale`) and each component that varies across the result; a coded component appears twice, as its label and as `<ID>_code`
+- Components holding one value across the whole result come back once, in `constant_columns` (`{ code, label }` per component; `{}` when nothing is constant), and leave the rows. Attributes are read at dataset, dimension-group, and observation level, and `UNIT_MULT` scales the value from whichever level carries it
+- A query that matches nothing fails `no_results`, naming the pinned code that has no data, a code matching only by letter case, or a period outside the key's range. Producing that costs one structure request once the dataflow's structure is cached (three on a cold call: dataflow reference, concept scheme, availability) and no data download; if the read fails or takes longer than 10 seconds, the plain message stands
 - Large results spill to DataCanvas with `truncated: true`, `canvas_id`, and `table_name`; without a canvas every row stays in `structuredContent` and only the rendered table is capped (`content_table_capped`)
-- A spill includes a `notice` naming the canvas and table: inspect columns with `oecd_dataframe_describe`, then use `oecd_dataframe_query` for SQL over the full result. Fitting results allocate no new canvas; an explicit `canvas_id` is checked before the download, so a stale one fails as `canvas_not_found` without spending an OECD request.
+- A spill includes a `notice` naming the canvas and table: inspect columns with `oecd_dataframe_describe`, then use `oecd_dataframe_query` for SQL over the full result. The staged table holds every column, constants and `_code` columns included, so SQL can filter on codes. Fitting results allocate no new canvas; an explicit `canvas_id` is checked before the download, so a stale one fails as `canvas_not_found` without spending an OECD request.
 
 ---
 
@@ -108,7 +114,7 @@ All resource data is also reachable via tools. Use `oecd_get_dataset_info` for t
 ### `oecd_dataframe_query` <sub>tool</sub>
 
 - `canvas_id` plus one read-only SQL `SELECT`; writes, DDL, and system-catalog access are rejected
-- `limit` (default 100) returns up to 1,000 rows per call, within 1 MiB of row data; a `limit` from 1,001 to 10,000 is served at 1,000 with a notice
+- `limit` (default 100) returns up to 1,000 rows per call; a larger `limit` is served at 1,000 with a notice
 - `truncated: true` marks a result with more rows than it returned, and its `notice` names how to reach the rest; `row_count` counts the rows returned
 - A query still running after 30 seconds is stopped with `query_timeout`
 
@@ -135,6 +141,7 @@ OECD-specific:
 - Keyless access — no API key required; OECD SDMX 2.1 REST API is fully public
 - Covers 1,500+ dataflows across 20+ OECD statistical departments (national accounts, employment, inflation, trade, education, health, environment, taxation, inequality)
 - Delegated dataflows and codelist revisions resolved end to end — a dataflow OECD catalogues on one service root but defines on another follows the catalog's own link for structure, codes, and observations, and codes come from the revision the datastructure names rather than the endpoint's current latest
+- Structure responses (the dataflow catalog, datastructures, codelists, concept schemes, availability) are cached in process for the lifetime OECD grants each, bounded at 64 MiB, so repeating a lookup inside that window sends no OECD request. The bound and lifetime are not configurable; observations are never cached
 - `AllDimensions` observation mode — one-pass SDMX-JSON decoding into flat row objects, no nested series key reconstruction
 - `oecd_query_dataset` materializes large observation sets (multi-country time-series) on a DuckDB DataCanvas for in-conversation SQL analytics; the `oecd_dataframe_*` tools work on it; DataCanvas is on by default and `CANVAS_PROVIDER_TYPE=none` disables it
 
@@ -142,7 +149,7 @@ Agent-friendly output:
 
 - Workflow-aware tool surface — `flow_ref` from search flows directly into info, values, and query tools without reconstruction
 - Spill signaling — `truncated: true` + `canvas_id` tells the agent to switch to SQL instead of parsing a truncated inline list
-- Full SDMX decoding server-side — agents see `{ REF_AREA: "United States", MEASURE: "Gross domestic product", UNIT_MULT: "Billions", value: 26054614000000, value_scale: 1000000000 }`, not raw index arrays
+- Full SDMX decoding server-side — agents see `{ REF_AREA: "United States", REF_AREA_code: "USA", MEASURE: "Gross domestic product", MEASURE_code: "B1GQ", value: 26054614000000, value_scale: 1000000000 }`, with components that never vary hoisted into `constant_columns`, not raw index arrays
 
 ## Getting started
 
@@ -180,7 +187,8 @@ All configuration is validated at startup via Zod schemas in `src/config/server-
 | Variable | Description | Default |
 |:---------|:------------|:--------|
 | `OECD_BASE_URL` | OECD SDMX REST API base URL. Must be an https origin that answers directly — no redirect is followed, so a plaintext `http://` origin fails instead of being upgraded to https. | `https://sdmx.oecd.org/public/rest` |
-| `OECD_TIMEOUT_MS` | Per-request timeout in milliseconds. | `30000` |
+| `OECD_TIMEOUT_MS` | Per-request timeout in milliseconds. Each tool or resource call also spends one upstream budget of max(50 s, this value) across all its requests and retries, so a value past 50 s needs a client that waits that long for a result. | `30000` |
+| `OECD_CLAMP_LIMITS` | Serve a `limit` above a tool's per-call cap (`oecd_search_datasets` 2,000, `oecd_get_dimension_values` 10,000, `oecd_dataframe_query` 1,000) at the cap, with a `notice`. `false` rejects it instead and advertises the cap as the schema `maximum`. | `true` |
 | `CANVAS_PROVIDER_TYPE` | Canvas engine. With `duckdb`, a large `oecd_query_dataset` result spills to a queryable table instead of just capping the rendered preview; with `none`, every row still comes back in `structuredContent` and only the rendered table is capped. | `duckdb` |
 | `OECD_DATAFRAME_DROP_ENABLED` | Set to `true` to register `oecd_dataframe_drop`. Off, the tool is listed as disabled and clients cannot call it. | `false` |
 | `MCP_TRANSPORT_TYPE` | Transport: `stdio` or `http`. | `stdio` |
@@ -198,7 +206,7 @@ See [`.env.example`](./.env.example) for the full list of optional overrides.
 
 ### Local development
 
-Requires [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
+Requires [Bun v1.4.4](https://bun.sh/) or higher (or Node.js v24+).
 
 - **Clone and install:**
 
@@ -244,10 +252,11 @@ The image defaults to HTTP transport, stateless session mode, and logs to `/var/
 | `src/config/` | Server-specific environment variable parsing and validation with Zod. |
 | `src/mcp-server/tools/definitions/` | Tool definitions (`*.tool.ts`) — eight tools for OECD data discovery, retrieval, and DataCanvas analysis. |
 | `src/mcp-server/resources/definitions/` | Resource definitions (`*.resource.ts`) — the `oecd://dataflow` resource. |
-| `src/services/oecd-http/` | Shared OECD fetch boundary — timeout and retry-classification corrections used by both services below, the response-body reader both share, the origin check every delegated service root passes before it is addressed, the refusal of any redirect off the configured host, and the classification that gives an upstream refusal the same declared reason on every tool and resource. |
-| `src/services/oecd-structure/` | OECD SDMX structure service — dataflows, data structures, codelists. |
-| `src/services/oecd-data/` | OECD SDMX data service — observations, SDMX-JSON decoding, DataCanvas spillover. |
+| `src/services/oecd-http/` | Shared OECD fetch boundary — timeout and retry-classification corrections used by both services below, the response-body reader both share, the per-call upstream budget, the origin check every delegated service root passes before it is addressed, the refusal of any redirect off the configured host, and the classification that gives an upstream refusal the same declared reason on every tool and resource. |
+| `src/services/oecd-structure/` | OECD SDMX structure service — dataflows, data structures, codelists, availability — and the in-process cache in front of its reads. |
+| `src/services/oecd-data/` | OECD SDMX data service — observations and SDMX-JSON decoding. |
 | `src/services/canvas-accessor/` | DataCanvas accessor — registers and exposes the framework canvas instance to tools. |
+| `src/utils/` | Shared helpers — table formatting, `limit` clamping, word-start text matching. |
 | `skills/` | Published agent skill (`oecd-guide`), served over MCP and shipped in the npm package and Docker image. |
 | `tests/` | Unit and integration tests mirroring `src/`. |
 

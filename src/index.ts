@@ -39,7 +39,8 @@ await createApp({
   instructions:
     'OECD Statistics MCP server — keyless access to 1,500+ OECD dataflows via SDMX 2.1.\n' +
     'Workflow: oecd_list_agencies → oecd_search_datasets → oecd_get_dataset_info ' +
-    '→ oecd_get_dimension_values → oecd_query_dataset.\n' +
+    '→ oecd_get_dimension_values (available_only lists only the codes with data) → oecd_query_dataset.\n' +
+    'Each coded component carries <ID>_code beside its label; components that hold one value across a result arrive once in constant_columns.\n' +
     'Large results (multi-country time-series) spill to DataCanvas; ' +
     'use oecd_dataframe_describe + oecd_dataframe_query for SQL analytics.\n' +
     (getServerConfig().dataframeDropEnabled

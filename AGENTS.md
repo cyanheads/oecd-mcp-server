@@ -2,8 +2,8 @@
 
 **Server:** oecd-mcp-server
 **Version:** 0.6.1
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.18`
-**Engines:** Bun ≥1.4.0, Node ≥24.0.0
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` `^2.4.0`
 **Zod:** `^4.6.7`
 
@@ -189,7 +189,7 @@ Handlers throw — the framework catches, classifies, and formats.
 
 **Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive `ctx.fail(reason, …)` typed against the reason union. TypeScript catches typos at compile time, `data.reason` is auto-populated for observability, linter enforces conformance against the handler body. `recovery` is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. The framework puts it on the wire whenever a failure carrying that `reason` arrives without a hint — a bare `ctx.fail('reason')` or a service throw with `data: { reason }` — as `data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim; override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Every error envelope also carries `data.requestId`, the id the server's log records for that call carry, and `content[]` closes with `(reason … · request <id>)`. Mark an entry the service layer throws with `thrownBy: 'service'` so `error-contract-unthrown` skips it — lint-only metadata, nothing at runtime reads it. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
 
-A reason resolved at runtime — `ctx.fail(refusal.reason, …)`, as every OECD-reaching definition here does for the five upstream reasons — puts unknown reasons in play, so both conformance scans bail on that whole definition. The contracts are held together by `tests/error-contract-coherence.test.ts` instead.
+A reason resolved at runtime — `ctx.fail(refusal.reason, …)`, as every OECD-reaching definition here does for the six upstream reasons — puts unknown reasons in play, so both conformance scans bail on that whole definition. The contracts are held together by `tests/error-contract-coherence.test.ts` instead.
 
 ```ts
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
@@ -235,25 +235,33 @@ See framework CLAUDE.md and the `api-errors` skill for the full auto-classificat
 src/
   index.ts                              # createApp() entry point
   config/
-    server-config.ts                    # Server-specific env vars (OECD_BASE_URL, OECD_TIMEOUT_MS, OECD_DATAFRAME_DROP_ENABLED)
+    server-config.ts                    # Server-specific env vars (OECD_BASE_URL, OECD_TIMEOUT_MS, OECD_DATAFRAME_DROP_ENABLED, OECD_CLAMP_LIMITS)
   services/
     oecd-http/
-      oecd-http.ts                      # Shared OECD fetch boundary (timeout, retry classification)
+      oecd-http.ts                      # Shared OECD fetch boundary (timeout, retry classification, upstream reasons)
+      upstream-budget.ts                # One upstream budget per tool call: a deadline over every request, retry, and backoff
+      external-service-root.ts          # Origin check a delegated service root passes before it is addressed
     oecd-structure/
       oecd-structure-service.ts         # OECD SDMX structure API (dataflows, data structures, codelists)
+      response-cache.ts                 # In-process cache of decoded structure responses, bounded in bytes
+      availability.ts                   # availableconstraint read: codes with data for a key, and the no-data diagnosis
       types.ts                          # Structure domain types
     oecd-data/
       oecd-data-service.ts              # OECD SDMX data API (observations, SDMX-JSON decoding)
       types.ts                          # Data domain types
     canvas-accessor/
       canvas-accessor.ts                # DataCanvas instance accessor for tools
+  utils/
+    count-limit.ts                      # limit inputs served at a per-call cap with a notice (OECD_CLAMP_LIMITS)
+    word-start-text.ts                  # Case-insensitive token matching anchored at word starts
+    format-table.ts                     # Markdown table rendering for content[]
   mcp-server/
     tools/definitions/
       list-agencies.tool.ts             # oecd_list_agencies
       search-datasets.tool.ts           # oecd_search_datasets
       get-dataset-info.tool.ts          # oecd_get_dataset_info
       get-dimension-values.tool.ts      # oecd_get_dimension_values
-      query-dataset.tool.ts             # oecd_query_dataset (with DataCanvas spillover)
+      query-dataset.tool.ts             # oecd_query_dataset (stages large results on DataCanvas)
       dataframe-describe.tool.ts        # oecd_dataframe_describe
       dataframe-query.tool.ts           # oecd_dataframe_query
       dataframe-drop.tool.ts            # oecd_dataframe_drop (opt-in: OECD_DATAFRAME_DROP_ENABLED)
@@ -366,9 +374,7 @@ When you complete a skill's checklist, check the boxes and add a completion time
 
 ## Bundling
 
-`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs (`framework-skills/`, `skills/`, `.claude/`, `.agents/`, `SKILL.md`) at a package's root — a `skills/` nested deeper is runtime code (the MCP SDK's `dist/ext/skills/`) and ships, a narrowing this server carries in both `scripts/clean-mcpb.ts` and `scripts/lint-packaging.ts` and pins in `tests/scripts/bundle-agent-docs.test.ts`; platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, `CLAUDE.md`, `AGENTS.md`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. The bundle therefore ships without DuckDB's native binding and sets `CANVAS_PROVIDER_TYPE=none`; queries return inline data and canvas tools report `canvas_disabled`. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
-
-`@duckdb/node-api` stays on 1.5.6: the framework's optional peer also admits 2.x, but its canvas SQL gate refuses `SHOW <table>` on DuckDB 2 with `plan_operator_not_allowed` (cyanheads/mcp-ts-core#800), a query 1.5.x answers with the column listing.
+`npm run bundle` produces a `.mcpb` extension bundle for one-click install in Claude Desktop. `mcpb pack` reads `.mcpbignore`, not `.gitignore`, so every root path the bundle must not ship — source, tests, docs, caches, logs, agent docs, plugin manifests, gitignored local files — needs a root-anchored line there (`/docs/`, never `docs/`, which also strips `node_modules/*/docs/`); `lint:packaging` names each missing or unanchored line. Root `skills/` ships on purpose. The pack step is followed by `scripts/clean-mcpb.ts`, which prunes dev dependencies (`mcpb clean`) and strips four classes of `node_modules/**` content that root-anchored `.mcpbignore` patterns cannot reach: dependency-shipped agent docs — `framework-skills/`, `skills/`, `.claude/`, `.agents/`, `AGENTS.md`, and `CLAUDE.md` at a package's root, and `SKILL.md` anywhere (a `skills/` deeper in a package is runtime code — the MCP SDK's `dist/ext/skills/` — and ships, which `tests/scripts/bundle-agent-docs.test.ts` pins); platform-specific native bindings, which would otherwise lock the bundle to the platform it was packed on; node-gyp build output beside a `binding.gyp` (`config.gypi`, Makefiles, `obj.target/`, `.deps/`, object files and debug symbols), which records the packing machine's paths — compiled `*.node` addons stay; and build-only package files — the framework's `changelog/`, `scripts/`, `templates/`, and config bases (`biome.json`, `vitest.config.base.mjs`, `config/tsconfig.base.json`), and `better-sqlite3`'s `deps/` and `src/` C sources. The bundle therefore ships without DuckDB's native binding and sets `CANVAS_PROVIDER_TYPE=none`; queries return inline data and canvas tools report `canvas_disabled`. MCPB is stdio-only — HTTP and Cloudflare Workers deployments are unaffected. Consumers who don't need it can delete `manifest.json` and `.mcpbignore`; `lint:packaging` skips cleanly.
 
 **Adding an env var requires both files:** `server.json` (registry discovery, `environmentVariables[]`) and `manifest.json` (bundle install UX, `mcp_config.env` + `user_config`). `lint:packaging` (run by `devcheck`) verifies the env var names match, that every `user_config` option is wired into `mcp_config.env` as `"X": "${user_config.X}"` (the host substitutes nothing else — `"${X}"` reaches the server as that literal string), and that an optional string option carries `"default": ""`.
 

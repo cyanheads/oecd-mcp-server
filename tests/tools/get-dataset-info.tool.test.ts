@@ -3,6 +3,7 @@
  * @module tests/tools/get-dataset-info.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
   createFetchMock,
@@ -10,9 +11,21 @@ import {
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getServerConfig } from '@/config/server-config.js';
 import { oecdGetDatasetInfo } from '@/mcp-server/tools/definitions/get-dataset-info.tool.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
-import { declaredRecovery, toolWireError } from '../helpers/error-contract.js';
+import { declaredRecovery, toolWireError, toolWireFailure } from '../helpers/error-contract.js';
+import { cacheableJson, noResultsFound } from '../helpers/oecd-response.js';
+import {
+  installScriptedFetch,
+  json,
+  observe,
+  PROXY_PAGE,
+  runUntil,
+  type ScriptedAnswer,
+  type ScriptedFetch,
+  STALL,
+} from '../helpers/scripted-fetch.js';
 
 /** Answer every request with a fresh copy of one response — a body reads once. */
 function respondWith(build: Response): void {
@@ -82,15 +95,7 @@ describe('oecdGetDatasetInfo', () => {
     process.env.OECD_BASE_URL = FAKE_BASE;
     process.env.OECD_TIMEOUT_MS = '5000';
     initStructureService();
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: () => Promise.resolve(DSD_RESPONSE),
-        text: () => Promise.resolve(JSON.stringify(DSD_RESPONSE)),
-      }),
-    );
+    respondWith(Response.json(DSD_RESPONSE));
   });
 
   it('returns dimensions and time dimension for a valid flow_ref', async () => {
@@ -127,7 +132,7 @@ describe('oecdGetDatasetInfo', () => {
 
   it('names a throttled structure read rate_limited with a wait-it-out hint', async () => {
     // OECD charges one throttle budget across the data and structure endpoints,
-    // so a refused /datastructure is an ordinary outcome — and the hint matters
+    // so a refused structure read is an ordinary outcome — and the hint matters
     // most here, since withRetry has already spent its attempts and its backoff
     // by the time the refusal surfaces.
     respondWith(
@@ -183,15 +188,7 @@ describe('oecdGetDatasetInfo', () => {
   });
 
   it('throws ctx.fail(dataflow_not_found) when DSD response is empty', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: () => Promise.resolve({ data: { dataStructures: [] } }),
-        text: () => Promise.resolve('{}'),
-      }),
-    );
+    respondWith(Response.json({ data: { dataStructures: [] } }));
     const ctx = createMockContext({ errors: oecdGetDatasetInfo.errors });
     const input = oecdGetDatasetInfo.input.parse({
       flow_ref: 'OECD.SDD.NAD,DSD_MISSING@DF_MISSING',
@@ -203,16 +200,11 @@ describe('oecdGetDatasetInfo', () => {
   });
 
   it('throws ctx.fail(dataflow_not_found) when datastructure is missing from the 200 response', async () => {
-    // parseDataStructure throws a NotFound for an empty dataStructures array in a
-    // 200 response, which isDataflowNotFound picks up through the cause chain.
-    vi.stubGlobal(
-      'fetch',
-      vi.fn().mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: () => Promise.resolve({ data: { dataStructures: [] } }),
-        text: () => Promise.resolve('{}'),
-      }),
+    // A dataflow entry with no datastructure beside it and no external
+    // reference to follow resolves nowhere, which the service reports as a
+    // NotFound the tool maps to its contract entry.
+    respondWith(
+      Response.json({ data: { dataflows: [{ agencyID: 'OECD.SDD.NAD', id: 'DSD_X@DF_X' }] } }),
     );
     const ctx = createMockContext({ errors: oecdGetDatasetInfo.errors });
     const input = oecdGetDatasetInfo.input.parse({
@@ -244,7 +236,6 @@ describe('oecdGetDatasetInfo', () => {
       ],
       time_dimension: { id: 'TIME_PERIOD', name: 'Time Period', position: 3 },
       key_example: '.',
-      non_production: false,
       source: 'OECD' as const,
     };
     const blocks = oecdGetDatasetInfo.format!(output);
@@ -286,6 +277,7 @@ const MISMATCHED_PREFIX_DSD_RESPONSE = {
 
 const MISMATCHED_FLOW_REF = 'OECD.CFE.EDS,DSD_REG_LAB@DF_RATES';
 const MISMATCHED_DATAFLOW_URL = `${FAKE_BASE}/dataflow/OECD.CFE.EDS/DSD_REG_LAB@DF_RATES?references=datastructure`;
+const MISTYPED_DATAFLOW_URL = `${FAKE_BASE}/dataflow/OECD.SDD.TPS/DSD_LFS@DF_IALFS_UNE_MM?references=datastructure`;
 
 describe('oecdGetDatasetInfo prefix/datastructure mismatch', () => {
   const http = createFetchMock();
@@ -318,6 +310,8 @@ describe('oecdGetDatasetInfo prefix/datastructure mismatch', () => {
     const result = await runToolContract(oecdGetDatasetInfo, { flow_ref: MISMATCHED_FLOW_REF });
 
     expect(result.isError).toBeFalsy();
+    // The dataflow's own reference answers, so the prefix route is never asked.
+    expect(http.calls.map((c) => c.request.url)).toEqual([MISMATCHED_DATAFLOW_URL]);
     expect(result.structuredContent).toMatchObject({
       flow_ref: MISMATCHED_FLOW_REF,
       dimensions: [
@@ -330,24 +324,31 @@ describe('oecdGetDatasetInfo prefix/datastructure mismatch', () => {
     expect(text).toContain('REF_AREA');
   });
 
-  it('still reports a dataflow OECD does not publish as not-found', async () => {
+  it('reports a dataflow OECD does not publish as not-found after one request, though its datastructure exists', async () => {
+    // The real flow is DF_IALFS_UNE_M. Its datastructure route answers for any
+    // dataflow id paired with DSD_LFS, so only the dataflow route can say no.
     http.route(
       {
-        match: `${FAKE_BASE}/datastructure/OECD.SDD.NAD/DSD_GONE`,
-        respond: () => new Response('Could not find requested structures', { status: 404 }),
+        match: `${FAKE_BASE}/datastructure/OECD.SDD.TPS/DSD_LFS`,
+        respond: () => cacheableJson(DSD_RESPONSE),
       },
-      {
-        match: `${FAKE_BASE}/dataflow/OECD.SDD.NAD/DSD_GONE@DF_GONE?references=datastructure`,
-        respond: () => new Response('Could not find requested structures', { status: 404 }),
-      },
+      { match: MISTYPED_DATAFLOW_URL, respond: () => noResultsFound() },
     );
 
-    const ctx = createMockContext({ errors: oecdGetDatasetInfo.errors });
-    const input = oecdGetDatasetInfo.input.parse({ flow_ref: 'OECD.SDD.NAD,DSD_GONE@DF_GONE' });
-    await expect(oecdGetDatasetInfo.handler(input, ctx)).rejects.toMatchObject({
-      code: JsonRpcErrorCode.NotFound,
-      data: { reason: 'dataflow_not_found' },
+    const { error, text } = await toolWireFailure(oecdGetDatasetInfo, {
+      flow_ref: 'OECD.SDD.TPS,DSD_LFS@DF_IALFS_UNE_MM',
     });
+
+    expect(http.calls.map((c) => c.request.url)).toEqual([MISTYPED_DATAFLOW_URL]);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: {
+        reason: 'dataflow_not_found',
+        recovery: { hint: declaredRecovery(oecdGetDatasetInfo, 'dataflow_not_found') },
+      },
+    });
+    expect(error.message).toContain('OECD.SDD.TPS,DSD_LFS@DF_IALFS_UNE_MM');
+    expect(text).toContain('(reason dataflow_not_found');
   });
 
   it('rejects a prefix carrying path characters before any request is issued', async () => {
@@ -412,10 +413,11 @@ const CONCEPT_SCHEME_RESPONSE = {
   },
 };
 
-const DSD_URL = `${FAKE_BASE}/datastructure/OECD.SDD.NAD/DSD_NAMAIN1`;
+const NAMAIN_FLOW_REF = 'OECD.SDD.NAD,DSD_NAMAIN1@DF_QNA_EXPENDITURE_GROWTH_OECD';
+/** The dataflow's own route, which answers with the datastructure revision it references. */
+const REFERENCE_URL = `${FAKE_BASE}/dataflow/OECD.SDD.NAD/DSD_NAMAIN1@DF_QNA_EXPENDITURE_GROWTH_OECD?references=datastructure`;
 /** The fixture URNs reference `CS_NA(1.0)`, and that version is what gets addressed. */
 const SCHEME_URL = `${FAKE_BASE}/conceptscheme/OECD.SDD.NAD/CS_NA/1.0`;
-const NAMAIN_FLOW_REF = 'OECD.SDD.NAD,DSD_NAMAIN1@DF_QNA_EXPENDITURE_GROWTH_OECD';
 
 describe('oecdGetDatasetInfo dimension names', () => {
   const http = createFetchMock();
@@ -434,7 +436,7 @@ describe('oecdGetDatasetInfo dimension names', () => {
 
   it('reports what an opaque dimension id means', async () => {
     http.route(
-      { match: DSD_URL, respond: () => Response.json(NAMELESS_DSD_RESPONSE) },
+      { match: REFERENCE_URL, respond: () => Response.json(NAMELESS_DSD_RESPONSE) },
       { match: SCHEME_URL, respond: () => Response.json(CONCEPT_SCHEME_RESPONSE) },
     );
 
@@ -442,6 +444,8 @@ describe('oecdGetDatasetInfo dimension names', () => {
     const input = oecdGetDatasetInfo.input.parse({ flow_ref: NAMAIN_FLOW_REF });
     const result = await oecdGetDatasetInfo.handler(input, ctx);
 
+    // One structure request and the concept scheme; the datastructure route is never asked.
+    expect(http.calls.map((c) => c.request.url)).toEqual([REFERENCE_URL, SCHEME_URL]);
     expect(result.dimensions[0]).toMatchObject({
       id: 'INSTR_ASSET',
       name: 'Financial instruments and non-financial assets',
@@ -454,7 +458,7 @@ describe('oecdGetDatasetInfo dimension names', () => {
 
   it('answers with ids rather than failing when the concept scheme is down', async () => {
     http.route(
-      { match: DSD_URL, respond: () => Response.json(NAMELESS_DSD_RESPONSE) },
+      { match: REFERENCE_URL, respond: () => Response.json(NAMELESS_DSD_RESPONSE) },
       { match: SCHEME_URL, respond: () => new Response('upstream boom', { status: 503 }) },
     );
 
@@ -463,5 +467,245 @@ describe('oecdGetDatasetInfo dimension names', () => {
     const result = await oecdGetDatasetInfo.handler(input, ctx);
 
     expect(result.dimensions.map((d) => d.name)).toEqual(['INSTR_ASSET', 'ADJUSTMENT']);
+  });
+});
+
+// ── The dataflow reference ────────────────────────────────────────────────────
+
+/**
+ * What the dataflow route answers: the dataflow entry, carrying the
+ * `NonProductionDataflow` annotation OECD puts on every catalogued flow, beside
+ * the datastructure revision it references.
+ */
+const REFERENCE_RESPONSE = {
+  data: {
+    dataflows: [
+      {
+        agencyID: 'OECD.SDD.NAD',
+        id: 'DSD_NAMAIN1@DF_QNA_EXPENDITURE_GROWTH_OECD',
+        annotations: [{ type: 'NonProductionDataflow', text: 'true' }],
+      },
+    ],
+    dataStructures: NAMELESS_DSD_RESPONSE.data.dataStructures,
+  },
+};
+
+describe('oecdGetDatasetInfo dataflow reference', () => {
+  const http = createFetchMock();
+
+  beforeEach(() => {
+    http.reset();
+    http.install();
+    process.env.OECD_BASE_URL = FAKE_BASE;
+    process.env.OECD_TIMEOUT_MS = '5000';
+    // A fresh service holds an empty cache, so no earlier test's structure is served here.
+    initStructureService();
+  });
+
+  afterEach(() => {
+    http.restore();
+  });
+
+  it('reports no non_production status on either surface, since OECD annotates every flow alike', async () => {
+    http.route(
+      { match: REFERENCE_URL, respond: () => Response.json(REFERENCE_RESPONSE) },
+      { match: SCHEME_URL, respond: () => Response.json(CONCEPT_SCHEME_RESPONSE) },
+    );
+
+    const result = await runToolContract(oecdGetDatasetInfo, { flow_ref: NAMAIN_FLOW_REF });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ flow_ref: NAMAIN_FLOW_REF });
+    expect(result.structuredContent).not.toHaveProperty('non_production');
+    const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    expect(text).toContain('Financial instruments and non-financial assets');
+    expect(text).not.toContain('non_production');
+    expect(JSON.stringify(z.toJSONSchema(oecdGetDatasetInfo.output))).not.toContain(
+      'non_production',
+    );
+  });
+
+  it('answers a repeat call inside max-age without a request', async () => {
+    http.route(
+      { match: REFERENCE_URL, respond: () => cacheableJson(REFERENCE_RESPONSE) },
+      { match: SCHEME_URL, respond: () => cacheableJson(CONCEPT_SCHEME_RESPONSE) },
+    );
+
+    const first = await runToolContract(oecdGetDatasetInfo, { flow_ref: NAMAIN_FLOW_REF });
+    expect(http.calls.map((c) => c.request.url)).toEqual([REFERENCE_URL, SCHEME_URL]);
+
+    const repeat = await runToolContract(oecdGetDatasetInfo, { flow_ref: NAMAIN_FLOW_REF });
+
+    expect(http.calls).toHaveLength(2);
+    expect(repeat.isError).toBeFalsy();
+    expect(repeat.structuredContent).toEqual(first.structuredContent);
+    expect(repeat.content).toEqual(first.content);
+    // The names came from the stored concept scheme, not from the ids.
+    expect(repeat.structuredContent).toMatchObject({
+      dimensions: [
+        { name: 'Financial instruments and non-financial assets' },
+        { name: 'Adjustment' },
+      ],
+    });
+  });
+
+  /**
+   * A dataflow the configured root catalogues as a pointer and only the root it
+   * points to defines. The configured root's datastructure route 404s, and a 404
+   * is never stored; the repeat call still sends nothing.
+   */
+  it('answers a repeat call for a dataflow its delegated root defines without a request', async () => {
+    const delegatedRoot = `${FAKE_BASE}/sti-public/rest`;
+    const flowRef = 'OECD.STI.PIE,DSD_TIVA_MAINLV@DF_MAINLV';
+    const flowPath = '/dataflow/OECD.STI.PIE/DSD_TIVA_MAINLV@DF_MAINLV?references=datastructure';
+    http.route(
+      {
+        match: `${FAKE_BASE}${flowPath}`,
+        respond: () =>
+          cacheableJson({
+            data: {
+              dataStructures: [],
+              dataflows: [
+                {
+                  agencyID: 'OECD.STI.PIE',
+                  id: 'DSD_TIVA_MAINLV@DF_MAINLV',
+                  isExternalReference: true,
+                  links: [
+                    {
+                      rel: 'external',
+                      href: `${delegatedRoot}/dataflow/OECD.STI.PIE/DSD_TIVA_MAINLV@DF_MAINLV/1.2`,
+                    },
+                  ],
+                },
+              ],
+            },
+          }),
+      },
+      {
+        match: `${FAKE_BASE}/datastructure/OECD.STI.PIE/DSD_TIVA_MAINLV`,
+        respond: () => new Response('Could not find requested structures', { status: 404 }),
+      },
+      { match: `${delegatedRoot}${flowPath}`, respond: () => cacheableJson(NAMELESS_DSD_RESPONSE) },
+      {
+        match: `${delegatedRoot}/conceptscheme/OECD.SDD.NAD/CS_NA/1.0`,
+        respond: () => cacheableJson(CONCEPT_SCHEME_RESPONSE),
+      },
+    );
+
+    const first = await runToolContract(oecdGetDatasetInfo, { flow_ref: flowRef });
+    const cold = http.calls.length;
+    const repeat = await runToolContract(oecdGetDatasetInfo, { flow_ref: flowRef });
+
+    expect({ cold, warm: http.calls.length - cold }).toEqual({ cold: 4, warm: 0 });
+    expect(repeat.isError).toBeFalsy();
+    expect(repeat.structuredContent).toEqual(first.structuredContent);
+    expect(repeat.content).toEqual(first.content);
+    expect(repeat.structuredContent).toMatchObject({
+      dimensions: [{ name: 'Financial instruments and non-financial assets' }, {}],
+    });
+  });
+});
+
+// ── Upstream failure wiring ───────────────────────────────────────────────────
+
+/**
+ * How each upstream failure reaches this tool's caller. The mechanisms — the
+ * reason mapping and the call's budget — are tabled at the HTTP boundary; these
+ * prove the tool is wired to them, one case per side of each branch.
+ */
+describe('oecdGetDatasetInfo upstream failure wiring', () => {
+  const input = { flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I' };
+  let configured: { baseUrl: string; timeoutMs: number };
+  let fake: ScriptedFetch | undefined;
+
+  function serve(datastructure: ScriptedAnswer): ScriptedFetch {
+    fake = installScriptedFetch(() => datastructure);
+    return fake;
+  }
+
+  beforeEach(() => {
+    process.env.OECD_BASE_URL = FAKE_BASE;
+    process.env.OECD_TIMEOUT_MS = '5000';
+    const config = getServerConfig();
+    configured = { baseUrl: config.baseUrl, timeoutMs: config.timeoutMs };
+    // The default OECD_TIMEOUT_MS: a stalled ladder runs into the budget, not out of attempts.
+    config.timeoutMs = 30_000;
+    initStructureService();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    Object.assign(getServerConfig(), configured);
+    initStructureService();
+    const installed = fake;
+    fake = undefined;
+    installed?.restore();
+  });
+
+  it('names a datastructure body that is not JSON upstream_unreadable, after one request', async () => {
+    const http = serve(PROXY_PAGE);
+    const hint = declaredRecovery(oecdGetDatasetInfo, 'upstream_unreadable');
+
+    const { error, text } = await toolWireFailure(oecdGetDatasetInfo, input);
+
+    expect(http.requests.map((r) => r.url)).toEqual([
+      `${FAKE_BASE}/dataflow/OECD.SDD.NAD/DSD_NAAG@DF_NAAG_I?references=datastructure`,
+    ]);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'upstream_unreadable', recovery: { hint }, retryable: false },
+    });
+    expect(error.message).toContain('not JSON (declared content type: text/html)');
+    expect(text).toContain(hint);
+  });
+
+  it('names a datastructure 422 upstream_error, carrying the status and OECD’s text', async () => {
+    serve({ body: 'Semantic error in the structure query', kind: 'answer', status: 422 });
+
+    const error = await toolWireError(oecdGetDatasetInfo, input);
+
+    expect(error.data).toMatchObject({
+      reason: 'upstream_error',
+      recovery: { hint: declaredRecovery(oecdGetDatasetInfo, 'upstream_error') },
+    });
+    expect(error.message).toContain(
+      'OECD answered HTTP 422: Semantic error in the structure query',
+    );
+  });
+
+  it('ends a stalled datastructure read as upstream_timeout when the call’s budget runs out', async () => {
+    vi.useFakeTimers({ now: 0 });
+    const http = serve(STALL);
+
+    const call = observe(toolWireError(oecdGetDatasetInfo, input));
+    const { outcome, pendingBefore } = await runUntil(call, 50_000);
+
+    expect(pendingBefore).toBe(true);
+    expect(call.settledAtMs).toBe(50_000);
+    expect(http.requests).toHaveLength(2);
+    expect(outcome).toMatchObject({
+      status: 'fulfilled',
+      value: {
+        code: JsonRpcErrorCode.Timeout,
+        data: {
+          reason: 'upstream_timeout',
+          recovery: { hint: declaredRecovery(oecdGetDatasetInfo, 'upstream_timeout') },
+        },
+      },
+    });
+  });
+
+  it('lets a failure with no OECD answer behind it through as itself', async () => {
+    getServerConfig().baseUrl = 'ftp://fake.oecd.test';
+    initStructureService();
+    const http = serve(json(DSD_RESPONSE));
+
+    const error = await toolWireError(oecdGetDatasetInfo, input);
+
+    expect(http.requests).toHaveLength(0);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_url' },
+    });
   });
 });

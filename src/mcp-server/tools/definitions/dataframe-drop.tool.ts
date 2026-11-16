@@ -32,7 +32,7 @@ const oecdDataframeDropDefinition = tool('oecd_dataframe_drop', {
       .string()
       .describe(
         'Name of the table or view to drop, exactly as oecd_dataframe_describe lists it ' +
-          '(e.g. spilled_ab12cd34ef).',
+          '(e.g. spilled_ab12cd34).',
       ),
   }),
   output: z.object({

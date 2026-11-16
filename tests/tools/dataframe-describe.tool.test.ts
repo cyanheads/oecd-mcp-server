@@ -45,9 +45,9 @@ describe('oecdDataframeDescribe', () => {
         kind: 'table',
         rowCount: 380,
         columns: [
-          { name: 'FREQ', type: 'VARCHAR' },
-          { name: 'REF_AREA', type: 'VARCHAR' },
-          { name: 'value', type: 'DOUBLE' },
+          { name: 'FREQ', type: 'VARCHAR', engineType: 'VARCHAR' },
+          { name: 'REF_AREA', type: 'VARCHAR', engineType: 'VARCHAR' },
+          { name: 'value', type: 'DOUBLE', engineType: 'DOUBLE' },
         ],
       },
     ];
@@ -70,6 +70,17 @@ describe('oecdDataframeDescribe', () => {
     });
     expect(result.tables[0]?.columns).toHaveLength(3);
     expect(result.tables[0]?.columns[0]).toEqual({ name: 'FREQ', type: 'VARCHAR' });
+  });
+
+  it('hands the caller’s signal to describe, so a cancelled call stops reading the canvas', async () => {
+    const mockInstance = buildMockInstance('canvas-001', []);
+    setCanvas({ acquire: vi.fn().mockResolvedValue(mockInstance) } as never);
+
+    const ctx = createMockContext({ errors: oecdDataframeDescribe.errors });
+    const input = oecdDataframeDescribe.input.parse({ canvas_id: 'canvas-001' });
+    await oecdDataframeDescribe.handler(input, ctx);
+
+    expect(mockInstance.describe).toHaveBeenCalledWith({ signal: ctx.signal });
   });
 
   it('throws ctx.fail(canvas_not_found) when acquire throws', async () => {

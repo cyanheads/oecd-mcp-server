@@ -4,23 +4,34 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createFetchMock, createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import {
+  createFetchMock,
+  createMockContext,
+  runToolContract,
+} from '@cyanheads/mcp-ts-core/testing';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getServerConfig } from '@/config/server-config.js';
 import { oecdListAgencies } from '@/mcp-server/tools/definitions/list-agencies.tool.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
-import { declaredRecovery, toolWireError } from '../helpers/error-contract.js';
+import { declaredRecovery, toolWireError, toolWireFailure } from '../helpers/error-contract.js';
+import {
+  installScriptedFetch,
+  json,
+  observe,
+  PROXY_PAGE,
+  runUntil,
+  type ScriptedAnswer,
+  type ScriptedFetch,
+  STALL,
+} from '../helpers/scripted-fetch.js';
 
 const FAKE_BASE = 'https://fake.oecd.test';
 
-function setupMockFetch(responseBody: unknown, ok = true, status = 200) {
+/** A fresh `Response` per call — a single instance can only be read once. */
+function stubFetchJson(body: unknown) {
   vi.stubGlobal(
     'fetch',
-    vi.fn().mockResolvedValue({
-      ok,
-      status,
-      json: () => Promise.resolve(responseBody),
-      text: () => Promise.resolve(JSON.stringify(responseBody)),
-    }),
+    vi.fn(() => Promise.resolve(Response.json(body))),
   );
 }
 
@@ -65,7 +76,7 @@ describe('oecdListAgencies', () => {
   });
 
   it('returns aggregated agency counts', async () => {
-    setupMockFetch(DATAFLOWS_RESPONSE);
+    stubFetchJson(DATAFLOWS_RESPONSE);
     const ctx = createMockContext({ errors: oecdListAgencies.errors });
     const result = await oecdListAgencies.handler({}, ctx);
 
@@ -260,5 +271,133 @@ describe('oecdListAgencies directorates', () => {
 
     expect(result.total_agencies).toBe(3);
     expect(result.agencies.every((a) => a.directorate === undefined)).toBe(true);
+  });
+});
+
+// ── Upstream failure wiring ───────────────────────────────────────────────────
+
+/**
+ * How each upstream failure reaches this tool's caller. The mechanisms — the
+ * reason mapping and the call's budget — are tabled at the HTTP boundary; these
+ * prove the tool is wired to them, one case per side of each branch.
+ */
+describe('oecdListAgencies upstream failure wiring', () => {
+  let configured: { baseUrl: string; timeoutMs: number };
+  let fake: ScriptedFetch | undefined;
+
+  /** Answer the catalog and the agency scheme each from its own script. */
+  function serve(
+    catalog: ScriptedAnswer,
+    agencyScheme = json(AGENCY_SCHEME_RESPONSE),
+  ): ScriptedFetch {
+    fake = installScriptedFetch((url) => (url.includes('/agencyscheme/') ? agencyScheme : catalog));
+    return fake;
+  }
+
+  beforeEach(() => {
+    process.env.OECD_BASE_URL = FAKE_BASE;
+    process.env.OECD_TIMEOUT_MS = '5000';
+    const config = getServerConfig();
+    configured = { baseUrl: config.baseUrl, timeoutMs: config.timeoutMs };
+    // The default OECD_TIMEOUT_MS: a stalled ladder runs into the budget, not out of attempts.
+    config.timeoutMs = 30_000;
+    initStructureService();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    Object.assign(getServerConfig(), configured);
+    initStructureService();
+    const installed = fake;
+    fake = undefined;
+    installed?.restore();
+  });
+
+  it('names a catalog body that is not JSON upstream_unreadable, after one request', async () => {
+    const http = serve(PROXY_PAGE);
+    const hint = declaredRecovery(oecdListAgencies, 'upstream_unreadable');
+
+    const { error, text } = await toolWireFailure(oecdListAgencies, {});
+
+    expect(http.requestsTo('/dataflow')).toHaveLength(1);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { reason: 'upstream_unreadable', recovery: { hint }, retryable: false },
+    });
+    expect(error.message).toContain('not JSON (declared content type: text/html)');
+    expect(text).toContain(hint);
+    expect(text).toContain('(reason upstream_unreadable · not retryable)');
+  });
+
+  it('names a catalog 422 upstream_error, carrying the status and OECD’s text', async () => {
+    serve({ body: 'Semantic error in the structure query', kind: 'answer', status: 422 });
+
+    const error = await toolWireError(oecdListAgencies, {});
+
+    expect(error.data).toMatchObject({
+      reason: 'upstream_error',
+      recovery: { hint: declaredRecovery(oecdListAgencies, 'upstream_error') },
+    });
+    expect(error.message).toContain(
+      'OECD answered HTTP 422: Semantic error in the structure query',
+    );
+  });
+
+  it('ends a stalled catalog read as upstream_timeout when the call’s budget runs out', async () => {
+    vi.useFakeTimers({ now: 0 });
+    const http = serve(STALL, STALL);
+
+    const call = observe(toolWireError(oecdListAgencies, {}));
+    const { outcome, pendingBefore } = await runUntil(call, 50_000);
+
+    expect(pendingBefore).toBe(true);
+    expect(call.settledAtMs).toBe(50_000);
+    expect(http.requestsTo('/dataflow')).toHaveLength(2);
+    expect(outcome).toMatchObject({
+      status: 'fulfilled',
+      value: {
+        code: JsonRpcErrorCode.Timeout,
+        data: {
+          reason: 'upstream_timeout',
+          recovery: { hint: declaredRecovery(oecdListAgencies, 'upstream_timeout') },
+        },
+      },
+    });
+  });
+
+  it('lists agencies without directorates once a stalled agency scheme spends the budget', async () => {
+    vi.useFakeTimers({ now: 0 });
+    const http = serve(json(MIXED_PUBLISHER_DATAFLOWS), STALL);
+
+    const call = observe(runToolContract(oecdListAgencies, {}));
+    const { outcome, pendingBefore } = await runUntil(call, 50_000);
+
+    expect(pendingBefore).toBe(true);
+    expect(call.settledAtMs).toBe(50_000);
+    expect(http.requestsTo('/agencyscheme/')).toHaveLength(2);
+    expect(outcome.status).toBe('fulfilled');
+    const result = (outcome as PromiseFulfilledResult<Awaited<ReturnType<typeof runToolContract>>>)
+      .value;
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ total_agencies: 3 });
+    expect(
+      (result.structuredContent as { agencies: Array<{ directorate?: string }> }).agencies.every(
+        (a) => a.directorate === undefined,
+      ),
+    ).toBe(true);
+  });
+
+  it('lets a failure with no OECD answer behind it through as itself', async () => {
+    getServerConfig().baseUrl = 'ftp://fake.oecd.test';
+    initStructureService();
+    const http = serve(json(MIXED_PUBLISHER_DATAFLOWS));
+
+    const error = await toolWireError(oecdListAgencies, {});
+
+    expect(http.requests).toHaveLength(0);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_url' },
+    });
   });
 });

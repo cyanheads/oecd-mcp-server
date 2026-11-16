@@ -6,6 +6,7 @@
 import { resource, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
+import { UpstreamBudget } from '@/services/oecd-http/upstream-budget.js';
 import {
   getStructureService,
   isDataflowNotFound,
@@ -61,16 +62,13 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
       })
       .optional()
       .describe(
-        'Time dimension, if present — used for startPeriod/endPeriod filtering in oecd_query_dataset.',
+        'Time dimension, if present — used for start_period/end_period filtering in oecd_query_dataset.',
       ),
     key_example: z
       .string()
       .describe(
         'Dot-delimited key with all segments empty (wildcards). Replace segments with codes from oecd_get_dimension_values.',
       ),
-    non_production: z
-      .boolean()
-      .describe('True if OECD flagged this dataflow as experimental or deprecated.'),
     source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
   }),
   /**
@@ -94,7 +92,7 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
     {
       reason: 'dataflow_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No datastructure was found for the flow reference the URI segments name.',
+      when: 'OECD publishes no dataflow under the flow reference the URI segments name, or the dataflow resolves to no datastructure.',
       recovery:
         'Verify the flow_ref with oecd_search_datasets. ' +
         'The dataflow may have been renamed or removed.',
@@ -103,7 +101,7 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
       retryable: true,
-      when: 'OECD throttled the request rate and was still refusing after the retries.',
+      when: "OECD throttled the request rate and was still refusing after the retries, or asked for a wait longer than the call's upstream budget had left.",
       recovery:
         'Wait several seconds before calling again, and space out consecutive queries ' +
         'rather than issuing them back to back.',
@@ -112,10 +110,9 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
       reason: 'upstream_timeout',
       code: JsonRpcErrorCode.Timeout,
       retryable: true,
-      when: 'OECD did not finish responding before OECD_TIMEOUT_MS elapsed.',
+      when: "An OECD request ran past OECD_TIMEOUT_MS, or the call's requests and retries together ran past its upstream budget — 50 seconds, or OECD_TIMEOUT_MS when that is longer.",
       recovery:
-        'Retry once — a structure response runs to megabytes and is occasionally slow — ' +
-        'and raise OECD_TIMEOUT_MS if it keeps timing out.',
+        'Retry once — a structure response runs to megabytes and is occasionally slow — and raise OECD_TIMEOUT_MS if it keeps timing out; a value past 50 seconds also needs a client that waits that long for a result.',
     },
     {
       reason: 'upstream_unavailable',
@@ -138,10 +135,17 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'OECD refused the request with a status this server does not model — an authorization challenge, a rejection from something sitting in front of the API, or a request read as malformed.',
+      when: 'OECD refused the request with a status this server does not model — an authorization challenge, a rejection from something sitting in front of the API, a request read as malformed or unprocessable (HTTP 400 or 422), or a method it does not implement (HTTP 501).',
       recovery:
-        'Retry once; a repeat is not transient, so report the OECD response and check that ' +
-        'OECD_BASE_URL names the public SDMX API rather than a proxy in front of it.',
+        'Retry once; a repeat is not transient, so report the HTTP status and OECD text this error carries and check that OECD_BASE_URL names the public SDMX API rather than a proxy in front of it.',
+    },
+    {
+      reason: 'upstream_unreadable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: false,
+      when: 'OECD answered with a body this server could not read — not JSON, or JSON whose fields do not have the shape SDMX gives them.',
+      recovery:
+        'Report the response this error describes and check that OECD_BASE_URL names the public SDMX API rather than a proxy in front of it; the same request returns the same body, so a retry will not help.',
     },
   ],
 
@@ -174,7 +178,7 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
 
     let dsd: OecdDataStructure;
     try {
-      dsd = await getStructureService().fetchDataStructure(flowRef, ctx.signal);
+      dsd = await getStructureService().fetchDataStructure(new UpstreamBudget(ctx.signal), flowRef);
     } catch (err) {
       if (isDataflowNotFound(err as Error)) {
         throw ctx.fail('dataflow_not_found', `Dataflow not found: ${flowRef}`, undefined, {
@@ -210,7 +214,6 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
           }
         : undefined,
       key_example: keyExample,
-      non_production: dsd.nonProduction,
       source: 'OECD' as const,
     };
   },

@@ -34,6 +34,13 @@
           "format": "boolean",
           "isRequired": false,
           "default": "false"
+        },
+        {
+          "name": "OECD_CLAMP_LIMITS",
+          "description": "Serve a limit above a tool's per-call cap at the cap, with a notice. Set to 'false' to reject it instead and advertise the cap as the input's maximum.",
+          "format": "boolean",
+          "isRequired": false,
+          "default": "true"
         }
       ],
       "transport": {
@@ -94,6 +101,13 @@
           "format": "boolean",
           "isRequired": false,
           "default": "false"
+        },
+        {
+          "name": "OECD_CLAMP_LIMITS",
+          "description": "Serve a limit above a tool's per-call cap at the cap, with a notice. Set to 'false' to reject it instead and advertise the cap as the input's maximum.",
+          "format": "boolean",
+          "isRequired": false,
+          "default": "true"
         }
       ],
       "transport": {

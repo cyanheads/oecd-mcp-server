@@ -7,17 +7,26 @@ import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
+import { UpstreamBudget } from '@/services/oecd-http/upstream-budget.js';
 import {
   getStructureService,
   isDataflowNotFound,
 } from '@/services/oecd-structure/oecd-structure-service.js';
 import type { OecdDataflow } from '@/services/oecd-structure/types.js';
+import { applyCountLimit, type CountLimit, countLimitSchema } from '@/utils/count-limit.js';
+import { WordStartText } from '@/utils/word-start-text.js';
+
+/**
+ * The catalog is searched locally with no upstream page maximum, so the cap holds
+ * a page near 1 MB per surface: a result serializes to at most ~444 bytes.
+ */
+const LIMIT: CountLimit = { cap: 2_000, defaultValue: 20, tool: 'oecd_search_datasets' };
 
 /**
  * Character budget for a returned description. OECD abstracts run to a median of
  * ~840 characters, so nearly every one is cut; 240 completes the opening summary
- * sentence for ~84% of the abstracts published while holding a full 100-result
- * response to roughly 2.4x its description-free size.
+ * sentence for ~84% of the abstracts published while holding a page of results
+ * to roughly 2.4x its description-free size.
  */
 const DESCRIPTION_MAX_CHARS = 240;
 
@@ -30,10 +39,36 @@ function truncateDescription(text: string): string {
   return `${body.trimEnd()}…`;
 }
 
+interface SearchMatch {
+  df: OecdDataflow;
+  matchedIn: 'name' | 'description' | 'both';
+}
+
+/**
+ * Which fields carry every token at a word start, or undefined when some token
+ * starts a word in neither.
+ */
+function locateTokens(
+  df: OecdDataflow,
+  tokens: readonly string[],
+): { inName: boolean; inDescription: boolean } | undefined {
+  const name = new WordStartText(df.name);
+  const description = df.description ? new WordStartText(df.description) : undefined;
+  let inName = true;
+  let inDescription = true;
+  for (const token of tokens) {
+    const nameHit = name.matches(token);
+    const descriptionHit = description?.matches(token) ?? false;
+    if (!nameHit && !descriptionHit) return;
+    inName &&= nameHit;
+    inDescription &&= descriptionHit;
+  }
+  return { inName, inDescription };
+}
+
 export const oecdSearchDatasets = tool('oecd_search_datasets', {
   description:
-    'Search OECD dataflows by keyword or theme, matching against dataflow names and descriptions. ' +
-    'Returns flow_ref identifiers, names, and agency IDs for use with oecd_get_dataset_info.',
+    'Search OECD dataflows by keyword or theme, matching each query token at the start of a word in dataflow names and descriptions, with name matches ranked first. Returns flow_ref identifiers, names, and agency IDs for use with oecd_get_dataset_info.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -43,8 +78,7 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
     query: z
       .string()
       .describe(
-        'Keyword or phrase to search for in dataflow names and descriptions — e.g. "GDP", "employment", "education". ' +
-          'Every whitespace-separated token must appear somewhere in the name or description.',
+        'Keyword or phrase to search for in dataflow names and descriptions — e.g. "GDP", "house prices", "TiVA". Every whitespace-separated token must start a word in the name or description, ignoring case: "price" matches "Prices" and "tiva" matches "(TiVA)", but "tiva" does not match "activation". A word starts after any character that is not a letter or digit, or at a lowercase-to-uppercase step ("markers" matches "RioMarkers"). A token that opens on such a character, like "&" or "-oecd", matches anywhere it occurs: "&" finds "R&D".',
       ),
     agency_id: z
       .string()
@@ -53,21 +87,14 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
         'Optional agency identifier to restrict the search scope — e.g. "OECD.SDD.NAD". ' +
           'Obtain valid agency IDs from oecd_list_agencies.',
       ),
-    limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(100)
-      .default(20)
-      .describe('Maximum number of results to return (1–100, default 20).'),
+    limit: countLimitSchema(LIMIT, 'Maximum number of results to return.'),
     offset: z
       .number()
       .int()
       .min(0)
       .default(0)
       .describe(
-        'Zero-based index of the first match to return, applied before limit. ' +
-          'Page through results past the limit by advancing it; an offset at or past total_matches returns an empty list.',
+        'Zero-based index of the first match to return within the ranked match list, applied before limit. Page through results past the limit by advancing it; an offset at or past total_matches returns an empty list.',
       ),
   }),
   output: z.object({
@@ -95,16 +122,14 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
             matched_in: z
               .enum(['name', 'description', 'both'])
               .describe(
-                'Which field carried every query token — "name" or "description" when only that one did, ' +
-                  '"both" when each did on its own or the tokens were split across the two.',
+                'Which field carried every query token at a word start — "name" or "description" when only that one did, "both" when each did on its own or the tokens were split across the two.',
               ),
-            non_production: z
-              .boolean()
-              .describe('True if flagged as experimental or deprecated by OECD.'),
           })
           .describe('A matching OECD dataflow entry.'),
       )
-      .describe('Matching dataflows for the requested page, up to the requested limit.'),
+      .describe(
+        'Matching dataflows for the requested page, up to the requested limit, ranked in three tiers: the name carries every token; the tokens are split across name and description; the description alone carries every token. Catalog order holds within each tier.',
+      ),
     result_count: z
       .number()
       .describe('Number of results returned (may be less than total_matches).'),
@@ -113,10 +138,16 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       .describe('Total dataflows matching the query before applying offset and limit.'),
     offset: z
       .number()
-      .describe('Zero-based index of the first returned result within the full match list.'),
+      .describe('Zero-based index of the first returned result within the ranked match list.'),
     source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
   }),
   enrichment: {
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Present when a requested limit was above the per-call maximum, naming the limit requested and the one served.',
+      ),
     totalCount: z
       .number()
       .optional()
@@ -130,8 +161,7 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       code: JsonRpcErrorCode.NotFound,
       when: 'No dataflows matched the search query.',
       recovery:
-        'Try broader search terms or use oecd_list_agencies to discover agency IDs, ' +
-        'then search within a specific agency.',
+        'Search whole words or the start of a word — a term matches where it starts a word in a name or description, so a fragment from the middle of a word matches nothing — or use oecd_list_agencies to discover agency IDs, then search within a specific agency.',
     },
     {
       reason: 'agency_not_found',
@@ -145,7 +175,7 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
       retryable: true,
-      when: 'OECD throttled the request rate and was still refusing after the retries.',
+      when: "OECD throttled the request rate and was still refusing after the retries, or asked for a wait longer than the call's upstream budget had left.",
       recovery:
         'Wait several seconds before calling again, and space out consecutive queries ' +
         'rather than issuing them back to back.',
@@ -154,11 +184,9 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       reason: 'upstream_timeout',
       code: JsonRpcErrorCode.Timeout,
       retryable: true,
-      when: 'OECD did not finish responding before OECD_TIMEOUT_MS elapsed.',
+      when: "An OECD request ran past OECD_TIMEOUT_MS, or the call's requests and retries together ran past its upstream budget — 50 seconds, or OECD_TIMEOUT_MS when that is longer.",
       recovery:
-        'Retry once — the whole-catalog response runs to megabytes and is occasionally slow — ' +
-        'and raise OECD_TIMEOUT_MS if it keeps timing out, or set agency_id to fetch one ' +
-        "agency's dataflows instead.",
+        "Retry once — the whole-catalog response runs to megabytes and is occasionally slow — and set agency_id to fetch one agency's dataflows if it keeps timing out; raising OECD_TIMEOUT_MS past 50 seconds also needs a client that waits that long for a tool result.",
     },
     {
       reason: 'upstream_unavailable',
@@ -181,10 +209,17 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'OECD refused the request with a status this server does not model — an authorization challenge, a rejection from something sitting in front of the API, or a request read as malformed.',
+      when: 'OECD refused the request with a status this server does not model — an authorization challenge, a rejection from something sitting in front of the API, a request read as malformed or unprocessable (HTTP 400 or 422), or a method it does not implement (HTTP 501).',
       recovery:
-        'Retry once; a repeat is not transient, so report the OECD response and check that ' +
-        'OECD_BASE_URL names the public SDMX API rather than a proxy in front of it.',
+        'Retry once; a repeat is not transient, so report the HTTP status and OECD text this error carries and check that OECD_BASE_URL names the public SDMX API rather than a proxy in front of it.',
+    },
+    {
+      reason: 'upstream_unreadable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: false,
+      when: 'OECD answered with a body this server could not read — not JSON, or JSON whose fields do not have the shape SDMX gives them.',
+      recovery:
+        'Report the response this error describes and check that OECD_BASE_URL names the public SDMX API rather than a proxy in front of it; the same request returns the same body, so a retry will not help.',
     },
   ],
 
@@ -199,8 +234,8 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
     let dataflows: OecdDataflow[];
     try {
       dataflows = await getStructureService().fetchDataflows(
+        new UpstreamBudget(ctx.signal),
         input.agency_id || undefined,
-        ctx.signal,
       );
     } catch (err) {
       if (input.agency_id && isDataflowNotFound(err as Error)) {
@@ -218,25 +253,28 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       throw err;
     }
 
-    // Filter by query tokens (case-insensitive, all tokens must match name or description)
     const tokens = input.query
       .toLowerCase()
       .split(/\s+/)
       .filter((t) => t.length > 0);
 
-    const matches: Array<{ df: OecdDataflow; matchedIn: 'name' | 'description' | 'both' }> = [];
+    /**
+     * Ranked in three tiers, each in catalog order: the name carries every token;
+     * the tokens are split so neither field carries them all; the description
+     * alone carries every token. 'both' therefore names two shapes — each field
+     * carrying every token on its own (first tier) and the split (second tier).
+     */
+    const byName: SearchMatch[] = [];
+    const split: SearchMatch[] = [];
+    const byDescription: SearchMatch[] = [];
     for (const df of dataflows) {
-      const name = df.name.toLowerCase();
-      const description = df.description?.toLowerCase() ?? '';
-      if (!tokens.every((t) => name.includes(t) || description.includes(t))) continue;
-      const inName = tokens.every((t) => name.includes(t));
-      const inDescription = tokens.every((t) => description.includes(t));
-      // 'both' covers two shapes: each field carries every token on its own, and
-      // neither does because the tokens are split across them.
-      const matchedIn =
-        inName && !inDescription ? 'name' : inDescription && !inName ? 'description' : 'both';
-      matches.push({ df, matchedIn });
+      const found = locateTokens(df, tokens);
+      if (!found) continue;
+      if (found.inName) byName.push({ df, matchedIn: found.inDescription ? 'both' : 'name' });
+      else if (found.inDescription) byDescription.push({ df, matchedIn: 'description' });
+      else split.push({ df, matchedIn: 'both' });
     }
+    const matches = [...byName, ...split, ...byDescription];
 
     // Keyed to the raw match count, before offset — an offset past the end is an
     // empty page, not an absent dataset.
@@ -247,13 +285,16 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       );
     }
 
-    const page = matches.slice(input.offset, input.offset + input.limit);
+    const limit = applyCountLimit(input.limit, LIMIT, ctx);
+    const page = matches.slice(input.offset, input.offset + limit.applied);
     ctx.log.info('Dataflow search complete', {
       totalMatches: matches.length,
       returned: page.length,
       offset: input.offset,
     });
 
+    // The clamp is the only notice this tool writes, so it needs no joining.
+    if (limit.notice) ctx.enrich.notice(limit.notice);
     // Disclose the full match count when matches remain beyond the returned page.
     if (input.offset + page.length < matches.length) {
       ctx.enrich.total(matches.length);
@@ -266,7 +307,6 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
         name: df.name,
         ...(df.description ? { description: truncateDescription(df.description) } : {}),
         matched_in: matchedIn,
-        non_production: df.nonProduction,
       })),
       result_count: page.length,
       total_matches: matches.length,
@@ -282,7 +322,7 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       '',
       ...result.dataflows.map((df) => {
         const entry = [
-          `- **${escapeMarkdownInline(df.flow_ref)}** (non_production: ${df.non_production}, matched_in: ${df.matched_in})`,
+          `- **${escapeMarkdownInline(df.flow_ref)}** (matched_in: ${df.matched_in})`,
           `  ${escapeMarkdownInline(df.name)}`,
           `  Agency: ${escapeMarkdownInline(df.agency_id)}`,
         ];

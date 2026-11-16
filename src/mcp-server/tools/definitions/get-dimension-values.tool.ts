@@ -7,27 +7,71 @@
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
+import { SDMX_KEY_SAFE } from '@/services/oecd-data/oecd-data-service.js';
 import { upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
+import { UpstreamBudget } from '@/services/oecd-http/upstream-budget.js';
+import {
+  type AvailabilityOutcome,
+  availabilityKey,
+  describeFindings,
+  diagnoseKey,
+  type OecdAvailability,
+  readAvailability,
+} from '@/services/oecd-structure/availability.js';
 import {
   getStructureService,
   isDataflowNotFound,
   parseFlowRef,
 } from '@/services/oecd-structure/oecd-structure-service.js';
 import type { OecdCode, OecdDataStructure } from '@/services/oecd-structure/types.js';
+import { applyCountLimit, type CountLimit, countLimitSchema } from '@/utils/count-limit.js';
 import { formatTable } from '@/utils/format-table.js';
 
-/** Codes returned when the caller names no page size. */
-const DEFAULT_LIMIT = 50;
+/**
+ * A page of codes: 50 by default, at most 10,000 — about 1 MB per surface at
+ * the 54–69 bytes a code with a 25–40-character label takes, with room for
+ * longer labels. The largest codelist on record holds 1,164.
+ */
+const LIMIT: CountLimit = { cap: 10_000, defaultValue: 50, tool: 'oecd_get_dimension_values' };
 
-/** Largest page a caller can ask for — enough to hold most codelists whole. */
-const MAX_LIMIT = 500;
+/**
+ * The codelist narrowed to the codes with data, in codelist order, followed by
+ * any code with data the codelist does not list, labelled by its own id.
+ */
+function codesWithData(codelist: readonly OecdCode[], withData: readonly string[]): OecdCode[] {
+  const wanted = new Set(withData);
+  const listed = new Set(codelist.map((c) => c.id));
+  return [
+    ...codelist.filter((c) => wanted.has(c.id)),
+    ...withData.filter((id) => !listed.has(id)).map((id) => ({ id, name: id })),
+  ];
+}
+
+/** What the availability record says about the key, as notice sentences. */
+function keyNotes(
+  availability: OecdAvailability,
+  dsd: OecdDataStructure,
+  key: string | undefined,
+): string[] {
+  const clauses = describeFindings(diagnoseKey(availability, dsd.dimensions, key ?? 'all'));
+  if (availability.observationCount === 0) {
+    if (availabilityKey(key) === 'all') return ['OECD records no observations for this dataflow.'];
+    return [
+      `The key matches no series: ${clauses.length > 0 ? clauses.join('; ') : 'its pinned segments match no series together'}.`,
+    ];
+  }
+  return clauses.length > 0 ? [`In the key, ${clauses.join('; ')}.`] : [];
+}
 
 export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
   description:
     'Fetch the valid codes and labels for one dimension of a dataflow. ' +
     'Use to resolve human-readable names (countries, measures) to SDMX codes before querying with oecd_query_dataset. ' +
     'Pass query to match a code or label by substring — codelists run to a thousand-plus entries, ' +
-    'and the response is a page of at most limit codes either way.',
+    'and the response is a page of at most limit codes either way. ' +
+    'A codelist is shared across dataflows and can list codes this one holds no data for: pass ' +
+    'available_only to list only the codes with data, or key to list the codes with data given ' +
+    "the key's other segments — a structure read, never a data download.",
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -54,13 +98,24 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
         'Case-insensitive substring matched against both the code and its label, so "PA" and ' +
           '"percent" each reach the code "PA" / "Percent per annum". Omit to page the whole codelist.',
       ),
-    limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(MAX_LIMIT)
-      .default(DEFAULT_LIMIT)
-      .describe(`Maximum codes to return (1–${MAX_LIMIT}, default ${DEFAULT_LIMIT}).`),
+    available_only: z
+      .boolean()
+      .default(false)
+      .describe(
+        "List only the codes of this dimension that have data in this dataflow, from OECD's " +
+          'availability record, with the time_range and observation_count they cover. ' +
+          'Applied before query, offset, and limit. Default false: the whole codelist.',
+      ),
+    key: z
+      .string()
+      .optional()
+      .describe(
+        'Dot-delimited key in the oecd_query_dataset form, one segment per dimension in the ' +
+          'order oecd_get_dataset_info gives — empty for a wildcard, "+" between codes, or "all". ' +
+          "Lists the codes of this dimension that have data given the key's other segments, so " +
+          'pass the key you plan to query. Implies available_only.',
+      ),
+    limit: countLimitSchema(LIMIT, 'Maximum codes to return.'),
     offset: z
       .number()
       .int()
@@ -79,14 +134,40 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
         z
           .object({
             id: z.string().describe('SDMX code — use in the dimension key for oecd_query_dataset.'),
-            name: z.string().describe('Human-readable label for the code.'),
+            name: z
+              .string()
+              .describe(
+                'Human-readable label for the code — the code itself for a code with data that the codelist does not list.',
+              ),
           })
           .describe('A valid SDMX code and its human-readable label.'),
       )
-      .describe('The requested page of codes, after query, offset, and limit are applied.'),
+      .describe(
+        'The requested page of codes, after available_only, query, offset, and limit are applied.',
+      ),
     code_count: z
       .number()
       .describe("Number of codes in this page — not the size of the dimension's codelist."),
+    available_only: z
+      .boolean()
+      .describe(
+        'True when codes holds only the codes with data, as OECD records them. False for the whole codelist, including when availability was asked for and could not be read — the notice then says why.',
+      ),
+    time_range: z
+      .object({
+        start: z.string().describe('First day the observations cover, YYYY-MM-DD, inclusive.'),
+        end: z.string().describe('Last day the observations cover, YYYY-MM-DD, inclusive.'),
+      })
+      .optional()
+      .describe(
+        'Span of the observations under key (the whole dataflow without one). Present when available_only applied and some series matches.',
+      ),
+    observation_count: z
+      .number()
+      .optional()
+      .describe(
+        'Observations under key (the whole dataflow without one), as OECD counts them. Present when available_only applied and OECD reported a count.',
+      ),
     source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
   }),
   enrichment: {
@@ -94,8 +175,10 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       .string()
       .optional()
       .describe(
-        'Present when the page needs explaining — the dimension has no codelist, the query ' +
-          'matched nothing, or codes remain beyond the page. States how to reach the rest.',
+        'Present when the page needs explaining — a limit above the per-call maximum, availability ' +
+          'that could not be read, a key that matches no series or pins a code that matches only by ' +
+          'letter case, a dimension with no codelist, a query that matched nothing, or codes ' +
+          'beyond the page. One string when several apply; states how to reach the rest.',
       ),
     effectiveQuery: z
       .string()
@@ -107,6 +190,11 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       .describe(
         'Codes matching before offset and limit, disclosed when the page does not cover them all.',
       ),
+  },
+  enrichmentTrailer: {
+    // The notice is stored as written — it carries the caller's query and key and
+    // OECD's codes — and escaped only where content[] renders it as Markdown.
+    notice: { render: (notice) => `> ${escapeMarkdownInline(notice ?? '')}` },
   },
   errors: [
     {
@@ -126,16 +214,24 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
     {
       reason: 'dimension_not_found',
       code: JsonRpcErrorCode.NotFound,
-      when: "The dimension_id is not present in this dataflow's structure.",
+      when: "The dimension_id names no dimension of this dataflow's key — its time dimension included, which has no codelist.",
       recovery:
         'Inspect available dimensions first with oecd_get_dataset_info, ' +
         'then use one of the returned dimension IDs.',
     },
     {
+      reason: 'invalid_key',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'The key holds a character outside the SDMX key set, or fewer dot-delimited segments than the dataflow has dimensions.',
+      recovery:
+        'Use oecd_get_dataset_info to check dimension order and count, then rebuild the key with ' +
+        'one segment per dimension — empty for a wildcard, "+" between codes — or pass "all".',
+    },
+    {
       reason: 'rate_limited',
       code: JsonRpcErrorCode.RateLimited,
       retryable: true,
-      when: 'OECD throttled the request rate and was still refusing after the retries.',
+      when: "OECD throttled the request rate and was still refusing after the retries, or asked for a wait longer than the call's upstream budget had left.",
       recovery:
         'Wait several seconds before calling again, and space out consecutive queries ' +
         'rather than issuing them back to back.',
@@ -144,10 +240,9 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       reason: 'upstream_timeout',
       code: JsonRpcErrorCode.Timeout,
       retryable: true,
-      when: 'OECD did not finish responding before OECD_TIMEOUT_MS elapsed.',
+      when: "An OECD request ran past OECD_TIMEOUT_MS, or the call's requests and retries together ran past its upstream budget — 50 seconds, or OECD_TIMEOUT_MS when that is longer.",
       recovery:
-        'Retry once — a codelist response runs to megabytes and is occasionally slow — ' +
-        'and raise OECD_TIMEOUT_MS if it keeps timing out.',
+        'Retry once — a codelist response runs to megabytes and is occasionally slow — and raise OECD_TIMEOUT_MS if it keeps timing out; a value past 50 seconds also needs a client that waits that long for a tool result.',
     },
     {
       reason: 'upstream_unavailable',
@@ -170,10 +265,17 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
     {
       reason: 'upstream_error',
       code: JsonRpcErrorCode.ServiceUnavailable,
-      when: 'OECD refused the request with a status this server does not model — an authorization challenge, a rejection from something sitting in front of the API, or a request read as malformed.',
+      when: 'OECD refused the request with a status this server does not model — an authorization challenge, a rejection from something sitting in front of the API, a request read as malformed or unprocessable (HTTP 400 or 422), or a method it does not implement (HTTP 501).',
       recovery:
-        'Retry once; a repeat is not transient, so report the OECD response and check that ' +
-        'OECD_BASE_URL names the public SDMX API rather than a proxy in front of it.',
+        'Retry once; a repeat is not transient, so report the HTTP status and OECD text this error carries and check that OECD_BASE_URL names the public SDMX API rather than a proxy in front of it.',
+    },
+    {
+      reason: 'upstream_unreadable',
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      retryable: false,
+      when: 'OECD answered with a body this server could not read — not JSON, or JSON whose fields do not have the shape SDMX gives them — or a datastructure naming a codelist outside the SDMX character set.',
+      recovery:
+        'Report the response this error describes and check that OECD_BASE_URL names the public SDMX API rather than a proxy in front of it; the same request returns the same body, so a retry will not help.',
     },
   ],
 
@@ -193,10 +295,29 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
     }
 
     /**
-     * Both upstream calls report an OECD refusal the same way. The codelist read
-     * sits outside the datastructure's catch and needs the same ladder — a
-     * throttle is charged across every endpoint, so it lands on whichever of the
-     * two happens to be in flight.
+     * A form-based client sends "" for a field left blank, which names no key.
+     * A key outside the SDMX character set can never reach a URL, so it fails
+     * here, before any request.
+     */
+    const key = input.key === '' ? undefined : input.key;
+    if (key !== undefined && !SDMX_KEY_SAFE.test(key)) {
+      throw ctx.fail(
+        'invalid_key',
+        `Key "${key}" holds a character outside the SDMX key set — letters, digits, ".", "+", "_", "-", and "%"`,
+      );
+    }
+    const availableOnly = input.available_only || key !== undefined;
+    const limit = applyCountLimit(input.limit, LIMIT, ctx);
+
+    // One budget for every upstream read: a slow datastructure leaves the
+    // codelist and the availability record only what is left of it.
+    const budget = new UpstreamBudget(ctx.signal);
+
+    /**
+     * Every upstream read reports an OECD refusal the same way. The codelist and
+     * availability reads sit outside the datastructure's catch and need the same
+     * ladder — a throttle is charged across every endpoint, so it lands on
+     * whichever of the three happens to be in flight.
      */
     const asUpstreamFailure = (err: unknown): unknown => {
       const refusal = upstreamRefusal(err);
@@ -209,14 +330,16 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       flowRef: input.flow_ref,
       dimensionId: input.dimension_id,
       query: input.query,
-      limit: input.limit,
+      availableOnly,
+      key,
+      limit: limit.applied,
       offset: input.offset,
     });
 
     // Fetch the datastructure to find the codelist ref for this dimension
     let dsd: OecdDataStructure;
     try {
-      dsd = await getStructureService().fetchDataStructure(input.flow_ref, ctx.signal);
+      dsd = await getStructureService().fetchDataStructure(budget, input.flow_ref);
     } catch (err) {
       if (isDataflowNotFound(err as Error)) {
         throw ctx.fail('dataflow_not_found', `Dataflow not found: ${input.flow_ref}`);
@@ -228,44 +351,80 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
     if (!dim) {
       throw ctx.fail(
         'dimension_not_found',
-        `Dimension "${input.dimension_id}" not found in dataflow ${input.flow_ref}`,
+        dsd.timeDimension?.id === input.dimension_id
+          ? `${input.dimension_id} is the time dimension of ${input.flow_ref} and has no codelist; pass available_only: true with any other dimension for its time_range`
+          : `Dimension "${input.dimension_id}" not found in dataflow ${input.flow_ref}`,
       );
     }
 
-    if (!dim.codelistRef) {
-      // Dimension has no codelist — return empty with an explanatory notice
-      ctx.log.info('Dimension has no codelist reference', {
-        flowRef: input.flow_ref,
-        dimensionId: input.dimension_id,
-      });
-      ctx.enrich.notice(
-        'This dimension has no fixed codelist — it accepts dynamic or free-form values. ' +
-          'Inspect actual data observations with oecd_query_dataset to discover valid values.',
-      );
-      return {
-        flow_ref: input.flow_ref,
-        dimension_id: input.dimension_id,
-        codes: [],
-        code_count: 0,
-        source: 'OECD' as const,
-      };
+    // Only the segment count needs the datastructure; an every-series key has none to count.
+    if (key !== undefined && availabilityKey(key) !== 'all') {
+      const segments = key.split('.').length;
+      if (segments < dsd.dimensions.length) {
+        throw ctx.fail(
+          'invalid_key',
+          `Key "${key}" has ${segments} ${segments === 1 ? 'segment' : 'segments'}, but ${input.flow_ref} has ${dsd.dimensions.length} dimensions — one segment each, empty for a wildcard`,
+        );
+      }
     }
-
-    // Parse codelist ref: "{agencyID},{codelistID}"
-    const clCommaIdx = dim.codelistRef.indexOf(',');
-    const clAgencyId = clCommaIdx >= 0 ? dim.codelistRef.slice(0, clCommaIdx) : parts.agencyId;
-    const codelistId = clCommaIdx >= 0 ? dim.codelistRef.slice(clCommaIdx + 1) : dim.codelistRef;
 
     /**
      * Read the codelist at the root and the version the datastructure names.
      * Both matter, and for the same reason: a codelist read from the wrong root
      * or at the wrong revision carries codes this dimension does not accept.
      */
-    const codes: OecdCode[] = await getStructureService()
-      .fetchCodelist(clAgencyId, codelistId, ctx.signal, dsd.serviceRoot, dim.codelistVersion)
-      .catch((err: unknown) => {
-        throw asUpstreamFailure(err);
-      });
+    let codelistRead: Promise<OecdCode[]> | undefined;
+    if (dim.codelistRef) {
+      // Codelist ref: "{agencyID},{codelistID}"
+      const clCommaIdx = dim.codelistRef.indexOf(',');
+      const clAgencyId = clCommaIdx >= 0 ? dim.codelistRef.slice(0, clCommaIdx) : parts.agencyId;
+      const codelistId = clCommaIdx >= 0 ? dim.codelistRef.slice(clCommaIdx + 1) : dim.codelistRef;
+      codelistRead = getStructureService()
+        .fetchCodelist(budget, clAgencyId, codelistId, dsd.serviceRoot, dim.codelistVersion)
+        .catch((err: unknown) => {
+          throw asUpstreamFailure(err);
+        });
+    }
+
+    /**
+     * The codelist and the availability record are independent reads of one
+     * budget, so they go out together. Availability is best-effort: a read that
+     * fails leaves the whole codelist standing, and only the caller's
+     * cancellation or the budget running out ends the call from there — the
+     * expiry reported through the same ladder as the codelist's.
+     */
+    const [codelist, read]: [OecdCode[] | undefined, AvailabilityOutcome | undefined] =
+      await Promise.all([
+        codelistRead,
+        availableOnly
+          ? readAvailability(budget, dsd, key).catch((err: unknown) => {
+              throw asUpstreamFailure(err);
+            })
+          : undefined,
+      ]);
+    const availability = read?.kind === 'read' ? read.availability : undefined;
+
+    /** One notice — the framework keeps only the last one written. */
+    const notes: string[] = [];
+    if (limit.notice) notes.push(limit.notice);
+    if (read?.kind === 'failed') {
+      notes.push(
+        codelist
+          ? `Availability could not be read (${read.failure}), so this lists the whole codelist, which can hold codes this dataflow has no data for.`
+          : `Availability could not be read (${read.failure}), and this dimension has no codelist to list instead.`,
+      );
+    }
+    if (availability) notes.push(...keyNotes(availability, dsd, key));
+    if (!codelist && !read) {
+      notes.push(
+        'This dimension has no fixed codelist — it accepts dynamic or free-form values. ' +
+          'Pass available_only: true to list the values that have data in this dataflow.',
+      );
+    }
+
+    const codes = availability
+      ? codesWithData(codelist ?? [], availability.codes.get(dim.id) ?? [])
+      : (codelist ?? []);
 
     /**
      * Narrow the result set, not the rendering. Both client surfaces read the
@@ -280,21 +439,20 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
           (c) => c.id.toLowerCase().includes(term) || c.name.toLowerCase().includes(term),
         )
       : codes;
-    const page = matched.slice(input.offset, input.offset + input.limit);
+    const page = matched.slice(input.offset, input.offset + limit.applied);
 
     if (filter) ctx.enrich.echo(filter);
 
-    if (filter && matched.length === 0) {
-      // A notice is authored Markdown — the caller's text inside it is escaped.
-      ctx.enrich.notice(
-        `No code in ${escapeMarkdownInline(input.dimension_id)} matches "${escapeMarkdownInline(filter)}". ` +
+    if (filter && codes.length > 0 && matched.length === 0) {
+      notes.push(
+        `No code in ${input.dimension_id} matches "${filter}". ` +
           `Try a shorter term, or omit query to page the full ${codes.length}-code list.`,
       );
     } else if (page.length < matched.length) {
       const shown = input.offset + page.length;
       const more = shown < matched.length;
       ctx.enrich.total(matched.length);
-      ctx.enrich.notice(
+      notes.push(
         page.length === 0
           ? `Offset ${input.offset} is past the ${matched.length} matching codes — lower offset to page back into the list.`
           : `Showing codes ${input.offset + 1}–${shown} of ${matched.length}. ` +
@@ -303,11 +461,13 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
                 : 'This is the last page.'),
       );
     }
+    if (notes.length > 0) ctx.enrich.notice(notes.join(' '));
 
     ctx.log.info('Dimension values fetched', {
       flowRef: input.flow_ref,
       dimensionId: input.dimension_id,
-      codelistSize: codes.length,
+      codelistSize: codelist?.length,
+      availability: read?.kind,
       matchCount: matched.length,
       returned: page.length,
     });
@@ -317,6 +477,13 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       dimension_id: input.dimension_id,
       codes: page.map((c) => ({ id: c.id, name: c.name })),
       code_count: page.length,
+      available_only: availability !== undefined,
+      ...(availability?.timeRange && {
+        time_range: { start: availability.timeRange.start, end: availability.timeRange.end },
+      }),
+      ...(availability?.observationCount !== undefined && {
+        observation_count: availability.observationCount,
+      }),
       source: 'OECD' as const,
     };
   },
@@ -324,7 +491,17 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
   format: (result) => {
     const lines = [
       `**Dimension: ${escapeMarkdownInline(result.dimension_id)}** (flow: ${escapeMarkdownInline(result.flow_ref)})`,
-      `${result.code_count} ${result.code_count === 1 ? 'code' : 'codes'} in this page`,
+      `${result.code_count} ${result.code_count === 1 ? 'code' : 'codes'} in this page, ${
+        result.available_only
+          ? 'only codes with data in this dataflow (available_only: true)'
+          : 'from the whole codelist (available_only: false)'
+      }`,
+      ...(result.time_range
+        ? [`Time range: ${result.time_range.start} to ${result.time_range.end}`]
+        : []),
+      ...(result.observation_count !== undefined
+        ? [`Observations: ${result.observation_count}`]
+        : []),
       formatTable(
         ['Code', 'Name'],
         result.codes.map((c) => [c.id, c.name]),

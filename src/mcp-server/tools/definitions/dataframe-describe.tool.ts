@@ -90,7 +90,7 @@ export const oecdDataframeDescribe = tool('oecd_dataframe_describe', {
       );
     }
 
-    const tableInfos = await instance.describe();
+    const tableInfos = await instance.describe({ signal: ctx.signal });
 
     return {
       canvas_id: instance.canvasId,

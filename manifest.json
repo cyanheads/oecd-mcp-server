@@ -21,7 +21,8 @@
         "MCP_AUTH_MODE": "none",
         "CANVAS_PROVIDER_TYPE": "none",
         "NODE_ENV": "production",
-        "OECD_DATAFRAME_DROP_ENABLED": "${user_config.OECD_DATAFRAME_DROP_ENABLED}"
+        "OECD_DATAFRAME_DROP_ENABLED": "${user_config.OECD_DATAFRAME_DROP_ENABLED}",
+        "OECD_CLAMP_LIMITS": "${user_config.OECD_CLAMP_LIMITS}"
       }
     }
   },
@@ -37,6 +38,13 @@
       "description": "Let callers drop staged DataCanvas tables with oecd_dataframe_drop. Registered but disabled when off.",
       "required": false,
       "default": false
+    },
+    "OECD_CLAMP_LIMITS": {
+      "type": "boolean",
+      "title": "Serve an over-the-cap limit at the cap",
+      "description": "Serve a limit above a tool's per-call cap at the cap, with a notice. When off, such a limit is rejected and the cap is advertised as its maximum.",
+      "required": false,
+      "default": true
     }
   }
 }

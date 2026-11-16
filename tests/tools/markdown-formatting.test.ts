@@ -86,7 +86,6 @@ describe('upstream text rendering', () => {
           name: punctuation,
           description: multiline,
           matched_in: 'both',
-          non_production: false,
         },
       ],
       result_count: 1,
@@ -105,7 +104,6 @@ describe('upstream text rendering', () => {
       dimensions: [{ id: 'D', name: multiline, position: 1, codelist_ref: punctuation }],
       time_dimension: { id: 'T', name: punctuation, position: 2 },
       key_example: punctuation,
-      non_production: false,
       source: 'OECD',
     });
     expect(jsonTable(blocks)).toEqual({
@@ -125,6 +123,9 @@ describe('upstream text rendering', () => {
       dimension_id: punctuation,
       codes: [{ id: punctuation, name: multiline }],
       code_count: 1,
+      available_only: true,
+      time_range: { start: '1995-01-01', end: '2024-12-31' },
+      observation_count: 453_657_180,
       source: 'OECD',
     });
     expect(jsonTable(blocks)).toEqual({
@@ -132,15 +133,19 @@ describe('upstream text rendering', () => {
       rows: [[punctuation, multiline]],
     });
     expect(textOf(blocks)).toContain(`Dimension: ${punctuation}`);
+    expect(textOf(blocks)).toContain('available_only: true');
+    expect(textOf(blocks)).toContain('Time range: 1995-01-01 to 2024-12-31');
+    expect(textOf(blocks)).toContain('Observations: 453657180');
   });
 
-  it('renders every query observation in the existing preview with literal metadata', () => {
+  it('renders every query observation and constant in the existing preview with literal metadata', () => {
     const blocks = oecdQueryDataset.format!({
       rows: [
-        { label: multiline, value: 2, source: 'OECD' },
-        { label: 'last', value: 3, source: 'OECD' },
+        { label: multiline, value: 2 },
+        { label: 'last', value: 3 },
       ],
       row_count: 2,
+      constant_columns: { [punctuation]: { code: punctuation, label: punctuation } },
       query_flow_ref: punctuation,
       query_key: punctuation,
       query_start_period: punctuation,
@@ -148,13 +153,14 @@ describe('upstream text rendering', () => {
       source: 'OECD',
     });
     expect(jsonTable(blocks)).toEqual({
-      columns: ['label', 'value', 'source'],
+      columns: ['label', 'value'],
       rows: [
-        [multiline, '2', 'OECD'],
-        ['last', '3', 'OECD'],
+        [multiline, '2'],
+        ['last', '3'],
       ],
     });
-    expect(textOf(blocks).split(punctuation)).toHaveLength(5);
+    // Four in the query echo, three in the constants table's one row.
+    expect(textOf(blocks).split(punctuation)).toHaveLength(8);
   });
 
   it('renders each returned dataframe value without changing table selection', () => {

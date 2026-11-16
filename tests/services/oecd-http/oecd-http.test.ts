@@ -1,26 +1,46 @@
 /**
  * @fileoverview Tests for the shared OECD fetch boundary — the rule that holds
  * every request to the host it was addressed to, the retry classification that
- * rule sits alongside, the body reader both services share, and the reader that
- * decides which failures are OECD's to answer for.
+ * rule sits alongside, each request's share of the call's budget, the body
+ * reader and decoder guard both services share, and the reader that decides
+ * which failures are OECD's to answer for and how they are worded.
  * @module tests/services/oecd-http/oecd-http.test
  */
 
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import {
+  JsonRpcErrorCode,
+  McpError,
+  notFound,
+  serializationError,
+  validationError,
+} from '@cyanheads/mcp-ts-core/errors';
 import { withRetry } from '@cyanheads/mcp-ts-core/utils';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getServerConfig } from '@/config/server-config.js';
 import {
+  decodeUpstream,
   fetchOecd,
+  parseJsonBody,
   readJsonBody,
   retryableUpstreamFailure,
   upstreamRefusal,
 } from '@/services/oecd-http/oecd-http.js';
 import { type BodyStub, onResponseHeaders, startBodyStub } from '../../helpers/body-stub.js';
+import {
+  installScriptedFetch,
+  observe,
+  rejectionOf,
+  type ScriptedFetch,
+  STALL,
+} from '../../helpers/scripted-fetch.js';
 
-const STRUCTURE_ACCEPT = 'application/vnd.sdmx.structure+json;version=1.0';
+const STRUCTURE_OPTIONS = {
+  accept: 'application/vnd.sdmx.structure+json;version=1.0',
+  expectedStatuses: [404],
+  operation: 'test',
+};
 
 /** A listening server plus the paths it was asked for, in order. */
 interface Probe {
@@ -48,14 +68,12 @@ async function probe(
   return { origin: `http://127.0.0.1:${port}`, paths, server };
 }
 
-/** Call the boundary the way the structure service does. */
+/**
+ * Call the boundary the way the structure service does, with no budget to cut
+ * the request short — the request gets `OECD_TIMEOUT_MS` whole.
+ */
 function call(url: string, signal?: AbortSignal): Promise<Response> {
-  return fetchOecd(url, {
-    accept: STRUCTURE_ACCEPT,
-    expectedStatuses: [404],
-    operation: 'test',
-    ...(signal ? { signal } : {}),
-  });
+  return fetchOecd(url, STRUCTURE_OPTIONS, { remainingMs: Number.POSITIVE_INFINITY, signal });
 }
 
 afterEach(async () => {
@@ -127,8 +145,12 @@ describe('fetchOecd redirect handling', () => {
 });
 
 /**
- * The response body over a real socket — a fetch fake hands back a finished
- * `Response`, so the deadline over the body would never run.
+ * The response body over a real loopback socket, so each failure reaches the
+ * reader in the shape the runtime's own network stack gives it — a deadline
+ * cutting a stalled read, a caller abort mid-body, a connection dropped partway
+ * through. That proves the classification against what Bun's and Node's
+ * `fetch` actually throw, where a fake would prove only what it was written to
+ * throw.
  */
 describe('readJsonBody', () => {
   const config = getServerConfig();
@@ -171,9 +193,33 @@ describe('readJsonBody', () => {
     expect(outcome).toBeInstanceOf(McpError);
     expect(outcome).toMatchObject({
       code: JsonRpcErrorCode.SerializationError,
-      message: 'OECD answered with a body that is not JSON',
+      message:
+        'OECD answered with a body that is not JSON (declared content type: application/json)',
     });
     expect((outcome as McpError).cause).toBeInstanceOf(SyntaxError);
+    expect(upstreamRefusal(outcome)?.reason).toBe('upstream_unreadable');
+  });
+
+  it.each([
+    [
+      'the content type a proxy page declared',
+      'text/html; charset=utf-8',
+      'text/html; charset=utf-8',
+    ],
+    ['none, when the response declared none', undefined, 'none'],
+  ])('names %s', async (_label, contentType, named) => {
+    const body = new TextEncoder().encode('<html><title>Bad Gateway</title></html>');
+    const response = new Response(
+      body,
+      contentType ? { headers: { 'content-type': contentType } } : {},
+    );
+
+    const outcome = await readJsonBody(response).catch((e: unknown) => e);
+
+    expect(outcome).toMatchObject({
+      code: JsonRpcErrorCode.SerializationError,
+      message: `OECD answered with a body that is not JSON (declared content type: ${named})`,
+    });
   });
 
   it('keeps the deadline’s Timeout when the body stalls past it', async () => {
@@ -209,21 +255,60 @@ describe('readJsonBody', () => {
     }
   });
 
-  it('lets a connection dropped mid-body through as the runtime’s own error', async () => {
+  it('reports a connection dropped mid-body as ServiceUnavailable, not SerializationError', async () => {
     const { outcome, stub } = await readFrom(() => ({ kind: 'dropped-body' }));
 
     expect(stub.requests[0]?.bodyStarted).toBe(true);
-    // Unclassified — which is what puts it on the retry path an outage takes,
-    // rather than on the SerializationError path no retry repeats.
-    expect(outcome).toBeInstanceOf(Error);
-    expect(outcome).not.toBeInstanceOf(McpError);
+    // The retry path an outage takes, rather than the SerializationError path
+    // no retry repeats; the runtime's own error stays on the cause.
+    expect(outcome).toBeInstanceOf(McpError);
+    expect(outcome).toMatchObject({
+      code: JsonRpcErrorCode.ServiceUnavailable,
+      data: { errorSource: 'FetchNetworkErrorWrapper' },
+    });
+    expect((outcome as McpError).cause).toBeInstanceOf(Error);
+    expect((outcome as McpError).cause).not.toBeInstanceOf(McpError);
+    expect(upstreamRefusal(outcome)?.reason).toBe('upstream_unavailable');
   });
 });
 
+/** The decode step on its own, for a reader that holds the body text — the structure service's. */
+describe('parseJsonBody', () => {
+  it('decodes JSON text', () => {
+    expect(parseJsonBody('{"data":{"dataflows":[]}}', new Headers())).toEqual({
+      data: { dataflows: [] },
+    });
+  });
+
+  it.each([
+    ['the content type the response declared', { 'content-type': 'text/html' }, 'text/html'],
+    ['none, when the response declared none', {}, 'none'],
+  ])(
+    'reports text that is not JSON as a SerializationError naming %s',
+    (_label, headers, named) => {
+      let outcome: unknown;
+      try {
+        parseJsonBody('<html><title>Bad Gateway</title></html>', new Headers(headers));
+      } catch (err) {
+        outcome = err;
+      }
+
+      expect(outcome).toBeInstanceOf(McpError);
+      expect(outcome).toMatchObject({
+        code: JsonRpcErrorCode.SerializationError,
+        message: `OECD answered with a body that is not JSON (declared content type: ${named})`,
+      });
+      expect((outcome as McpError).cause).toBeInstanceOf(SyntaxError);
+      expect(upstreamRefusal(outcome)?.reason).toBe('upstream_unreadable');
+    },
+  );
+});
+
 /**
- * `fetchWithTimeout` reports an `AbortError` that neither its deadline nor the
- * caller raised as `RequestCancelled` (cyanheads/mcp-ts-core#799). The header
- * phase is the only place it does, and a fetch fake reaches it.
+ * An `AbortError` that neither the deadline nor the caller raised is the
+ * runtime dropping the request, so it takes the retry path a reset connection
+ * takes; only the caller's own abort is `RequestCancelled`. A fetch fake reaches
+ * the header phase, where the rejection lands.
  */
 describe('fetchOecd cancellation', () => {
   const URL_UNDER_TEST = 'https://fake.oecd.test/dataflow';
@@ -355,23 +440,224 @@ describe('upstreamRefusal', () => {
     [JsonRpcErrorCode.Unauthorized, 'upstream_error'],
     [JsonRpcErrorCode.InvalidParams, 'upstream_error'],
     [JsonRpcErrorCode.InvalidRequest, 'upstream_error'],
-  ])('maps %s to %s', (code, reason) => {
+    [JsonRpcErrorCode.SerializationError, 'upstream_unreadable'],
+  ])('maps a status-less %s to %s with its message as written', (code, reason) => {
     expect(upstreamRefusal(new McpError(code, 'upstream said no'))).toEqual({
       message: 'upstream said no',
       reason,
     });
   });
 
+  /** A refusal the boundary classified, as a service relabels it. */
+  function refused(code: JsonRpcErrorCode, status: number, body: string, extra = {}): McpError {
+    return new McpError(code, 'Failed to fetch OECD dataflows', { body, status, ...extra });
+  }
+
   it.each([
-    ['InternalError', JsonRpcErrorCode.InternalError],
-    ['SerializationError', JsonRpcErrorCode.SerializationError],
-    ['ValidationError', JsonRpcErrorCode.ValidationError],
-    ['RequestCancelled', JsonRpcErrorCode.RequestCancelled],
-  ])('declines %s — naming OECD for it would blame the wrong party', (_label, code) => {
-    expect(upstreamRefusal(new McpError(code, 'not OECD'))).toBeUndefined();
+    ['plain text as written', 'Forbidden by policy', ': Forbidden by policy'],
+    ['JSON as written', '{"error":"no key"}', ': {"error":"no key"}'],
+    [
+      'an HTML page by its title',
+      '<html><head><TITLE lang="en">\n  Access\n Denied </TITLE>',
+      ': Access Denied',
+    ],
+    ['an HTML page with no title as nothing', '<html><body><h1>Denied</h1></body></html>', ''],
+    ['an unterminated title as nothing', '  <html><title>Denied', ''],
+    ['an empty body as nothing', '', ''],
+    ['a blank body as nothing', ' \n\t ', ''],
+  ])('carries the status on an upstream_error, and OECD’s text: %s', (_label, body, suffix) => {
+    expect(upstreamRefusal(refused(JsonRpcErrorCode.Forbidden, 403, body))).toEqual({
+      message: `Failed to fetch OECD dataflows — OECD answered HTTP 403${suffix}`,
+      reason: 'upstream_error',
+    });
   });
 
-  it('declines a plain Error, which carries no classification to read', () => {
-    expect(upstreamRefusal(new Error('boom'))).toBeUndefined();
+  it('reads a structure 422 as OECD’s refusal rather than this server’s', () => {
+    const unprocessable = refused(JsonRpcErrorCode.ValidationError, 422, 'Unprocessable entity');
+
+    expect(upstreamRefusal(unprocessable)).toEqual({
+      message: 'Failed to fetch OECD dataflows — OECD answered HTTP 422: Unprocessable entity',
+      reason: 'upstream_error',
+    });
+  });
+
+  it('lands a 501 the framework marked non-retryable under upstream_error, not upstream_unavailable', () => {
+    const notImplemented = refused(JsonRpcErrorCode.ServiceUnavailable, 501, 'Not Implemented', {
+      retryable: false,
+    });
+
+    expect(upstreamRefusal(notImplemented)).toEqual({
+      message: 'Failed to fetch OECD dataflows — OECD answered HTTP 501: Not Implemented',
+      reason: 'upstream_error',
+    });
+  });
+
+  it('lands a status-less ServiceUnavailable marked non-retryable under upstream_error as written', () => {
+    const settled = new McpError(JsonRpcErrorCode.ServiceUnavailable, 'upstream said no', {
+      retryable: false,
+    });
+
+    expect(upstreamRefusal(settled)).toEqual({
+      message: 'upstream said no',
+      reason: 'upstream_error',
+    });
+  });
+
+  it.each([
+    [JsonRpcErrorCode.ServiceUnavailable, 503, 'upstream_unavailable'],
+    [JsonRpcErrorCode.Timeout, 504, 'upstream_timeout'],
+  ])('keeps the message of a %s carrying HTTP %i under %s', (code, status, reason) => {
+    expect(upstreamRefusal(refused(code, status, 'upstream fault'))).toEqual({
+      message: 'Failed to fetch OECD dataflows',
+      reason,
+    });
+  });
+
+  it('names an unreadable body with the sentence the decoder raised under the relabel', () => {
+    const decoded = serializationError(
+      'OECD answered with a body that is not JSON (declared content type: text/html)',
+    );
+    const service = new McpError(
+      JsonRpcErrorCode.SerializationError,
+      'Failed to fetch OECD datastructure for OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+      decoded.data,
+      { cause: decoded },
+    );
+    const relabelledTwice = new McpError(
+      JsonRpcErrorCode.SerializationError,
+      'Failed to fetch OECD data for OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+      service.data,
+      { cause: service },
+    );
+
+    expect(upstreamRefusal(service)).toEqual({
+      message:
+        'Failed to fetch OECD datastructure for OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I: OECD answered with a body that is not JSON (declared content type: text/html)',
+      reason: 'upstream_unreadable',
+    });
+    // The innermost sentence, however many relabels sit over it.
+    expect(upstreamRefusal(relabelledTwice)?.message).toBe(
+      'Failed to fetch OECD data for OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I: OECD answered with a body that is not JSON (declared content type: text/html)',
+    );
+  });
+
+  it.each([
+    ['InternalError', new McpError(JsonRpcErrorCode.InternalError, 'not OECD')],
+    ['RequestCancelled', new McpError(JsonRpcErrorCode.RequestCancelled, 'not OECD')],
+    [
+      'a ValidationError raised before any request left',
+      validationError('Only HTTP and HTTPS URLs are allowed.', { reason: 'invalid_url' }),
+    ],
+    ['a plain Error, which carries no classification to read', new Error('boom')],
+  ])('declines %s — naming OECD for it would blame the wrong party', (_label, error) => {
+    expect(upstreamRefusal(error)).toBeUndefined();
+  });
+});
+
+describe('decodeUpstream', () => {
+  it('returns what the decoder returns', () => {
+    expect(decodeUpstream(() => ['DF_NAAG_I'])).toEqual(['DF_NAAG_I']);
+  });
+
+  it('restates a mistyped field as an unreadable answer, keeping the TypeError as the cause', () => {
+    const mistyped: unknown = { data: { dataflows: {} } };
+
+    const error = (() => {
+      try {
+        return decodeUpstream(() =>
+          (mistyped as { data: { dataflows: string[] } }).data.dataflows.map((id) => id),
+        );
+      } catch (e) {
+        return e;
+      }
+    })();
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.SerializationError,
+      message: 'OECD answered with JSON whose fields do not have the SDMX shape',
+    });
+    expect((error as McpError).cause).toBeInstanceOf(TypeError);
+    expect(upstreamRefusal(error)).toEqual({
+      message: 'OECD answered with JSON whose fields do not have the SDMX shape',
+      reason: 'upstream_unreadable',
+    });
+  });
+
+  it('passes a decoder’s deliberate not-found through as it was thrown', () => {
+    const missing = notFound('Dataflow not found: OECD.SDD.NAD,DF_NONE');
+
+    expect(() =>
+      decodeUpstream(() => {
+        throw missing;
+      }),
+    ).toThrow(missing);
+  });
+});
+
+/**
+ * Each request's share of the call's budget, under fake timers with a fetch
+ * fake that holds every request open until its signal aborts.
+ */
+describe('fetchOecd request window', () => {
+  const config = getServerConfig();
+  const configuredTimeoutMs = config.timeoutMs;
+  const URL_UNDER_TEST = 'https://fake.oecd.test/dataflow';
+  let http: ScriptedFetch;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ now: 0 });
+    config.timeoutMs = 30_000;
+    http = installScriptedFetch(() => STALL);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    config.timeoutMs = configuredTimeoutMs;
+    http.restore();
+  });
+
+  it.each([
+    ['the time left, when that is less than OECD_TIMEOUT_MS', 10_000, 10_000],
+    ['OECD_TIMEOUT_MS, when the budget has more left', 45_000, 30_000],
+  ])('times a request out at %s', async (_label, remainingMs, timeoutMs) => {
+    const sent = observe(fetchOecd(URL_UNDER_TEST, STRUCTURE_OPTIONS, { remainingMs }));
+    await vi.advanceTimersByTimeAsync(timeoutMs - 1);
+
+    expect(sent.settledAtMs).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    const error = await rejectionOf(sent);
+
+    expect(sent.settledAtMs).toBe(timeoutMs);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      data: { errorSource: 'FetchTimeout' },
+    });
+    expect(http.requests).toHaveLength(1);
+  });
+
+  it('sends nothing when the budget has no time left, and fails as Timeout at once', async () => {
+    const error = await fetchOecd(URL_UNDER_TEST, STRUCTURE_OPTIONS, { remainingMs: 0 }).catch(
+      (e: unknown) => e,
+    );
+
+    expect(http.requests).toHaveLength(0);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.Timeout,
+      message: 'No time was left in the upstream budget of this call to send the OECD request',
+    });
+    expect(upstreamRefusal(error)?.reason).toBe('upstream_timeout');
+  });
+
+  it('reports a caller who already left as RequestCancelled, even with no time left', async () => {
+    const caller = new AbortController();
+    caller.abort();
+
+    const error = await fetchOecd(URL_UNDER_TEST, STRUCTURE_OPTIONS, {
+      remainingMs: 0,
+      signal: caller.signal,
+    }).catch((e: unknown) => e);
+
+    expect(error).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
+    expect(upstreamRefusal(error)).toBeUndefined();
   });
 });

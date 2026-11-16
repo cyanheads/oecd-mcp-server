@@ -27,6 +27,16 @@ import { setCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 import { initDataService } from '@/services/oecd-data/oecd-data-service.js';
 import { declaredRecovery } from '../helpers/error-contract.js';
 
+/**
+ * Before the imports run: `tool()` emits the input schema once at definition
+ * time, and the `limit` schema of oecd_dataframe_query reads the server config,
+ * so importing it parses that config. The base URL has to be in the
+ * environment by then.
+ */
+vi.hoisted(() => {
+  process.env.OECD_BASE_URL = 'https://fake.oecd.test';
+});
+
 const input = { flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I', key: 'A.USA..' };
 const ctx = createMockContext({ tenantId: 'default', errors: oecdQueryDataset.errors });
 const http = createFetchMock();
@@ -208,9 +218,15 @@ describe('query dataset real canvas lifecycle', () => {
     expect(http.calls).toHaveLength(1);
   });
 
+  /**
+   * A one-row result hoists every component, so the label is charged inside
+   * `constant_columns` — `{"REF_AREA":{"code":"USA","label":"…"},"TIME_PERIOD":{"code":"2020","label":"2020"}}`
+   * beside the row `{"value":7,"value_scale":1}` — and the two together come
+   * to exactly 100,000 characters at a 99,890-character label.
+   */
   it.each([
-    [99_922, false],
-    [99_923, true],
+    [99_890, false],
+    [99_891, true],
   ] as const)(
     'applies the exact preview boundary to a label of %i characters',
     async (labelChars, spills) => {

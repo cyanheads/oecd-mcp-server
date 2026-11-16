@@ -3,7 +3,6 @@
  * @module tests/tools/dataframe-query.tool.test
  */
 
-import { Buffer } from 'node:buffer';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,6 +26,7 @@ import {
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { ErrorHandler, escapeMarkdownInline, logger } from '@cyanheads/mcp-ts-core/utils';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getServerConfig } from '@/config/server-config.js';
 import { oecdDataframeQuery } from '@/mcp-server/tools/definitions/dataframe-query.tool.js';
 import { setCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 import { declaredRecovery, toolWireError } from '../helpers/error-contract.js';
@@ -36,7 +36,6 @@ type ToolResult = Awaited<ReturnType<typeof runToolContract>>;
 
 const CANVAS_ID = 'canvas-001';
 const SQL = 'SELECT * FROM spilled_abc';
-const BUDGET_BYTES = 1_048_576;
 
 function buildMockInstance(canvasId: string, queryResult: unknown) {
   return {
@@ -57,6 +56,14 @@ function canvasAnswering(answer: (sql: string, options: QueryOptions) => Promise
   instance.query = vi.fn(answer);
   setCanvas({ acquire: vi.fn().mockResolvedValue(instance) } as never);
   return instance;
+}
+
+/**
+ * `count` rows numbered from 0, built afresh on every call, so the rows a stub
+ * answers with and the rows a test expects never share an object.
+ */
+function numbered(count: number): Row[] {
+  return Array.from({ length: count }, (_, n) => ({ n }));
 }
 
 /** The result the canvas reports for `rows`, with its own truncation flag when it set one. */
@@ -100,8 +107,6 @@ function tableRowsOf(result: ToolResult): string[] {
     .filter((line) => line.startsWith('| '))
     .slice(2);
 }
-
-const utf8 = (text: string) => Buffer.byteLength(text, 'utf8');
 
 describe('oecdDataframeQuery', () => {
   beforeEach(() => {
@@ -207,14 +212,12 @@ describe('oecdDataframeQuery', () => {
 
   it('throws ctx.fail(invalid_sql) when the canvas rejects a non-SELECT statement', async () => {
     const mockInstance = buildMockInstance('canvas-001', null);
-    mockInstance.query = vi
-      .fn()
-      .mockRejectedValue(
-        validationError(
-          'Canvas query must be SELECT; got DROP_TABLE. Mutations must use registerTable, drop, or clear.',
-          { reason: 'non_select_statement', statementType: 'DROP_TABLE' },
-        ),
-      );
+    mockInstance.query = vi.fn().mockRejectedValue(
+      validationError('Canvas query must be SELECT.', {
+        reason: 'non_select_statement',
+        statementType: 'UNKNOWN',
+      }),
+    );
     const mockCanvas = {
       acquire: vi.fn().mockResolvedValue(mockInstance),
     };
@@ -264,6 +267,8 @@ describe('oecdDataframeQuery', () => {
     // The advice has to name the data fix, never the statement-shape one.
     const hint = (err.data as { recovery: { hint: string } }).recovery.hint;
     expect(hint).toContain('TRY_CAST');
+    // DuckDB raises on an integer division or modulo by zero; TRY(…) is the way round it.
+    expect(hint).toContain('TRY(…)');
     expect(hint).not.toContain('DDL');
   });
 
@@ -424,7 +429,7 @@ describe('oecdDataframeQuery limit', () => {
     expect(structuredOf(result).notice).toBeUndefined();
   });
 
-  it.each([1001, 5000, 10_000])(
+  it.each([1001, 10_001, 20_000])(
     'serves limit %i at 1000 and names both values on both surfaces',
     async (limit) => {
       const instance = canvasAnswering(async () => canvasResult([{ n: 1 }]));
@@ -446,7 +451,6 @@ describe('oecdDataframeQuery limit', () => {
 
   it.each([
     [0, /too small/i],
-    [10_001, /too big/i],
     [1.5, /int/i],
   ])('rejects limit %s at argument validation', async (limit, issue) => {
     const instance = canvasAnswering(async () => canvasResult([{ n: 1 }]));
@@ -464,16 +468,46 @@ describe('oecdDataframeQuery limit', () => {
     expect(instance.query).not.toHaveBeenCalled();
   });
 
-  it('advertises the 1–10,000 bounds and the default in the input schema', () => {
+  it('advertises the default and the cap once, and no maximum, in the input schema', () => {
     const schema = z.toJSONSchema(oecdDataframeQuery.input, { io: 'input' });
+    const limit = schema.properties?.limit as Record<string, unknown>;
 
-    expect(schema.properties?.limit).toMatchObject({
-      type: 'integer',
-      minimum: 1,
-      maximum: 10_000,
-      default: 100,
-    });
+    expect(limit).toMatchObject({ type: 'integer', minimum: 1, default: 100 });
+    expect(limit).not.toHaveProperty('maximum');
+    expect(limit.description).toContain(
+      'Default 100; a larger value returns at most 1,000 and says so.',
+    );
     expect(schema.required ?? []).not.toContain('limit');
+  });
+
+  describe('under OECD_CLAMP_LIMITS=false', () => {
+    beforeEach(() => {
+      getServerConfig().clampLimits = false;
+    });
+
+    afterEach(() => {
+      getServerConfig().clampLimits = true;
+    });
+
+    it('rejects a limit above 1000 at argument validation, before any query', async () => {
+      const instance = canvasAnswering(async () => canvasResult([{ n: 1 }]));
+
+      const result = await runToolContract(oecdDataframeQuery, {
+        canvas_id: CANVAS_ID,
+        sql: SQL,
+        limit: 1001,
+      });
+
+      expect(structuredOf(result).error?.code).toBe(JsonRpcErrorCode.InvalidParams);
+      expect(structuredOf(result).error?.message).toMatch(/too big/i);
+      expect(instance.query).not.toHaveBeenCalled();
+    });
+
+    it('advertises 1000 as the maximum', () => {
+      const schema = z.toJSONSchema(oecdDataframeQuery.input, { io: 'input' });
+
+      expect(schema.properties?.limit).toMatchObject({ maximum: 1000 });
+    });
   });
 });
 
@@ -484,15 +518,14 @@ describe('oecdDataframeQuery truncation', () => {
   });
 
   it('forwards the canvas truncated flag with a notice naming every way to the rest', async () => {
-    const rows = Array.from({ length: 100 }, (_, i) => ({ n: i }));
-    canvasAnswering(async () => canvasResult(rows, true));
+    canvasAnswering(async () => canvasResult(numbered(100), true));
 
     const result = await runToolContract(oecdDataframeQuery, { canvas_id: CANVAS_ID, sql: SQL });
 
     const structured = structuredOf(result);
     expect(structured.truncated).toBe(true);
     expect(structured.row_count).toBe(100);
-    expect(structured.rows).toEqual(rows);
+    expect(structured.rows).toEqual(numbered(100));
     expect(structured.notice).toContain('aggregate');
     expect(structured.notice).toContain('`ORDER BY … LIMIT … OFFSET`');
     expect(structured.notice).toContain('raise `limit`');
@@ -503,7 +536,7 @@ describe('oecdDataframeQuery truncation', () => {
   });
 
   it('drops the raise-limit lever once the served limit is the per-call maximum', async () => {
-    const rows = Array.from({ length: 1000 }, (_, i) => ({ n: i }));
+    const rows = numbered(1000);
     canvasAnswering(async () => canvasResult(rows, true));
 
     const result = await runToolContract(oecdDataframeQuery, {
@@ -549,16 +582,17 @@ describe('oecdDataframeQuery truncation', () => {
   });
 });
 
-describe('oecdDataframeQuery response budget', () => {
+/** The page is `limit` rows, never a byte cut: row size decides nothing about what comes back. */
+describe('oecdDataframeQuery page size', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     setCanvas(undefined);
   });
 
-  it('stops adding rows before the one that would pass 1 MiB of row data', async () => {
-    // 1 MiB holds 20 of these rows and not 21, whichever surface is counted.
-    const rows = Array.from({ length: 40 }, () => ({ label: 'x'.repeat(50_000) }));
-    canvasAnswering(async () => canvasResult(rows));
+  it('returns every row the canvas answered, whatever their size, on both surfaces', async () => {
+    // About 2 MB of row data on each surface, built afresh for the stub and for the expectation.
+    const wideRows = () => Array.from({ length: 40 }, (_, n) => ({ n, label: 'x'.repeat(50_000) }));
+    canvasAnswering(async () => canvasResult(wideRows()));
 
     const result = await runToolContract(oecdDataframeQuery, {
       canvas_id: CANVAS_ID,
@@ -567,51 +601,24 @@ describe('oecdDataframeQuery response budget', () => {
     });
 
     const structured = structuredOf(result);
-    expect(structured.rows).toHaveLength(20);
-    expect(structured.row_count).toBe(20);
-    expect(structured.truncated).toBe(true);
-    expect(utf8(JSON.stringify(structured.rows))).toBeLessThanOrEqual(BUDGET_BYTES);
-    expect(tableRowsOf(result)).toHaveLength(20);
-    expect(structured.notice).toContain('1 MiB');
-    expect(structured.notice).toContain('fewer or narrower columns');
-    // A larger limit cannot reach rows the byte budget cut.
-    expect(structured.notice).not.toContain('raise');
-    expect(textOf(result)).toContain('Result truncated');
+    expect(structured.rows).toEqual(wideRows());
+    expect(structured.row_count).toBe(40);
+    expect(structured).not.toHaveProperty('truncated');
+    expect(structured).not.toHaveProperty('notice');
+    expect(tableRowsOf(result)).toHaveLength(40);
+    expect(tableRowsOf(result).at(-1)).toBe(`| 39 | ${'x'.repeat(50_000)} |`);
   });
 
-  it('counts a row against the rendered table when that is the larger surface', async () => {
-    // The escaped table line is the larger surface for these rows, so it decides where they stop.
-    const rows = Array.from({ length: 40 }, () => ({ label: '*'.repeat(50_000) }));
-    canvasAnswering(async () => canvasResult(rows));
-
-    const result = await runToolContract(oecdDataframeQuery, {
-      canvas_id: CANVAS_ID,
-      sql: SQL,
-      limit: 1000,
-    });
-
-    const structured = structuredOf(result);
-    expect(structured.rows).toHaveLength(10);
-    expect(structured.truncated).toBe(true);
-    expect(utf8(tableRowsOf(result).join('\n'))).toBeLessThanOrEqual(BUDGET_BYTES);
-  });
-
-  it('returns no rows, never a clipped value, when the first row alone passes the budget', async () => {
+  it('returns a row larger than a mebibyte whole, with the rows after it', async () => {
+    const largeLabel = 'x'.repeat(1_100_000);
     canvasAnswering(async () => canvasResult([{ label: 'x'.repeat(1_100_000) }, { label: 'y' }]));
 
     const result = await runToolContract(oecdDataframeQuery, { canvas_id: CANVAS_ID, sql: SQL });
 
     const structured = structuredOf(result);
-    expect(structured.rows).toEqual([]);
-    expect(structured.row_count).toBe(0);
-    expect(structured.truncated).toBe(true);
-    expect(structured.column_names).toEqual(['label']);
-    expect(structured.notice).toContain('fewer or narrower columns');
-    const text = textOf(result);
-    expect(text).toContain('Result truncated');
-    expect(text).toContain('label');
-    expect(text).not.toContain('returned 0 rows');
-    expect(utf8(text)).toBeLessThan(4096);
+    expect(structured.rows).toEqual([{ label: largeLabel }, { label: 'y' }]);
+    expect(structured).not.toHaveProperty('truncated');
+    expect(tableRowsOf(result)).toEqual([`| ${largeLabel} |`, '| y |']);
   });
 });
 

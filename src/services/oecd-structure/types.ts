@@ -25,8 +25,6 @@ export interface OecdDataflow {
   flowRef: string;
   /** Human-readable name. */
   name: string;
-  /** True when flagged NonProductionDataflow. */
-  nonProduction: boolean;
 }
 
 /** A dimension of a datastructure. */
@@ -61,13 +59,21 @@ export interface OecdTimeDimension {
   position: number;
 }
 
-/** Datastructure metadata for a dataflow. */
+/** Datastructure metadata for a dataflow, at the revision the dataflow references. */
 export interface OecdDataStructure {
   agencyId: string;
+  /**
+   * OECD service root that serves this dataflow's data, and so its availability
+   * record: the root the configured catalog's dataflow entry delegates to when
+   * it is published as a pointer (`rel: external`), and {@link serviceRoot}
+   * otherwise. The two differ only for a delegated dataflow whose datastructure
+   * the configured root also holds — the configured root defines the structure
+   * but answers its data and availability reads with a 500.
+   */
+  dataRoot: string;
   dimensions: OecdDimension[];
   dsdId: string;
   flowRef: string;
-  nonProduction: boolean;
   /**
    * OECD service root that served this datastructure — the configured base URL
    * for nearly every dataflow, and the root named in the catalog entry's

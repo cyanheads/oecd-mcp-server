@@ -83,12 +83,24 @@ export async function toolWireError<T extends ToolDefinition>(
   def: T,
   input: z.input<T['input']>,
 ): Promise<WireError> {
+  return (await toolWireFailure(def, input)).error;
+}
+
+/**
+ * {@link toolWireError}, plus the text the same failed call puts in `content[]`
+ * — the surface a client reading only text sees the message and hint on.
+ */
+export async function toolWireFailure<T extends ToolDefinition>(
+  def: T,
+  input: z.input<T['input']>,
+): Promise<{ error: WireError; text: string }> {
   const result = await runToolContract(def, input);
   const error = (result.structuredContent as { error?: WireError } | undefined)?.error;
   if (!result.isError || !error) {
     throw new Error(`${def.name} returned a success result, not an error envelope`);
   }
-  return error;
+  const text = (result.content as Array<{ text?: string }>).map((b) => b.text ?? '').join('\n');
+  return { error, text };
 }
 
 /**

@@ -1,6 +1,7 @@
 /**
  * @fileoverview OECD SDMX structure service — wraps the dataflow, datastructure,
- * codelist, concept-scheme, and agency-scheme endpoints.
+ * codelist, concept-scheme, and agency-scheme endpoints, behind one response
+ * cache.
  * @module services/oecd-structure/oecd-structure-service
  */
 
@@ -8,12 +9,19 @@ import {
   JsonRpcErrorCode,
   McpError,
   notFound,
+  serializationError,
   serviceUnavailable,
 } from '@cyanheads/mcp-ts-core/errors';
-import { withRetry } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
 import { externalServiceRootOf } from '@/services/oecd-http/external-service-root.js';
-import { fetchOecd, readJsonBody } from '@/services/oecd-http/oecd-http.js';
+import {
+  decodeUpstream,
+  fetchOecd,
+  parseJsonBody,
+  type RequestWindow,
+} from '@/services/oecd-http/oecd-http.js';
+import { isBudgetExpiry, UpstreamBudget } from '@/services/oecd-http/upstream-budget.js';
+import { type LoadedResponse, ResponseCache } from './response-cache.js';
 import type {
   OecdCode,
   OecdDataflow,
@@ -92,40 +100,149 @@ export function directorateCode(agencyId: string): string | undefined {
   return agencyId.split('.')[1] || undefined;
 }
 
-/** Fetch and decode one structure endpoint. */
-async function fetchJson(url: string, signal?: AbortSignal): Promise<unknown> {
-  const res = await fetchOecd(url, {
-    accept: STRUCTURE_ACCEPT,
-    // An unknown agency or dataflow is a caller mistake, not a server fault.
-    expectedStatuses: [404],
-    operation: 'oecdStructureFetch',
-    ...(signal ? { signal } : {}),
-  });
-  return readJsonBody(res);
+/** Retries a structure read gets after its first attempt, on a transient failure. */
+const STRUCTURE_RETRIES = 2;
+
+/** One structure response read to the end: its parsed body, and what the cache needs to know about it. */
+interface StructureBody {
+  /** Characters in the body. */
+  bodyChars: number;
+  /** See {@link freshForMs}. */
+  freshForMs: number | undefined;
+  payload: unknown;
 }
 
 /**
- * Retry a structure fetch and label the failure with the call that produced it,
- * preserving the upstream classification so a terminal 4xx does not resurface as
- * a transient outage.
+ * How long OECD lets a structure response be reused, in milliseconds: its
+ * `max-age` less the `Age` a cache in front of OECD already spent of it
+ * (RFC 9111 freshness). Undefined when the response forbids reuse
+ * (`no-store`, `no-cache`), names no `max-age`, or is already stale — OECD's
+ * 404s answer `no-cache,no-store`, and its 2xx `public,max-age=86400` on the
+ * catalog and every definition, `7200` on availability.
  */
-function fetchStructureJson(
-  url: string,
-  failureMessage: string,
-  signal?: AbortSignal,
-): Promise<unknown> {
-  const retryOpts = { maxRetries: 2, ...(signal ? { signal } : {}) };
-  return withRetry(() => fetchJson(url, signal), retryOpts).catch((err: unknown) => {
-    if (err instanceof McpError) {
-      throw new McpError(err.code, failureMessage, err.data, { cause: err });
-    }
-    throw serviceUnavailable(failureMessage, {}, { cause: err });
-  });
+function freshForMs(headers: Headers): number | undefined {
+  const directives = new Map<string, string>();
+  for (const part of (headers.get('cache-control') ?? '').split(',')) {
+    const [name = '', value = ''] = part.split('=', 2);
+    directives.set(name.trim().toLowerCase(), value.trim());
+  }
+  if (directives.has('no-store') || directives.has('no-cache')) return;
+  const maxAge = directives.get('max-age');
+  if (maxAge === undefined || !/^\d+$/.test(maxAge)) return;
+  const age = headers.get('age')?.trim() ?? '';
+  const spentS = /^\d+$/.test(age) ? Number(age) : 0;
+  const freshMs = (Number(maxAge) - spentS) * 1000;
+  return freshMs > 0 ? freshMs : undefined;
+}
+
+/**
+ * Fetch one structure endpoint inside one request's share of the budget and
+ * read its body to the end.
+ *
+ * The read keeps the body's length and caching headers, which the cache needs,
+ * so it reads the text itself and parses it through `parseJsonBody`, failing the
+ * way `readJsonBody` does: a read cut short keeps the classification
+ * `fetchWithTimeout` gave it, and only a body that arrived whole and is not JSON
+ * becomes `SerializationError`.
+ */
+async function fetchStructureBody(url: string, window: RequestWindow): Promise<StructureBody> {
+  const res = await fetchOecd(
+    url,
+    {
+      accept: STRUCTURE_ACCEPT,
+      // An unknown agency or dataflow is a caller mistake, not a server fault.
+      expectedStatuses: [404],
+      operation: 'oecdStructureFetch',
+    },
+    window,
+  );
+  const text = await res.text();
+  return {
+    bodyChars: text.length,
+    freshForMs: freshForMs(res.headers),
+    payload: parseJsonBody(text, res.headers),
+  };
+}
+
+/** One structure endpoint to read through the service's response cache. */
+export interface StructureRead<T> {
+  /**
+   * `retry` gives the read its retries on a transient failure, the default for
+   * a structure read; `once` sends a single attempt at `OECD_TIMEOUT_MS`, for a
+   * lookup its caller treats as best-effort.
+   */
+  attempts: 'once' | 'retry';
+  /**
+   * Turn the parsed body into the value the read returns. The cache stores that
+   * value, so it is a pure function of the body; it runs once per load, after
+   * the attempts, and a throw fails the load without storing anything. A
+   * `TypeError` reports as `SerializationError` (see `decodeUpstream`).
+   */
+  decode: (payload: unknown) => T;
+  /** What the caller reports when the read fails; the upstream failure stays its cause, code and data intact. */
+  failureMessage: string;
+  /** The request URL, service root included. One URL is always decoded the same way. */
+  url: string;
+}
+
+/**
+ * Load one structure read under the cache's own signal and a budget of its own
+ * that starts with the load. The load outlives no caller (the cache aborts it
+ * when the last one leaves), and a caller's abort or deadline ends only that
+ * caller's wait, never the load. The load's own deadline ends it for every
+ * waiter, so a caller that joined later and still has time when that deadline
+ * passes starts a fresh load rather than take the expiry (see `ResponseCache`).
+ */
+async function loadStructure<T>(
+  read: StructureRead<T>,
+  signal: AbortSignal,
+): Promise<LoadedResponse<T>> {
+  const budget = new UpstreamBudget(signal);
+  const attempt = (window: RequestWindow) => fetchStructureBody(read.url, window);
+  const body =
+    read.attempts === 'retry'
+      ? await budget.retry(attempt, STRUCTURE_RETRIES)
+      : await budget.once(attempt);
+  return {
+    bodyChars: body.bodyChars,
+    freshForMs: body.freshForMs,
+    value: decodeUpstream(() => read.decode(body.payload)),
+  };
+}
+
+/**
+ * Label a failed read with the call that produced it, preserving the upstream
+ * classification so a terminal 4xx does not resurface as a transient outage.
+ */
+function relabel(err: unknown, failureMessage: string): McpError {
+  if (err instanceof McpError)
+    return new McpError(err.code, failureMessage, err.data, { cause: err });
+  return serviceUnavailable(failureMessage, {}, { cause: err });
 }
 
 /** The id a dataflow is catalogued under — combined `{dsd}@{df}`, or bare `{df}`. */
 function dataflowIdOf(parts: { dfId: string; dsdId?: string }): string {
   return parts.dsdId ? `${parts.dsdId}@${parts.dfId}` : parts.dfId;
+}
+
+/**
+ * The two routes one root answers a datastructure on, in the order they are
+ * read: the dataflow's reference, then the datastructure itself, which only a
+ * combined ref names.
+ */
+function structureRoutes(
+  root: string,
+  parts: { agencyId: string; dfId: string; dsdId?: string },
+): { direct: string | undefined; reference: string } {
+  return {
+    direct: parts.dsdId ? `${root}/datastructure/${parts.agencyId}/${parts.dsdId}` : undefined,
+    reference: `${root}/dataflow/${parts.agencyId}/${dataflowIdOf(parts)}?references=datastructure`,
+  };
+}
+
+/** The cache key of a structure read: one URL, decoded one way. */
+function structureCacheKey(url: string): string {
+  return `${STRUCTURE_ACCEPT}\n${url}`;
 }
 
 /**
@@ -144,113 +261,160 @@ function swallowNotFound(err: unknown): undefined {
  *
  * Takes the base URL rather than reading the singleton so the data service can
  * resolve a delegation without depending on structure-service initialization.
- * A failed lookup resolves to undefined: this runs only when the caller already
- * holds a real error to report, and a second failure must not replace the first.
- * The caller's own abort is the exception — it is the outcome now, and the
- * error held from before it would report a call nobody is waiting on.
+ * A failed lookup resolves to undefined — an unreadable catalog entry included:
+ * this runs only when the caller already holds a real error to report, and a
+ * second failure must not replace the first. Two outcomes are the exception,
+ * because each is the outcome now and the error held from before it would
+ * report something false: the caller's own abort, and the call's budget running
+ * out mid-lookup, which leaves nothing to try next and is no more "not found"
+ * than it is an outage.
  *
  * One attempt, deliberately unretried. The caller reaches here holding a
  * failure it wants settled faster than a retry loop would settle it, so
  * answering "where does this flow live" with three requests and a backoff would
  * reintroduce the delay on the catalog endpoint that skipping the retries on
  * the data endpoint just removed.
+ *
+ * Uncached, unlike every read the service makes: it has no service instance to
+ * hold a cache, and it runs only after a data query has already failed.
  */
 export async function fetchExternalServiceRoot(
+  budget: UpstreamBudget,
   baseUrl: string,
   flowRef: string,
-  signal?: AbortSignal,
 ): Promise<string | undefined> {
   const parts = parseFlowRef(flowRef);
   if (!parts) return;
 
-  const payload = await fetchJson(
-    `${baseUrl}/dataflow/${parts.agencyId}/${dataflowIdOf(parts)}`,
-    signal,
-  ).catch((err: unknown) => {
-    if (signal?.aborted) throw err;
+  const url = `${baseUrl}/dataflow/${parts.agencyId}/${dataflowIdOf(parts)}`;
+  try {
+    const { payload } = await budget.once((window) => fetchStructureBody(url, window));
+    return externalServiceRootOf(payload, baseUrl);
+  } catch (err) {
+    if (budget.signal?.aborted || isBudgetExpiry(err)) throw err;
     return;
-  });
-
-  return payload === undefined ? undefined : externalServiceRootOf(payload, baseUrl);
+  }
 }
 
 let _instance: OecdStructureService | undefined;
 
-/** Service for fetching OECD SDMX structural metadata. */
+/**
+ * Service for fetching OECD SDMX structural metadata.
+ *
+ * Every structure read goes through one {@link ResponseCache} the instance
+ * owns, keyed by the request — the service root included, so a delegated root
+ * never answers for the configured one — and kept for the lifetime OECD's
+ * `cache-control` grants each response. The catalog, the dataflow references,
+ * datastructures, concept schemes, codelists, and the agency scheme are all
+ * reused that way; the data service's requests and its delegation lookup
+ * ({@link fetchExternalServiceRoot}) are not. One instance serves the whole
+ * process, every tenant included: structure requests carry no credentials, so
+ * a URL answers every caller alike.
+ */
 export class OecdStructureService {
   private readonly baseUrl: string;
+  readonly #cache = new ResponseCache();
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl;
   }
 
   /**
+   * Read one structure endpoint through this service's response cache.
+   *
+   * A stored, fresh response costs no request. A miss joins the load of the
+   * same request already in flight, or starts one; the load spends a budget of
+   * its own, and this call waits on it only as long as its own `budget` and
+   * signal allow, so a waiter that leaves early fails alone and reports a wait
+   * its budget cut short as the budget's expiry (`isBudgetExpiry`). A failure of
+   * any kind is never stored.
+   *
+   * @throws {McpError} The upstream or decode failure with `read.failureMessage` as
+   *   its message and the original as its cause; `RequestCancelled` on the
+   *   caller's abort; `Timeout` when its budget runs out first.
+   */
+  readStructure<T>(budget: UpstreamBudget, read: StructureRead<T>): Promise<T> {
+    return this.#cache
+      .get(structureCacheKey(read.url), budget, (signal) => loadStructure(read, signal))
+      .catch((err: unknown) => {
+        // A lone read reports its budget running out as `budget.once` does, so
+        // a best-effort caller can still tell the expiry apart (`isBudgetExpiry`).
+        if (read.attempts === 'once' && isBudgetExpiry(err)) throw err;
+        throw relabel(err, read.failureMessage);
+      });
+  }
+
+  /**
    * Fetch all dataflows, optionally filtered by agency.
    * Uses `GET /dataflow/{agencyID}` or `GET /dataflow` for all agencies.
    */
-  async fetchDataflows(agencyId?: string, signal?: AbortSignal): Promise<OecdDataflow[]> {
+  fetchDataflows(budget: UpstreamBudget, agencyId?: string): Promise<OecdDataflow[]> {
     // agencyId comes straight from caller input. A value outside the SDMX
     // character set cannot name any agency, so it is a not-found — never a
     // transient failure the caller should retry.
     if (agencyId !== undefined && !SDMX_ID_SAFE.test(agencyId)) {
-      throw notFound(`Invalid agency identifier: ${agencyId}`, { agencyId });
+      return Promise.reject(notFound(`Invalid agency identifier: ${agencyId}`, { agencyId }));
     }
-    const url = agencyId ? `${this.baseUrl}/dataflow/${agencyId}` : `${this.baseUrl}/dataflow`;
-
-    const data = await fetchStructureJson(
-      url,
-      `Failed to fetch OECD dataflows${agencyId ? ` for agency ${agencyId}` : ''}`,
-      signal,
-    );
-
-    return parseDataflows(data);
+    return this.readStructure(budget, {
+      attempts: 'retry',
+      decode: parseDataflows,
+      failureMessage: `Failed to fetch OECD dataflows${agencyId ? ` for agency ${agencyId}` : ''}`,
+      url: agencyId ? `${this.baseUrl}/dataflow/${agencyId}` : `${this.baseUrl}/dataflow`,
+    });
   }
 
   /**
-   * Fetch the datastructure for a flow ref, with each dimension's name resolved
-   * from its concept scheme.
+   * Fetch the datastructure a flow ref's dataflow references, with each
+   * dimension's name resolved from its concept scheme.
    *
-   * Two routes, because neither covers the catalog alone.
+   * Every ref starts at the dataflow itself:
+   * `GET /dataflow/{agencyID}/{id}?references=datastructure`, the id as OECD
+   * catalogues it, combined or bare. One request answers two questions there.
+   * Whether OECD publishes the dataflow at all — a 404 is the not-found the
+   * caller reports, never a cue to try another route. And which datastructure
+   * revision the dataflow references, which is not always the latest:
+   * `DF_UOE_FIN_NATURE` references `DSD_EAG_UOE_FIN` 1.0, eight dimensions,
+   * where the datastructure's own route answers with 3.2 and nine.
    *
-   * A combined `{dsd_id}@{df_id}` ref names a datastructure directly, so
-   * `GET /datastructure/{agencyID}/{dsd_id}` answers in one request and stays
-   * the first attempt. But the `{dsd_id}` half is a label OECD does not keep in
-   * step with the real datastructure — for part of the catalog it names one
-   * that does not exist (`DSD_REG_LAB@DF_RATES` is backed by `DSD_REG_LABOUR`),
-   * and that route answers 404 for a dataflow the data endpoint serves happily.
+   * That route cannot answer the first question and gets the second wrong for
+   * part of the catalog, which is why it does not lead. The `{dsd_id}` half of
+   * a combined ref names a datastructure, not a dataflow, so the route resolves
+   * a mistyped or retired dataflow id as long as its datastructure exists; and
+   * the `{dsd_id}` is a label OECD does not keep in step with the real
+   * datastructure (`DSD_REG_LAB@DF_RATES` is backed by `DSD_REG_LABOUR`). A bare
+   * `{agencyID},{df_id}` ref carries no datastructure id to address at all.
    *
-   * So a not-found falls back to asking the dataflow for its own datastructure:
-   * `GET /dataflow/{agencyID}/{id}?references=datastructure` returns the same
-   * `dataStructures` payload keyed to the id OECD actually catalogues. That is
-   * also the only route for a bare `{agencyID},{df_id}` ref, which carries no
-   * datastructure id to address at all.
+   * The datastructure route stays for one class. Part of the catalog is
+   * published as a pointer rather than a definition — `isExternalReference:
+   * true`, no inline datastructure, and a `links[]` entry naming the OECD
+   * service root that owns the real thing. For several of those the configured
+   * root holds the datastructure anyway, so the datastructure route is tried
+   * next, and then the root the link names, read the same way.
    *
-   * The fallback is second rather than first because the reference route is not
-   * a superset: a dataflow OECD publishes as an external reference carries no
-   * inline datastructure, and for several of those the datastructure is
-   * nonetheless reachable on its own endpoint. Trying the direct route first
-   * keeps them working; falling back covers the mismatched prefixes. Only the
-   * refs the first route cannot resolve pay the second request.
+   * Whichever revision answers is the authority for the lookups that follow
+   * it, so the codelists and concept schemes read back at the versions it names
+   * are coherent with the dimensions it declared.
    *
-   * Every route asks for latest. A `flow_ref` carries no version, and learning
-   * which one to pin would cost a catalog request to answer a question nothing
-   * asked — this is the entry point, not a reference followed from somewhere
-   * else. Whichever revision answers is then the authority for the lookups that
-   * follow it, so the codelists and concept schemes read back at the versions
-   * it names are coherent with the dimensions it declared.
+   * A pointer also names where the dataflow's data lives, whichever route then
+   * answers for the structure, so the result records that root as `dataRoot`
+   * beside the `serviceRoot` that defined the structure. Without a pointer the
+   * two are the same root.
    *
-   * A third route exists for the entries neither of the first two can answer.
-   * Part of the catalog is published as a pointer rather than a definition —
-   * `isExternalReference: true`, no `structure` URN, and a `links[]` entry
-   * naming the OECD service root that owns the real thing. The second route's
-   * response already carries that link, so following it costs one request and
-   * only on a ref that would otherwise have failed.
+   * A repeat call for a pointer whose root already answered is served from that
+   * answer, before the configured root's datastructure route — see
+   * {@link cachedDataStructure}.
+   *
+   * Every route and every concept-scheme read spends the one budget it is
+   * given, so the whole cascade ends when the budget does.
    */
-  async fetchDataStructure(flowRef: string, signal?: AbortSignal): Promise<OecdDataStructure> {
+  async fetchDataStructure(budget: UpstreamBudget, flowRef: string): Promise<OecdDataStructure> {
     const parts = parseFlowRef(flowRef);
     if (!parts) {
       throw new Error(`Invalid flow_ref format: ${flowRef}`);
     }
+
+    const configured = structureRoutes(this.baseUrl, parts);
+    const reference = await this.readDataStructure(budget, configured.reference, flowRef);
 
     /**
      * Root that answered. Codelists and concept schemes are versioned per root
@@ -259,83 +423,108 @@ export class OecdStructureService {
      * whichever root defined it.
      */
     let serviceRoot = this.baseUrl;
-    let parsed: ParsedDataStructure | undefined;
+    let parsed = reference.kind === 'structure' ? reference.parsed : undefined;
 
-    if (parts.dsdId) {
-      parsed = await this.loadDataStructure(
-        `${this.baseUrl}/datastructure/${parts.agencyId}/${parts.dsdId}`,
-        flowRef,
-        parts.agencyId,
-        signal,
-      ).catch(swallowNotFound);
+    if (!parsed && reference.kind === 'delegated') {
+      parsed = this.cachedDataStructure(reference.root, parts);
+      if (parsed) serviceRoot = reference.root;
+    }
+
+    if (!parsed && configured.direct) {
+      const direct = await this.readDataStructure(budget, configured.direct, flowRef).catch(
+        swallowNotFound,
+      );
+      if (direct?.kind === 'structure') parsed = direct.parsed;
     }
 
     if (!parsed) {
-      // The dataflow is catalogued under the id as published — combined or bare.
-      const payload = await fetchStructureJson(
-        `${this.baseUrl}/dataflow/${parts.agencyId}/${dataflowIdOf(parts)}?references=datastructure`,
-        `Failed to fetch OECD datastructure for ${flowRef}`,
-        signal,
-      );
-      try {
-        parsed = parseDataStructure(payload, flowRef, parts.agencyId);
-      } catch (err) {
-        if (!isDataflowNotFound(err as Error)) throw err;
-        const external = externalServiceRootOf(payload, this.baseUrl);
-        // No delegation to follow means the ref genuinely resolves nowhere.
-        if (!external) throw err;
-        parsed = await this.loadDelegatedDataStructure(external, parts, flowRef, signal);
-        serviceRoot = external;
+      // No delegation to follow means the ref genuinely resolves nowhere.
+      if (reference.kind !== 'delegated') {
+        throw notFound(`DataStructure not found for ${flowRef}`, { flowRef });
       }
+      parsed = await this.loadDelegatedDataStructure(budget, reference.root, parts, flowRef);
+      serviceRoot = reference.root;
     }
 
-    return this.applyConceptNames({ ...parsed.structure, serviceRoot }, parsed.conceptRefs, signal);
+    return this.applyConceptNames(
+      budget,
+      {
+        ...parsed.structure,
+        agencyId: parts.agencyId,
+        dataRoot: reference.kind === 'delegated' ? reference.root : serviceRoot,
+        flowRef,
+        serviceRoot,
+      },
+      parsed.conceptRefs,
+    );
   }
 
   /**
-   * Resolve a datastructure on the service root the catalog delegated to,
-   * trying the same two routes in the same order and for the same reasons as
-   * {@link fetchDataStructure}. The delegating root is only ever the validated
-   * one {@link externalServiceRootOf} returns; the path is rebuilt here from
-   * identifiers `parseFlowRef` already checked, never from the upstream href.
+   * Resolve a datastructure on the service root the catalog delegated to, in
+   * the order and for the reasons {@link fetchDataStructure} gives: the
+   * dataflow's reference first, the datastructure route when that carries
+   * none. The configured root has already answered that the dataflow exists, so
+   * a 404 on the first route still leaves the second to try. The delegating root
+   * is only ever the validated one {@link externalServiceRootOf} returns; the
+   * paths are rebuilt here from identifiers `parseFlowRef` already checked,
+   * never from the upstream href.
    */
   private async loadDelegatedDataStructure(
+    budget: UpstreamBudget,
     serviceRoot: string,
     parts: { agencyId: string; dfId: string; dsdId?: string },
     flowRef: string,
-    signal?: AbortSignal,
   ): Promise<ParsedDataStructure> {
-    if (parts.dsdId) {
-      const direct = await this.loadDataStructure(
-        `${serviceRoot}/datastructure/${parts.agencyId}/${parts.dsdId}`,
-        flowRef,
-        parts.agencyId,
-        signal,
-      ).catch(swallowNotFound);
-      if (direct) return direct;
-    }
-
-    return this.loadDataStructure(
-      `${serviceRoot}/dataflow/${parts.agencyId}/${dataflowIdOf(parts)}?references=datastructure`,
-      flowRef,
-      parts.agencyId,
-      signal,
+    const routes = structureRoutes(serviceRoot, parts);
+    const reference = await this.readDataStructure(budget, routes.reference, flowRef).catch(
+      swallowNotFound,
     );
+    if (reference?.kind === 'structure') return reference.parsed;
+
+    const direct = routes.direct
+      ? await this.readDataStructure(budget, routes.direct, flowRef)
+      : undefined;
+    if (direct?.kind === 'structure') return direct.parsed;
+    throw notFound(`DataStructure not found for ${flowRef}`, { flowRef });
   }
 
-  /** Fetch one structure endpoint and read the datastructure out of it. */
-  private async loadDataStructure(
+  /**
+   * The datastructure a delegated root has already answered with, read from the
+   * cache alone in {@link loadDelegatedDataStructure}'s order; undefined when
+   * neither of its routes holds one.
+   *
+   * It lets a repeat call skip the configured root's datastructure route, whose
+   * 404 is never stored. Skipping it changes no answer: a delegated root's
+   * routes are read only by {@link loadDelegatedDataStructure}, which runs only
+   * once that route has found nothing, so a stored answer is the resolution the
+   * full cascade reached, kept for the lifetime OECD granted it. When it
+   * expires, the next call reads the cascade in full again.
+   */
+  private cachedDataStructure(
+    serviceRoot: string,
+    parts: { agencyId: string; dfId: string; dsdId?: string },
+  ): ParsedDataStructure | undefined {
+    const routes = structureRoutes(serviceRoot, parts);
+    for (const url of [routes.reference, routes.direct]) {
+      if (url === undefined) continue;
+      const stored = this.#cache.peek<StructureResponse>(structureCacheKey(url));
+      if (stored?.kind === 'structure') return stored.parsed;
+    }
+    return;
+  }
+
+  /** Read one datastructure or dataflow-reference response. */
+  private readDataStructure(
+    budget: UpstreamBudget,
     url: string,
     flowRef: string,
-    agencyId: string,
-    signal?: AbortSignal,
-  ): Promise<ParsedDataStructure> {
-    const data = await fetchStructureJson(
+  ): Promise<StructureResponse> {
+    return this.readStructure(budget, {
+      attempts: 'retry',
+      decode: (payload) => parseStructureResponse(payload, this.baseUrl),
+      failureMessage: `Failed to fetch OECD datastructure for ${flowRef}`,
       url,
-      `Failed to fetch OECD datastructure for ${flowRef}`,
-      signal,
-    );
-    return parseDataStructure(data, flowRef, agencyId);
+    });
   }
 
   /**
@@ -353,33 +542,40 @@ export class OecdStructureService {
    * {@link SDMX_VERSION_SAFE} and this parameter becomes a URL path segment.
    */
   async fetchConceptScheme(
+    budget: UpstreamBudget,
     agencyId: string,
     schemeId: string,
-    signal?: AbortSignal,
     serviceRoot: string = this.baseUrl,
     version?: string,
   ): Promise<Map<string, string>> {
     // Both IDs come from a datastructure URN, but validate as a safety net
-    // before embedding in the URL path.
+    // before embedding in the URL path. One outside the SDMX character set is a
+    // fault in what OECD published, and no retry clears it.
     if (!SDMX_ID_SAFE.test(agencyId) || !SDMX_ID_SAFE.test(schemeId)) {
-      throw serviceUnavailable(`Invalid concept scheme identifier: ${agencyId}/${schemeId}`, {
-        agencyId,
-        schemeId,
-      });
+      throw serializationError(
+        `OECD named a concept scheme identifier outside the SDMX character set: ${agencyId}/${schemeId}`,
+        { agencyId, schemeId },
+      );
     }
     const url = `${serviceRoot}/conceptscheme/${agencyId}/${schemeId}`;
     const label = `OECD concept scheme ${agencyId}/${schemeId}`;
 
     if (version !== undefined) {
-      const pinned = await fetchStructureJson(
-        `${url}/${version}`,
-        `Failed to fetch ${label} version ${version}`,
-        signal,
-      ).catch(swallowNotFound);
-      if (pinned !== undefined) return parseConceptScheme(pinned);
+      const pinned = await this.readStructure(budget, {
+        attempts: 'retry',
+        decode: parseConceptScheme,
+        failureMessage: `Failed to fetch ${label} version ${version}`,
+        url: `${url}/${version}`,
+      }).catch(swallowNotFound);
+      if (pinned !== undefined) return pinned;
     }
 
-    return parseConceptScheme(await fetchStructureJson(url, `Failed to fetch ${label}`, signal));
+    return this.readStructure(budget, {
+      attempts: 'retry',
+      decode: parseConceptScheme,
+      failureMessage: `Failed to fetch ${label}`,
+      url,
+    });
   }
 
   /**
@@ -387,14 +583,13 @@ export class OecdStructureService {
    * Uses `GET /agencyscheme/OECD`, whose entries are keyed by the directorate
    * segment of a dotted agency identifier — see {@link directorateCode}.
    */
-  async fetchDirectorates(signal?: AbortSignal): Promise<Map<string, string>> {
-    const data = await fetchStructureJson(
-      `${this.baseUrl}/agencyscheme/OECD`,
-      'Failed to fetch the OECD agency scheme',
-      signal,
-    );
-
-    return parseAgencyScheme(data);
+  fetchDirectorates(budget: UpstreamBudget): Promise<Map<string, string>> {
+    return this.readStructure(budget, {
+      attempts: 'retry',
+      decode: parseAgencyScheme,
+      failureMessage: 'Failed to fetch the OECD agency scheme',
+      url: `${this.baseUrl}/agencyscheme/OECD`,
+    });
   }
 
   /**
@@ -405,15 +600,17 @@ export class OecdStructureService {
    * dimension, so the names live one request away in the concept scheme. A
    * scheme that fails to fetch, or one that omits a concept, leaves the
    * dimension on its id. A missing label is a tolerable gap; failing the whole
-   * dataset-info call over one is not. The caller's own abort is not a scheme
+   * dataset-info call over one is not. A budget that runs out during the
+   * scheme reads is one more way for a scheme to fail to arrive, so the
+   * structure comes back on its ids. The caller's own abort is not a scheme
    * failing to fetch: it ends the call as the cancellation it is, rather than
    * returning a structure nobody is waiting for. A datastructure whose
    * dimensions carry no parseable `conceptIdentity` issues no request at all.
    */
   private async applyConceptNames(
+    budget: UpstreamBudget,
     structure: OecdDataStructure,
     conceptRefs: ConceptRef[],
-    signal?: AbortSignal,
   ): Promise<OecdDataStructure> {
     // Every dimension of a datastructure shares one scheme in practice; keying
     // by scheme collapses them to the single request that fact implies.
@@ -425,13 +622,13 @@ export class OecdStructureService {
             [
               key,
               await this.fetchConceptScheme(
+                budget,
                 ref.agencyId,
                 ref.schemeId,
-                signal,
                 structure.serviceRoot,
                 ref.version,
               ).catch((err: unknown) => {
-                if (signal?.aborted) throw err;
+                if (budget.signal?.aborted) throw err;
                 return new Map<string, string>();
               }),
             ] as const,
@@ -485,33 +682,40 @@ export class OecdStructureService {
    * segment.
    */
   async fetchCodelist(
+    budget: UpstreamBudget,
     agencyId: string,
     codelistId: string,
-    signal?: AbortSignal,
     serviceRoot: string = this.baseUrl,
     version?: string,
   ): Promise<OecdCode[]> {
-    // Both IDs are derived from upstream DSD responses, but validate as a safety net
-    // before embedding in the URL path.
+    // Both IDs are derived from upstream DSD responses, but validate as a safety
+    // net before embedding in the URL path. One outside the SDMX character set
+    // is a fault in what OECD published, and no retry clears it.
     if (!SDMX_ID_SAFE.test(agencyId) || !SDMX_ID_SAFE.test(codelistId)) {
-      throw serviceUnavailable(`Invalid codelist identifier: ${agencyId}/${codelistId}`, {
-        agencyId,
-        codelistId,
-      });
+      throw serializationError(
+        `OECD named a codelist identifier outside the SDMX character set: ${agencyId}/${codelistId}`,
+        { agencyId, codelistId },
+      );
     }
     const url = `${serviceRoot}/codelist/${agencyId}/${codelistId}`;
     const label = `OECD codelist ${agencyId}/${codelistId}`;
 
     if (version !== undefined) {
-      const pinned = await fetchStructureJson(
-        `${url}/${version}`,
-        `Failed to fetch ${label} version ${version}`,
-        signal,
-      ).catch(swallowNotFound);
-      if (pinned !== undefined) return parseCodelist(pinned);
+      const pinned = await this.readStructure(budget, {
+        attempts: 'retry',
+        decode: parseCodelist,
+        failureMessage: `Failed to fetch ${label} version ${version}`,
+        url: `${url}/${version}`,
+      }).catch(swallowNotFound);
+      if (pinned !== undefined) return pinned;
     }
 
-    return parseCodelist(await fetchStructureJson(url, `Failed to fetch ${label}`, signal));
+    return this.readStructure(budget, {
+      attempts: 'retry',
+      decode: parseCodelist,
+      failureMessage: `Failed to fetch ${label}`,
+      url,
+    });
   }
 }
 
@@ -707,10 +911,6 @@ function parseDataflows(data: unknown): OecdDataflow[] {
     const rawDescription = localizedString(f.description);
     const description = rawDescription ? stripHtml(rawDescription) : undefined;
 
-    // Check for NonProductionDataflow annotation
-    const annotations = (f.annotations ?? []) as Array<Record<string, unknown>>;
-    const nonProduction = annotations.some((a) => String(a.id ?? '') === 'NonProductionDataflow');
-
     return {
       flowRef,
       agencyId,
@@ -718,7 +918,6 @@ function parseDataflows(data: unknown): OecdDataflow[] {
       dsdId,
       name: String(name),
       ...(description ? { description } : {}),
-      nonProduction,
     };
   });
 }
@@ -729,19 +928,44 @@ function parseDataflows(data: unknown): OecdDataflow[] {
  */
 interface ParsedDataStructure {
   conceptRefs: ConceptRef[];
-  /** The root that served it is the caller's to record — see {@link OecdDataStructure.serviceRoot}. */
-  structure: Omit<OecdDataStructure, 'serviceRoot'>;
+  /**
+   * What the response defines. The flow ref and agency it was asked for, and
+   * the roots that served it and its data, are the caller's to record: one
+   * datastructure response can answer more than one flow ref.
+   */
+  structure: Omit<OecdDataStructure, 'agencyId' | 'dataRoot' | 'flowRef' | 'serviceRoot'>;
 }
 
-function parseDataStructure(data: unknown, flowRef: string, agencyId: string): ParsedDataStructure {
+/**
+ * What a datastructure or dataflow-reference response carries: the
+ * datastructure, or failing that the service root the dataflow entry delegates
+ * to, or neither.
+ */
+type StructureResponse =
+  | { kind: 'absent' }
+  | { kind: 'delegated'; root: string }
+  | { kind: 'structure'; parsed: ParsedDataStructure };
+
+/**
+ * Read a datastructure or dataflow-reference response. The delegation links
+ * are read only from a response that carries no datastructure — the one case
+ * that needs them.
+ */
+function parseStructureResponse(data: unknown, baseUrl: string): StructureResponse {
+  const parsed = parseDataStructure(data);
+  if (parsed) return { kind: 'structure', parsed };
+  const root = externalServiceRootOf(data, baseUrl);
+  return root ? { kind: 'delegated', root } : { kind: 'absent' };
+}
+
+/** The first datastructure a response carries, or undefined for an empty `dataStructures`. */
+function parseDataStructure(data: unknown): ParsedDataStructure | undefined {
   const root = data as Record<string, unknown>;
   const structures = root?.data as Record<string, unknown> | undefined;
   const rawDsds = (structures?.dataStructures ?? []) as Array<Record<string, unknown>>;
 
   const dsd = rawDsds[0];
-  if (!dsd) {
-    throw notFound(`DataStructure not found for ${flowRef}`, { flowRef });
-  }
+  if (!dsd) return;
 
   const components = dsd.dataStructureComponents as Record<string, unknown> | undefined;
   const dimList = components?.dimensionList as Record<string, unknown> | undefined;
@@ -750,10 +974,6 @@ function parseDataStructure(data: unknown, flowRef: string, agencyId: string): P
   // API uses "timeDimensions" (plural, array) — not "timeDimension" (singular)
   const rawTimeDims = (dimList?.timeDimensions ?? []) as Array<Record<string, unknown>>;
   const rawTimeDim = rawTimeDims[0];
-
-  // Check NonProductionDataflow annotation
-  const annotations = (dsd.annotations ?? []) as Array<Record<string, unknown>>;
-  const nonProduction = annotations.some((a) => String(a.id ?? '') === 'NonProductionDataflow');
 
   const conceptRefs: ConceptRef[] = [];
   for (const d of [...rawDims, ...(rawTimeDim ? [rawTimeDim] : [])]) {
@@ -794,14 +1014,11 @@ function parseDataStructure(data: unknown, flowRef: string, agencyId: string): P
   return {
     conceptRefs,
     structure: {
-      flowRef,
-      agencyId,
       // The response is authoritative: the `{dsd_id}` half of a combined flow
       // ref is a label OECD does not keep in step with the real datastructure.
       dsdId: String(dsd.id ?? ''),
       dimensions,
       timeDimension,
-      nonProduction,
     },
   };
 }
@@ -857,9 +1074,10 @@ function parseCodelist(data: unknown): OecdCode[] {
 /**
  * Returns true when an error (or its cause chain) signals that an agency,
  * dataflow, or datastructure was not found. Both sources are structural: an
- * upstream HTTP 404 arrives as `NotFound` from `fetchWithTimeout`, and an empty
- * `dataStructures` array is thrown as `notFound()` by `parseDataStructure`. Tool
- * handlers use it to map service errors onto their typed not-found contract entry.
+ * upstream HTTP 404 arrives as `NotFound` from `fetchWithTimeout`, and a ref
+ * that no route resolves to a datastructure is thrown as `notFound()` by
+ * `fetchDataStructure`. Tool handlers use it to map service errors onto their
+ * typed not-found contract entry.
  */
 export function isDataflowNotFound(e: Error): boolean {
   if (e instanceof McpError && e.code === JsonRpcErrorCode.NotFound) return true;
