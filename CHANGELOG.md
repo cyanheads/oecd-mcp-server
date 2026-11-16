@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-11-16 · ⚠️ Breaking
+
+oecd_query_dataset rows drop constant columns for a new constant_columns and gain _code columns; oecd_search_datasets matches at word starts and loses non_production; each call spends one upstream budget; structure responses are cached; limits clamp; DuckDB 2 and mcp-ts-core 0.13.22.
+
 ## [0.6.1](changelog/0.6.x/0.6.1.md) — 2026-11-02 · 🛡️ Security
 
 oecd_dataframe_query returns 100 rows by default (up to 1,000 per call, within 1 MiB, stopped after 30 seconds) and flags truncated results; oecd_query_dataset checks an explicit canvas_id before the download; failures while reading OECD response bodies keep their reason.

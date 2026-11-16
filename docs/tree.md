@@ -1,6 +1,6 @@
 # oecd-mcp-server - Directory Structure
 
-Generated on: 2026-11-03 03:57:06
+Generated on: 2026-11-16 08:52:04
 
 ```text
 oecd-mcp-server/
@@ -30,6 +30,7 @@ oecd-mcp-server/
 │   ├── 0.4.x/
 │   ├── 0.5.x/
 │   ├── 0.6.x/
+│   ├── 0.7.x/
 │   └── template.md
 ├── docs/
 │   ├── design.md
@@ -174,17 +175,24 @@ oecd-mcp-server/
 │   │   │   └── types.ts
 │   │   ├── oecd-http/
 │   │   │   ├── external-service-root.ts
-│   │   │   └── oecd-http.ts
+│   │   │   ├── oecd-http.ts
+│   │   │   └── upstream-budget.ts
 │   │   └── oecd-structure/
+│   │       ├── availability.ts
 │   │       ├── oecd-structure-service.ts
+│   │       ├── response-cache.ts
 │   │       └── types.ts
 │   ├── utils/
-│   │   └── format-table.ts
+│   │   ├── count-limit.ts
+│   │   ├── format-table.ts
+│   │   └── word-start-text.ts
 │   └── index.ts
 ├── tests/
 │   ├── helpers/
 │   │   ├── body-stub.ts
-│   │   └── error-contract.ts
+│   │   ├── error-contract.ts
+│   │   ├── oecd-response.ts
+│   │   └── scripted-fetch.ts
 │   ├── prompts/
 │   ├── resources/
 │   │   └── dataflow.resource.test.ts
@@ -195,9 +203,12 @@ oecd-mcp-server/
 │   │   │   └── oecd-data-service.test.ts
 │   │   ├── oecd-http/
 │   │   │   ├── external-service-root.test.ts
-│   │   │   └── oecd-http.test.ts
+│   │   │   ├── oecd-http.test.ts
+│   │   │   └── upstream-budget.test.ts
 │   │   └── oecd-structure/
-│   │       └── oecd-structure-service.test.ts
+│   │       ├── availability.test.ts
+│   │       ├── oecd-structure-service.test.ts
+│   │       └── response-cache.test.ts
 │   ├── tools/
 │   │   ├── dataframe-describe.tool.test.ts
 │   │   ├── dataframe-drop.tool.test.ts
@@ -209,6 +220,9 @@ oecd-mcp-server/
 │   │   ├── query-dataset-canvas.test.ts
 │   │   ├── query-dataset.tool.test.ts
 │   │   └── search-datasets.tool.test.ts
+│   ├── utils/
+│   │   ├── count-limit.test.ts
+│   │   └── word-start-text.test.ts
 │   ├── error-contract-coherence.test.ts
 │   ├── startup.test.ts
 │   └── tool-input-strictness.test.ts
