@@ -72,9 +72,8 @@ export async function readAvailability(
   key: string | undefined,
   root: string = dsd.dataRoot,
 ): Promise<AvailabilityOutcome> {
-  // A flow ref `fetchDataStructure` accepted carries one `@` at most, the one
-  // the path percent-encodes.
-  const flow = dsd.flowRef.replace('@', '%40');
+  // The path percent-encodes the `@` of a combined flow ref.
+  const flow = dsd.flowRef.replaceAll('@', '%40');
   try {
     const availability = await getStructureService().readStructure(budget, {
       attempts: 'once',
