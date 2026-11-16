@@ -1,9 +1,10 @@
 /**
  * @fileoverview Pins the `.mcpb` agent-doc selector shared by
  * `scripts/clean-mcpb.ts` (strip) and `scripts/lint-packaging.ts` (check 8):
- * agent directories at an installed package's root are stripped, while a
- * `skills/` nested inside a package — the MCP SDK's runtime `dist/ext/skills/`
- * modules — ships, or the bundle fails at boot with `ERR_MODULE_NOT_FOUND`.
+ * agent directories and `AGENTS.md`/`CLAUDE.md` at an installed package's root
+ * are stripped, as is a `SKILL.md` anywhere, while a `skills/` nested inside a
+ * package — the MCP SDK's runtime `dist/ext/skills/` modules — ships, or the
+ * bundle fails at boot with `ERR_MODULE_NOT_FOUND`.
  * @module tests/scripts/bundle-agent-docs.test
  */
 
@@ -32,6 +33,7 @@ const RUNTIME_ENTRIES = [
   'node_modules/some-dep/node_modules/other/lib/skills/loader.js',
   'node_modules/@scope/skills/index.js',
   'node_modules/skills/index.js',
+  'node_modules/some-dep/docs/AGENTS.md',
   'dist/index.js',
   'skills/oecd-guide/SKILL.md',
 ];
@@ -44,6 +46,9 @@ const AGENT_DOC_ENTRIES = [
   'node_modules/some-dep/SKILL.md',
   'node_modules/some-dep/node_modules/@scope/pkg/skills/guide/SKILL.md',
   'node_modules/some-dep/node_modules/other/.claude/commands/x.md',
+  'node_modules/@cyanheads/mcp-ts-core/CLAUDE.md',
+  'node_modules/some-dep/AGENTS.md',
+  'node_modules/some-dep/lib/guides/SKILL.md',
 ];
 
 describe('bundle agent-doc selector', () => {
@@ -51,7 +56,7 @@ describe('bundle agent-doc selector', () => {
     expect(filterAgentDocEntries(RUNTIME_ENTRIES)).toEqual([]);
   });
 
-  it('strips agent directories and SKILL.md at a package root, scoped and nested', () => {
+  it('strips agent directories and agent docs at a package root, and SKILL.md anywhere', () => {
     expect(filterAgentDocEntries(AGENT_DOC_ENTRIES)).toEqual(AGENT_DOC_ENTRIES);
   });
 
