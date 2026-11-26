@@ -77,7 +77,7 @@ describe('upstream text rendering', () => {
     });
   });
 
-  it('renders search identifiers, names, and descriptions literally', () => {
+  it('renders search identifiers, names, and descriptions literally, with or without matched_in', () => {
     const blocks = oecdSearchDatasets.format!({
       dataflows: [
         {
@@ -87,20 +87,31 @@ describe('upstream text rendering', () => {
           description: multiline,
           matched_in: 'both',
         },
+        {
+          flow_ref: 'OECD.ELS.HD,DSD_HEALTH@DF_HEALTH',
+          agency_id: 'OECD.ELS.HD',
+          name: 'Health indicators',
+        },
       ],
-      result_count: 1,
-      total_matches: 1,
+      result_count: 2,
+      total_matches: 2,
       offset: 0,
       source: 'OECD',
     });
     const text = textOf(blocks);
     expect(text.split(punctuation)).toHaveLength(5);
     expect(text).toContain(multiline);
+    expect(text).toContain('OECD.ELS.HD,DSD_HEALTH@DF_HEALTH');
+    expect(text.match(/matched_in:/g)).toHaveLength(1);
   });
 
-  it('renders all dataset dimensions including the time dimension', () => {
+  it('renders all dataset dimensions, time dimension, name, description links, and resources', () => {
     const blocks = oecdGetDatasetInfo.format!({
       flow_ref: punctuation,
+      name: punctuation,
+      description:
+        'Covers A*B* | <tag> &amp; `D` _E_ ~F~ [bad](javascript:alert(1)) — see [User guide](https://example.org/guide) and [stats@oecd.org](mailto:stats@oecd.org).',
+      resources: [{ label: punctuation, url: 'https://example.org/notes.pdf' }],
       dimensions: [{ id: 'D', name: multiline, position: 1, codelist_ref: punctuation }],
       time_dimension: { id: 'T', name: punctuation, position: 2 },
       key_example: punctuation,
@@ -113,24 +124,47 @@ describe('upstream text rendering', () => {
         ['2', 'T (time)', punctuation, '—'],
       ],
     });
-    expect(textOf(blocks)).toContain(`Dataflow: ${punctuation}`);
-    expect(textOf(blocks)).toContain(`Key example (all wildcards): ${punctuation}`);
+    const text = textOf(blocks);
+    expect(text).toContain(`Dataflow: ${punctuation}`);
+    expect(text).toContain(`Name: ${punctuation}`);
+    expect(text).toContain('Covers A*B* | <tag> &amp; `D` _E_ ~F~ [bad](javascript:alert(1))');
+    expect(text).toContain('User guide');
+    expect(text).toContain('stats@oecd.org');
+    expect(text).toContain(`Key example (all wildcards): ${punctuation}`);
+    expect(text).toContain(`Resources:${punctuation}`);
+    const source = blocks.map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    const hrefs = markdown
+      .parse(source, {})
+      .flatMap((token) => token.children ?? [])
+      .filter((token) => token.type === 'link_open')
+      .map((token) => token.attrGet('href'));
+    expect(hrefs).toEqual([
+      'https://example.org/guide',
+      'mailto:stats@oecd.org',
+      'https://example.org/notes.pdf',
+    ]);
   });
 
-  it('renders every returned dimension code and label', () => {
+  it('renders every returned dimension code, label, and optional parent', () => {
     const blocks = oecdGetDimensionValues.format!({
       flow_ref: punctuation,
       dimension_id: punctuation,
-      codes: [{ id: punctuation, name: multiline }],
-      code_count: 1,
+      codes: [
+        { id: punctuation, name: multiline, parent: punctuation },
+        { id: 'ROOT', name: 'Top level' },
+      ],
+      code_count: 2,
       available_only: true,
       time_range: { start: '1995-01-01', end: '2024-12-31' },
       observation_count: 453_657_180,
       source: 'OECD',
     });
     expect(jsonTable(blocks)).toEqual({
-      columns: ['Code', 'Name'],
-      rows: [[punctuation, multiline]],
+      columns: ['Code', 'Name', 'Parent'],
+      rows: [
+        [punctuation, multiline, punctuation],
+        ['ROOT', 'Top level', '—'],
+      ],
     });
     expect(textOf(blocks)).toContain(`Dimension: ${punctuation}`);
     expect(textOf(blocks)).toContain('available_only: true');
@@ -138,7 +172,7 @@ describe('upstream text rendering', () => {
     expect(textOf(blocks)).toContain('Observations: 453657180');
   });
 
-  it('renders every query observation and constant in the existing preview with literal metadata', () => {
+  it('renders every query observation and constant with literal metadata including last_n_observations', () => {
     const blocks = oecdQueryDataset.format!({
       rows: [
         { label: multiline, value: 2 },
@@ -150,6 +184,7 @@ describe('upstream text rendering', () => {
       query_key: punctuation,
       query_start_period: punctuation,
       query_end_period: punctuation,
+      query_last_n_observations: 2,
       source: 'OECD',
     });
     expect(jsonTable(blocks)).toEqual({
@@ -159,8 +194,10 @@ describe('upstream text rendering', () => {
         ['last', '3'],
       ],
     });
+    const text = textOf(blocks);
     // Four in the query echo, three in the constants table's one row.
-    expect(textOf(blocks).split(punctuation)).toHaveLength(8);
+    expect(text.split(punctuation)).toHaveLength(8);
+    expect(text).toContain('Last N: 2');
   });
 
   it('renders each returned dataframe value without changing table selection', () => {

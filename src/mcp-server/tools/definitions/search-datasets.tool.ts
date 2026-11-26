@@ -1,5 +1,5 @@
 /**
- * @fileoverview oecd_search_datasets — search OECD dataflows by keyword or theme.
+ * @fileoverview oecd_search_datasets — search OECD dataflows by keyword or theme, or list the catalog or an agency's dataflows.
  * @module mcp-server/tools/definitions/search-datasets.tool
  */
 
@@ -41,7 +41,7 @@ function truncateDescription(text: string): string {
 
 interface SearchMatch {
   df: OecdDataflow;
-  matchedIn: 'name' | 'description' | 'both';
+  matchedIn?: 'name' | 'description' | 'both';
 }
 
 /**
@@ -68,7 +68,7 @@ function locateTokens(
 
 export const oecdSearchDatasets = tool('oecd_search_datasets', {
   description:
-    'Search OECD dataflows by keyword or theme, matching each query token at the start of a word in dataflow names and descriptions, with name matches ranked first. Returns flow_ref identifiers, names, and agency IDs for use with oecd_get_dataset_info.',
+    'Search OECD dataflows by keyword or theme, or omit query to list every dataflow in catalog order (optionally scoped to one agency_id). When query is supplied, each whitespace-separated token must match at the start of a word in dataflow names or descriptions, with name matches ranked first. Returns flow_ref identifiers, names, and agency IDs for use with oecd_get_dataset_info.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -77,15 +77,15 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
   input: z.object({
     query: z
       .string()
+      .optional()
       .describe(
-        'Keyword or phrase to search for in dataflow names and descriptions — e.g. "GDP", "house prices", "TiVA". Every whitespace-separated token must start a word in the name or description, ignoring case: "price" matches "Prices" and "tiva" matches "(TiVA)", but "tiva" does not match "activation". A word starts after any character that is not a letter or digit, or at a lowercase-to-uppercase step ("markers" matches "RioMarkers"). A token that opens on such a character, like "&" or "-oecd", matches anywhere it occurs: "&" finds "R&D".',
+        'Optional keyword or phrase to search for in dataflow names and descriptions — e.g. "GDP", "house prices", "TiVA". Omit or leave blank to list every dataflow in catalog order (all agencies, or only agency_id when set). Every whitespace-separated token must start a word in the name or description, ignoring case: "price" matches "Prices" and "tiva" matches "(TiVA)", but "tiva" does not match "activation". A word starts after any character that is not a letter or digit, or at a lowercase-to-uppercase step ("markers" matches "RioMarkers"). A token that opens on such a character, like "&" or "-oecd", matches anywhere it occurs: "&" finds "R&D".',
       ),
     agency_id: z
       .string()
       .optional()
       .describe(
-        'Optional agency identifier to restrict the search scope — e.g. "OECD.SDD.NAD". ' +
-          'Obtain valid agency IDs from oecd_list_agencies.',
+        'Optional agency identifier to restrict the search or listing scope — e.g. "OECD.SDD.NAD". Omit query with agency_id to list every dataflow published by that agency. Obtain valid agency IDs from oecd_list_agencies.',
       ),
     limit: countLimitSchema(LIMIT, 'Maximum number of results to return.'),
     offset: z
@@ -94,7 +94,7 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       .min(0)
       .default(0)
       .describe(
-        'Zero-based index of the first match to return within the ranked match list, applied before limit. Page through results past the limit by advancing it; an offset at or past total_matches returns an empty list.',
+        'Zero-based index of the first dataflow to return within the ranked match list (or catalog order when query is omitted or blank), applied before limit. Page through results past the limit by advancing it; an offset at or past total_matches returns an empty list.',
       ),
   }),
   output: z.object({
@@ -121,24 +121,29 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
               ),
             matched_in: z
               .enum(['name', 'description', 'both'])
+              .optional()
               .describe(
-                'Which field carried every query token at a word start — "name" or "description" when only that one did, "both" when each did on its own or the tokens were split across the two.',
+                'Which field carried every query token at a word start — "name" or "description" when only that one did, "both" when each did on its own or the tokens were split across the two. Absent when query was omitted or blank.',
               ),
           })
-          .describe('A matching OECD dataflow entry.'),
+          .describe('A matching or listed OECD dataflow entry.'),
       )
       .describe(
-        'Matching dataflows for the requested page, up to the requested limit, ranked in three tiers: the name carries every token; the tokens are split across name and description; the description alone carries every token. Catalog order holds within each tier.',
+        'Dataflows for the requested page, up to the requested limit. When query has search tokens, ranked in three tiers: the name carries every token; the tokens are split across name and description; the description alone carries every token (catalog order within each tier). When query is omitted or blank, returned in catalog order.',
       ),
     result_count: z
       .number()
       .describe('Number of results returned (may be less than total_matches).'),
     total_matches: z
       .number()
-      .describe('Total dataflows matching the query before applying offset and limit.'),
+      .describe(
+        'Total dataflows matching the query — or total dataflows in the catalog or agency when query is omitted or blank — before applying offset and limit.',
+      ),
     offset: z
       .number()
-      .describe('Zero-based index of the first returned result within the ranked match list.'),
+      .describe(
+        'Zero-based index of the first returned result within the ranked match list (or catalog order when query is omitted or blank).',
+      ),
     source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
   }),
   enrichment: {
@@ -152,16 +157,16 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       .number()
       .optional()
       .describe(
-        'Total dataflows matching the query, disclosed when matches remain beyond the returned page.',
+        'Total dataflows available for the search or listing, disclosed when results remain beyond the returned page.',
       ),
   },
   errors: [
     {
       reason: 'no_match',
       code: JsonRpcErrorCode.NotFound,
-      when: 'No dataflows matched the search query.',
+      when: 'No dataflows matched the search query, or the catalog or requested agency published no dataflows.',
       recovery:
-        'Search whole words or the start of a word — a term matches where it starts a word in a name or description, so a fragment from the middle of a word matches nothing — or use oecd_list_agencies to discover agency IDs, then search within a specific agency.',
+        'Search whole words or the start of a word — a term matches where it starts a word in a name or description, so a fragment from the middle of a word matches nothing — omit query to list all dataflows in an agency, or use oecd_list_agencies to discover agencies with published dataflows.',
     },
     {
       reason: 'agency_not_found',
@@ -253,36 +258,44 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
       throw err;
     }
 
-    const tokens = input.query
+    const tokens = (input.query ?? '')
       .toLowerCase()
       .split(/\s+/)
       .filter((t) => t.length > 0);
 
-    /**
-     * Ranked in three tiers, each in catalog order: the name carries every token;
-     * the tokens are split so neither field carries them all; the description
-     * alone carries every token. 'both' therefore names two shapes — each field
-     * carrying every token on its own (first tier) and the split (second tier).
-     */
-    const byName: SearchMatch[] = [];
-    const split: SearchMatch[] = [];
-    const byDescription: SearchMatch[] = [];
-    for (const df of dataflows) {
-      const found = locateTokens(df, tokens);
-      if (!found) continue;
-      if (found.inName) byName.push({ df, matchedIn: found.inDescription ? 'both' : 'name' });
-      else if (found.inDescription) byDescription.push({ df, matchedIn: 'description' });
-      else split.push({ df, matchedIn: 'both' });
+    let matches: SearchMatch[];
+    if (tokens.length === 0) {
+      matches = dataflows.map((df) => ({ df }));
+    } else {
+      /**
+       * Ranked in three tiers, each in catalog order: the name carries every token;
+       * the tokens are split so neither field carries them all; the description
+       * alone carries every token. 'both' therefore names two shapes — each field
+       * carrying every token on its own (first tier) and the split (second tier).
+       */
+      const byName: SearchMatch[] = [];
+      const split: SearchMatch[] = [];
+      const byDescription: SearchMatch[] = [];
+      for (const df of dataflows) {
+        const found = locateTokens(df, tokens);
+        if (!found) continue;
+        if (found.inName) byName.push({ df, matchedIn: found.inDescription ? 'both' : 'name' });
+        else if (found.inDescription) byDescription.push({ df, matchedIn: 'description' });
+        else split.push({ df, matchedIn: 'both' });
+      }
+      matches = [...byName, ...split, ...byDescription];
     }
-    const matches = [...byName, ...split, ...byDescription];
 
     // Keyed to the raw match count, before offset — an offset past the end is an
     // empty page, not an absent dataset.
     if (matches.length === 0) {
-      throw ctx.fail(
-        'no_match',
-        `No dataflows matched "${input.query}"${input.agency_id ? ` in agency ${input.agency_id}` : ''}`,
-      );
+      const message =
+        tokens.length === 0
+          ? input.agency_id
+            ? `No dataflows found in agency ${input.agency_id}`
+            : 'No dataflows found in the OECD catalog'
+          : `No dataflows matched "${input.query}"${input.agency_id ? ` in agency ${input.agency_id}` : ''}`;
+      throw ctx.fail('no_match', message);
     }
 
     const limit = applyCountLimit(input.limit, LIMIT, ctx);
@@ -306,7 +319,7 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
         agency_id: df.agencyId,
         name: df.name,
         ...(df.description ? { description: truncateDescription(df.description) } : {}),
-        matched_in: matchedIn,
+        ...(matchedIn ? { matched_in: matchedIn } : {}),
       })),
       result_count: page.length,
       total_matches: matches.length,
@@ -321,8 +334,9 @@ export const oecdSearchDatasets = tool('oecd_search_datasets', {
         `starting at offset ${result.offset}`,
       '',
       ...result.dataflows.map((df) => {
+        const matchSuffix = df.matched_in ? ` (matched_in: ${df.matched_in})` : '';
         const entry = [
-          `- **${escapeMarkdownInline(df.flow_ref)}** (matched_in: ${df.matched_in})`,
+          `- **${escapeMarkdownInline(df.flow_ref)}**${matchSuffix}`,
           `  ${escapeMarkdownInline(df.name)}`,
           `  Agency: ${escapeMarkdownInline(df.agency_id)}`,
         ];

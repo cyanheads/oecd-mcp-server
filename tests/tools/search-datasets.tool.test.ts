@@ -926,3 +926,275 @@ describe('oecdSearchDatasets upstream failure wiring', () => {
     });
   });
 });
+
+// ── Catalog and agency listing with optional query (#58) ──────────────────────
+
+describe('oecdSearchDatasets catalog and agency listing (optional query)', () => {
+  const http = createFetchMock();
+
+  beforeEach(() => {
+    http.reset();
+    http.install();
+    process.env.OECD_BASE_URL = FAKE_BASE;
+    process.env.OECD_TIMEOUT_MS = '5000';
+    initStructureService();
+  });
+
+  afterEach(() => {
+    http.restore();
+  });
+
+  it('advertises query as optional in the input schema and matched_in as optional in output', () => {
+    const inputSchema = z.toJSONSchema(oecdSearchDatasets.input, { io: 'input' }) as {
+      required?: string[];
+    };
+    const outputSchema = z.toJSONSchema(oecdSearchDatasets.output) as {
+      properties?: {
+        dataflows?: { items?: { required?: string[] } };
+      };
+    };
+
+    expect(inputSchema.required ?? []).not.toContain('query');
+    expect(outputSchema.properties?.dataflows?.items?.required ?? []).not.toContain('matched_in');
+  });
+
+  it('lists all dataflows for an agency_id when query is omitted, in catalog order without matched_in', async () => {
+    const agencyCatalog = {
+      data: {
+        dataflows: [
+          catalogFlow(
+            'OECD.ELS.HD',
+            'DSD_SHA@DF_SHA',
+            'Health expenditure and financing',
+            '<p>Annual health spending indicators.</p>',
+          ),
+          catalogFlow('OECD.ELS.HD', 'DSD_HEALTH_STAT@DF_HOSP', 'Hospital aggregates'),
+        ],
+      },
+    };
+    http.route({
+      match: `${FAKE_BASE}/dataflow/OECD.ELS.HD`,
+      respond: () => Response.json(agencyCatalog),
+    });
+
+    const result = await runToolContract(oecdSearchDatasets, { agency_id: 'OECD.ELS.HD' });
+
+    expect(result.isError).toBeFalsy();
+    expect(http.calls.map((c) => c.request.url)).toEqual([`${FAKE_BASE}/dataflow/OECD.ELS.HD`]);
+    const structured = result.structuredContent as {
+      dataflows: Array<Record<string, unknown>>;
+      result_count: number;
+      total_matches: number;
+      offset: number;
+      source: string;
+    };
+    expect(structured).toMatchObject({
+      result_count: 2,
+      total_matches: 2,
+      offset: 0,
+      source: 'OECD',
+    });
+    expect(structured.dataflows.map((d) => d.flow_ref)).toEqual([
+      'OECD.ELS.HD,DSD_SHA@DF_SHA',
+      'OECD.ELS.HD,DSD_HEALTH_STAT@DF_HOSP',
+    ]);
+    for (const df of structured.dataflows) {
+      expect(df).not.toHaveProperty('matched_in');
+    }
+    expect(structured.dataflows[0]?.description).toBe('Annual health spending indicators.');
+    expect(structured.dataflows[1]).not.toHaveProperty('description');
+
+    const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    expect(text).toContain('- **OECD.ELS.HD,DSD_SHA@DF_SHA**\n');
+    expect(text).toContain('- **OECD.ELS.HD,DSD_HEALTH_STAT@DF_HOSP**\n');
+    expect(text).toContain('Health expenditure and financing');
+    expect(text).toContain('Annual health spending indicators.');
+    expect(text).not.toContain('matched_in');
+  });
+
+  it('lists the full catalog in catalog order when called with {}', async () => {
+    http.route({
+      match: `${FAKE_BASE}/dataflow`,
+      respond: () => Response.json(DATAFLOWS_RESPONSE),
+    });
+
+    const result = await runToolContract(oecdSearchDatasets, {});
+
+    expect(result.isError).toBeFalsy();
+    expect(http.calls.map((c) => c.request.url)).toEqual([`${FAKE_BASE}/dataflow`]);
+    const structured = result.structuredContent as {
+      dataflows: Array<Record<string, unknown>>;
+      result_count: number;
+      total_matches: number;
+      offset: number;
+    };
+    expect(structured).toMatchObject({ result_count: 3, total_matches: 3, offset: 0 });
+    expect(structured.dataflows.map((d) => d.flow_ref)).toEqual([
+      'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+      'OECD.EDU.IMEP,DSD_SPI@DF_SPI',
+      'OECD.SDD,DSD_HEALTH@DF_HEALTH',
+    ]);
+    for (const df of structured.dataflows) {
+      expect(df).not.toHaveProperty('matched_in');
+    }
+    const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    expect(text).not.toContain('matched_in');
+  });
+
+  it.each(['', '   \t\n  '])(
+    'treats blank query %j the same as omitted query, omitting matched_in on both surfaces',
+    async (blankQuery) => {
+      http.route({
+        match: `${FAKE_BASE}/dataflow`,
+        respond: () => Response.json(DATAFLOWS_RESPONSE),
+      });
+
+      const result = await runToolContract(oecdSearchDatasets, { query: blankQuery });
+
+      expect(result.isError).toBeFalsy();
+      const structured = result.structuredContent as {
+        dataflows: Array<Record<string, unknown>>;
+        result_count: number;
+        total_matches: number;
+      };
+      expect(structured).toMatchObject({ result_count: 3, total_matches: 3 });
+      expect(structured.dataflows.map((d) => d.flow_ref)).toEqual([
+        'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+        'OECD.EDU.IMEP,DSD_SPI@DF_SPI',
+        'OECD.SDD,DSD_HEALTH@DF_HEALTH',
+      ]);
+      for (const df of structured.dataflows) {
+        expect(df).not.toHaveProperty('matched_in');
+      }
+      const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+      expect(text).not.toContain('matched_in');
+    },
+  );
+
+  it('pages catalog listings with limit, offset, totalCount disclosure, and empty past-end pages', async () => {
+    http.route({
+      match: `${FAKE_BASE}/dataflow`,
+      respond: () => Response.json(PAGED_RESPONSE),
+    });
+
+    const first = await runToolContract(oecdSearchDatasets, { limit: 4, offset: 0 });
+    expect(first.isError).toBeFalsy();
+    expect(first.structuredContent).toMatchObject({
+      result_count: 4,
+      total_matches: 10,
+      offset: 0,
+      totalCount: 10,
+    });
+    expect(
+      (first.structuredContent as { dataflows: Array<{ name: string }> }).dataflows.map(
+        (d) => d.name,
+      ),
+    ).toEqual([
+      'Tax revenue series 0',
+      'Tax revenue series 1',
+      'Tax revenue series 2',
+      'Tax revenue series 3',
+    ]);
+
+    const last = await runToolContract(oecdSearchDatasets, { limit: 4, offset: 8 });
+    expect(last.isError).toBeFalsy();
+    expect(last.structuredContent).toMatchObject({
+      result_count: 2,
+      total_matches: 10,
+      offset: 8,
+    });
+    expect(last.structuredContent).not.toHaveProperty('totalCount');
+    expect(
+      (last.structuredContent as { dataflows: Array<{ name: string }> }).dataflows.map(
+        (d) => d.name,
+      ),
+    ).toEqual(['Tax revenue series 8', 'Tax revenue series 9']);
+
+    const pastEnd = await runToolContract(oecdSearchDatasets, { limit: 4, offset: 15 });
+    expect(pastEnd.isError).toBeFalsy();
+    expect(pastEnd.structuredContent).toMatchObject({
+      dataflows: [],
+      result_count: 0,
+      total_matches: 10,
+      offset: 15,
+    });
+    expect(pastEnd.structuredContent).not.toHaveProperty('totalCount');
+  });
+
+  it('throws no_match without "undefined" when an agency publishes zero dataflows and query is omitted', async () => {
+    http.route({
+      match: `${FAKE_BASE}/dataflow/OECD.EMPTY`,
+      respond: () => Response.json({ data: { dataflows: [] } }),
+    });
+
+    const { error, text } = await toolWireFailure(oecdSearchDatasets, {
+      agency_id: 'OECD.EMPTY',
+    });
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: {
+        reason: 'no_match',
+        recovery: { hint: declaredRecovery(oecdSearchDatasets, 'no_match') },
+      },
+    });
+    expect(error.message).toContain('OECD.EMPTY');
+    expect(error.message).not.toContain('undefined');
+    expect(text).not.toContain('undefined');
+  });
+
+  it('throws no_match without "undefined" when the whole catalog is empty and query is omitted or blank', async () => {
+    http.route({
+      match: `${FAKE_BASE}/dataflow`,
+      respond: () => Response.json({ data: { dataflows: [] } }),
+    });
+
+    for (const args of [{}, { query: '   ' }]) {
+      const { error, text } = await toolWireFailure(oecdSearchDatasets, args);
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.NotFound,
+        data: { reason: 'no_match' },
+      });
+      expect(error.message).not.toContain('undefined');
+      expect(text).not.toContain('undefined');
+    }
+  });
+
+  it('still rejects an invalid agency_id before hitting the network when query is omitted', async () => {
+    http.route({
+      match: `${FAKE_BASE}`,
+      respond: () => Response.json(DATAFLOWS_RESPONSE),
+    });
+
+    const error = await toolWireError(oecdSearchDatasets, { agency_id: 'OECD/../secrets' });
+
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'agency_not_found' },
+    });
+    expect(http.calls).toHaveLength(0);
+  });
+
+  it('preserves three-tier ranking and matched_in on both surfaces when a non-blank query runs', async () => {
+    http.route({
+      match: `${FAKE_BASE}/dataflow`,
+      respond: () => Response.json(RANKING_RESPONSE),
+    });
+
+    const result = await runToolContract(oecdSearchDatasets, { query: 'house prices' });
+
+    expect(result.isError).toBeFalsy();
+    const structured = result.structuredContent as {
+      dataflows: Array<{ flow_ref: string; matched_in?: string }>;
+    };
+    expect(structured.dataflows.map((d) => [d.flow_ref, d.matched_in])).toEqual([
+      [HOUSE_PRICES, 'name'],
+      [TABLE1, 'both'],
+      [RPP, 'description'],
+    ]);
+    const text = result.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    expect(text).toContain(`- **${HOUSE_PRICES}** (matched_in: name)`);
+    expect(text).toContain(`- **${TABLE1}** (matched_in: both)`);
+    expect(text).toContain(`- **${RPP}** (matched_in: description)`);
+  });
+});

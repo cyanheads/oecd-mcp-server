@@ -25,6 +25,7 @@ import { oecdDataframeQuery } from '@/mcp-server/tools/definitions/dataframe-que
 import { oecdQueryDataset } from '@/mcp-server/tools/definitions/query-dataset.tool.js';
 import { setCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 import { initDataService } from '@/services/oecd-data/oecd-data-service.js';
+import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
 import { declaredRecovery } from '../helpers/error-contract.js';
 
 /**
@@ -45,6 +46,31 @@ let canvas: DataCanvas;
 let provider: DuckdbProvider;
 let scratch: string;
 let now: number;
+
+const DSD_PAYLOAD = {
+  data: {
+    dataStructures: [
+      {
+        id: 'DSD_NAAG',
+        dataStructureComponents: {
+          dimensionList: {
+            dimensions: ['FREQ', 'REF_AREA', 'MEASURE', 'UNIT_MEASURE'].map((id, position) => ({
+              id,
+              position,
+            })),
+            timeDimensions: [{ id: 'TIME_PERIOD' }],
+          },
+        },
+      },
+    ],
+  },
+};
+
+function dsdResponse(): Response {
+  return new Response(JSON.stringify(DSD_PAYLOAD), {
+    headers: { 'cache-control': 'public,max-age=86400', 'content-type': 'application/json' },
+  });
+}
 
 /** Three observations; only the dimension label changes to force overflow. */
 function respond(large = false): void {
@@ -68,6 +94,7 @@ function respond(large = false): void {
   };
   http.reset();
   http.route(
+    { match: /^https:\/\/fake.oecd.test\/dataflow\//, respond: dsdResponse },
     { match: /^https:\/\/fake.oecd.test\/data\//, respond: () => Response.json(payload) },
     // Matches everything else, so `http.calls` counts every request issued, not only data ones.
     { match: () => true, respond: () => Promise.reject(new Error('unmocked fetch')) },
@@ -91,6 +118,7 @@ function textOf(output: Awaited<ReturnType<typeof runToolContract>>): string {
 beforeEach(async () => {
   process.env.OECD_BASE_URL = 'https://fake.oecd.test';
   initDataService();
+  initStructureService();
   scratch = await mkdtemp(join(tmpdir(), 'oecd-canvas-test-'));
   provider = new DuckdbProvider({
     memoryLimitMb: 128,
@@ -194,7 +222,9 @@ describe('query dataset real canvas lifecycle', () => {
     expect(output.isError).toBeUndefined();
     expect(output.structuredContent).toMatchObject({ row_count: 3 });
     expect(output.structuredContent).not.toHaveProperty('canvas_id');
-    expect(http.calls).toHaveLength(1);
+    expect(
+      http.calls.filter((c) => new URL(c.request.url).pathname.startsWith('/data/')),
+    ).toHaveLength(1);
   });
 
   it('stages a spill on an explicit canvas beside its tables, even with the pool full', async () => {
@@ -215,7 +245,9 @@ describe('query dataset real canvas lifecycle', () => {
     expect((await existing.describe()).map((table) => table.name).sort()).toEqual(
       ['keep', result.table_name].sort(),
     );
-    expect(http.calls).toHaveLength(1);
+    expect(
+      http.calls.filter((c) => new URL(c.request.url).pathname.startsWith('/data/')),
+    ).toHaveLength(1);
   });
 
   /**
@@ -231,25 +263,28 @@ describe('query dataset real canvas lifecycle', () => {
     'applies the exact preview boundary to a label of %i characters',
     async (labelChars, spills) => {
       http.reset();
-      http.route({
-        match: /^https:\/\/fake.oecd.test\/data\//,
-        respond: () =>
-          Response.json({
-            data: {
-              dataSets: [{ observations: { '0:0': [7] } }],
-              structures: [
-                {
-                  dimensions: {
-                    observation: [
-                      { id: 'REF_AREA', values: [{ id: 'USA', name: 'x'.repeat(labelChars) }] },
-                      { id: 'TIME_PERIOD', values: [{ id: '2020' }] },
-                    ],
+      http.route(
+        { match: /^https:\/\/fake.oecd.test\/dataflow\//, respond: dsdResponse },
+        {
+          match: /^https:\/\/fake.oecd.test\/data\//,
+          respond: () =>
+            Response.json({
+              data: {
+                dataSets: [{ observations: { '0:0': [7] } }],
+                structures: [
+                  {
+                    dimensions: {
+                      observation: [
+                        { id: 'REF_AREA', values: [{ id: 'USA', name: 'x'.repeat(labelChars) }] },
+                        { id: 'TIME_PERIOD', values: [{ id: '2020' }] },
+                      ],
+                    },
                   },
-                },
-              ],
-            },
-          }),
-      });
+                ],
+              },
+            }),
+        },
+      );
       const output = await runToolContract(oecdQueryDataset, input);
       expect(output.isError).toBeUndefined();
       expect(output.structuredContent).toMatchObject({
@@ -353,5 +388,81 @@ describe('query dataset real canvas lifecycle', () => {
     vi.spyOn(canvas, 'drop').mockRejectedValue(new Error('Deliberate cleanup failure'));
     respond(true);
     await expect(oecdQueryDataset.handler(input, ctx)).rejects.toBe(failure);
+  });
+
+  it('spills a >25-row overflow to a 25-row preview head on both surfaces while staging every row in DuckDB', async () => {
+    const totalRows = 60;
+    const observations: Record<string, Array<number>> = {};
+    const areas = Array.from({ length: totalRows }, (_, i) => ({
+      id: `C${String(i).padStart(3, '0')}`,
+      name: `Country ${String(i).padStart(3, '0')} ${'a'.repeat(2_000)}`,
+    }));
+    for (let i = 0; i < totalRows; i++) {
+      observations[`${i}:0`] = [i + 1];
+    }
+    const payload = {
+      data: {
+        dataSets: [{ observations }],
+        structures: [
+          {
+            dimensions: {
+              observation: [
+                { id: 'REF_AREA', values: areas },
+                { id: 'TIME_PERIOD', values: [{ id: '2024' }] },
+              ],
+            },
+          },
+        ],
+      },
+    };
+    http.reset();
+    http.route(
+      { match: /^https:\/\/fake.oecd.test\/data\//, respond: () => Response.json(payload) },
+      { match: () => true, respond: () => Promise.reject(new Error('unmocked fetch')) },
+    );
+
+    const output = await runToolContract(oecdQueryDataset, {
+      flow_ref: input.flow_ref,
+      key: 'all',
+    });
+    expect(output.isError).toBeUndefined();
+    const result = output.structuredContent as {
+      canvas_id: string;
+      row_count: number;
+      rows: Record<string, unknown>[];
+      table_name: string;
+      truncated: boolean;
+    };
+    expect(result.truncated).toBe(true);
+    expect(result.row_count).toBe(totalRows);
+    expect(result.rows).toHaveLength(25);
+    expect(result.rows[0]?.value).toBe(1);
+    expect(result.rows[24]?.value).toBe(25);
+
+    const text = textOf(output);
+    expect(text).toContain(`Truncated — showing the first 25 of ${totalRows} rows`);
+    const rawText = output.content
+      .map((block) => (block.type === 'text' ? block.text : ''))
+      .join('\n');
+    const dataTableLines = rawText
+      .split('\n')
+      .filter(
+        (line) =>
+          line.startsWith('| ') &&
+          !line.startsWith('| ---') &&
+          !line.startsWith('| component |') &&
+          !line.startsWith('| TIME_PERIOD |'),
+      );
+    // Header + 25 preview rows
+    expect(dataTableLines).toHaveLength(26);
+
+    const counted = await runToolContract(oecdDataframeQuery, {
+      canvas_id: result.canvas_id,
+      sql: `SELECT CAST(COUNT(*) AS INTEGER) AS n, MAX(value) AS max_val FROM "${result.table_name}"`,
+    });
+    expect(counted.structuredContent).toMatchObject({
+      rows: [{ n: totalRows, max_val: totalRows }],
+      row_count: 1,
+    });
   });
 });

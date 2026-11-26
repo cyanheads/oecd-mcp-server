@@ -312,6 +312,7 @@ export class OecdDataService {
    * @param key - dot-delimited dimension key, e.g. `A.USA.B1GQ..`
    * @param startPeriod - ISO date string or period code, e.g. `2010`
    * @param endPeriod - ISO date string or period code, e.g. `2023`
+   * @param lastNObservations - most recent N observations per series (`lastNObservations`), applied by OECD before `startPeriod` / `endPeriod`
    */
   async fetchData(
     budget: UpstreamBudget,
@@ -319,6 +320,7 @@ export class OecdDataService {
     key: string,
     startPeriod?: string,
     endPeriod?: string,
+    lastNObservations?: number,
   ): Promise<OecdDataResult> {
     const parts = parseFlowRef(flowRef);
     if (!parts) {
@@ -339,6 +341,7 @@ export class OecdDataService {
     let path = `/data/${parts.agencyId},${encodedFlowId}/${pathKey}?dimensionAtObservation=AllDimensions`;
     if (startPeriod) path += `&startPeriod=${encodeURIComponent(startPeriod)}`;
     if (endPeriod) path += `&endPeriod=${encodeURIComponent(endPeriod)}`;
+    if (lastNObservations !== undefined) path += `&lastNObservations=${lastNObservations}`;
 
     const primary = `${this.baseUrl}${path}`;
     try {

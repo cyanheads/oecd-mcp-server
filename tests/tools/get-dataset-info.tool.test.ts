@@ -10,6 +10,7 @@ import {
   createMockContext,
   runToolContract,
 } from '@cyanheads/mcp-ts-core/testing';
+import MarkdownIt from 'markdown-it';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getServerConfig } from '@/config/server-config.js';
 import { oecdGetDatasetInfo } from '@/mcp-server/tools/definitions/get-dataset-info.tool.js';
@@ -244,6 +245,238 @@ describe('oecdGetDatasetInfo', () => {
     expect(text).toContain('REF_AREA');
     expect(text).toContain('TIME_PERIOD');
     expect(text).toContain('Source: OECD');
+  });
+
+  it('returns name, full description with links, and resources on both surfaces with zero extra requests', async () => {
+    const http = createFetchMock();
+    http.install();
+    try {
+      const flowRef = 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I';
+      const refUrl = `${FAKE_BASE}/dataflow/OECD.SDD.NAD/DSD_NAAG@DF_NAAG_I?references=datastructure`;
+      http.route({
+        match: refUrl,
+        respond: () =>
+          Response.json({
+            data: {
+              dataflows: [
+                {
+                  agencyID: 'OECD.SDD.NAD',
+                  id: 'DSD_NAAG@DF_NAAG_I',
+                  name: 'National Accounts *at a Glance*',
+                  description:
+                    '<p>Quarterly GDP growth (*real* &amp; _adjusted_ &lt;5%). See ' +
+                    '<a href="https://webfs-sdd.oecd.org/files/QNA Guide (2026).pdf">QNA [User] Guide</a> ' +
+                    'or <a href="mailto: STAT.Contact@oecd.org">STAT.Contact@oecd.org</a>.</p>',
+                  annotations: [
+                    {
+                      type: 'EXT_RESOURCE',
+                      text: 'Bulk *ZIP*|https://webfs-sti.oecd.org/EXGR.zip',
+                    },
+                    {
+                      type: 'EXT_RESOURCE',
+                      text: 'Excel File|https://webfs-ctp.oecd.org/itid.xlsx|https://upload.wikimedia.org/icon.svg',
+                    },
+                  ],
+                },
+              ],
+              dataStructures: DSD_RESPONSE.data.dataStructures,
+            },
+          }),
+      });
+      initStructureService();
+
+      const result = await runToolContract(oecdGetDatasetInfo, { flow_ref: flowRef });
+
+      expect(result.isError).toBeFalsy();
+      expect(http.calls.map((c) => c.request.url)).toEqual([refUrl]);
+      expect(result.structuredContent).toMatchObject({
+        flow_ref: flowRef,
+        name: 'National Accounts *at a Glance*',
+        description:
+          'Quarterly GDP growth (*real* & _adjusted_ <5%). See ' +
+          '[QNA \\[User\\] Guide](https://webfs-sdd.oecd.org/files/QNA%20Guide%20%282026%29.pdf) ' +
+          'or [STAT.Contact@oecd.org](mailto:STAT.Contact@oecd.org).',
+        resources: [
+          { label: 'Bulk *ZIP*', url: 'https://webfs-sti.oecd.org/EXGR.zip' },
+          { label: 'Excel File', url: 'https://webfs-ctp.oecd.org/itid.xlsx' },
+        ],
+      });
+
+      const md = new MarkdownIt({ html: true });
+      const text = (result.content[0] as { text: string }).text;
+      const tokens = md.parse(text, {});
+      const inlineChildren = tokens.flatMap((t) => t.children ?? []);
+      const links = inlineChildren
+        .map((t, i) =>
+          t.type === 'link_open'
+            ? { href: t.attrGet('href'), label: inlineChildren[i + 1]?.content }
+            : null,
+        )
+        .filter((x) => x !== null);
+
+      expect(links).toEqual([
+        {
+          href: 'https://webfs-sdd.oecd.org/files/QNA%20Guide%20%282026%29.pdf',
+          label: 'QNA [User] Guide',
+        },
+        {
+          href: 'mailto:STAT.Contact@oecd.org',
+          label: 'STAT.Contact@oecd.org',
+        },
+        {
+          href: 'https://webfs-sti.oecd.org/EXGR.zip',
+          label: 'Bulk *ZIP*',
+        },
+        {
+          href: 'https://webfs-ctp.oecd.org/itid.xlsx',
+          label: 'Excel File',
+        },
+      ]);
+      // Plain text punctuation in name, description, and resource labels must not turn into emphasis or raw HTML.
+      expect(inlineChildren.some((t) => t.type === 'em_open')).toBe(false);
+      expect(inlineChildren.some((t) => t.type === 'html_inline')).toBe(false);
+      const renderedText = inlineChildren
+        .map((t) => (t.type === 'text' || t.type === 'code_inline' ? t.content : ''))
+        .join('');
+      expect(renderedText).toContain('National Accounts *at a Glance*');
+      expect(renderedText).toContain('Quarterly GDP growth (*real* & _adjusted_ <5%).');
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('omits name, description, and resources when the upstream payload carries none', async () => {
+    const result = await runToolContract(oecdGetDatasetInfo, {
+      flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).not.toHaveProperty('name');
+    expect(result.structuredContent).not.toHaveProperty('description');
+    expect(result.structuredContent).not.toHaveProperty('resources');
+  });
+
+  it('prevents accidental images and unsafe links when formatting descriptions with Markdown syntax', () => {
+    const blocks = oecdGetDatasetInfo.format!({
+      flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+      description:
+        'Alert![Guide](https://oecd.org/g) and [bad](javascript:alert(1)) and [outer [inner](https://oecd.org/i)',
+      dimensions: [{ id: 'FREQ', name: 'Frequency', position: 1 }],
+      key_example: '.',
+      source: 'OECD',
+    });
+    const md = new MarkdownIt({ html: true });
+    const text = (blocks[0] as { text: string }).text;
+    const tokens = md.parse(text, {}).flatMap((t) => t.children ?? []);
+
+    expect(tokens.some((t) => t.type === 'image')).toBe(false);
+    const hrefs = tokens.filter((t) => t.type === 'link_open').map((t) => t.attrGet('href'));
+    expect(hrefs).toEqual(['https://oecd.org/g', 'https://oecd.org/i']);
+  });
+
+  it('round-trips escaped backslashes and brackets in description link labels through CommonMark', () => {
+    const blocks = oecdGetDatasetInfo.format!({
+      flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+      description:
+        'See [foo\\\\](https://oecd.org/bs) and [foo\\\\\\[bar\\]](https://oecd.org/bs2).',
+      dimensions: [{ id: 'FREQ', name: 'Frequency', position: 1 }],
+      key_example: '.',
+      source: 'OECD',
+    });
+    const md = new MarkdownIt({ html: true });
+    const text = (blocks[0] as { text: string }).text;
+    const inlineChildren = md.parse(text, {}).flatMap((t) => t.children ?? []);
+    const links: Array<{ href: string | number | null; label: string }> = [];
+    for (let idx = 0; idx < inlineChildren.length; idx++) {
+      if (inlineChildren[idx]?.type === 'link_open') {
+        const href = inlineChildren[idx]!.attrGet('href');
+        const labelParts: string[] = [];
+        for (let j = idx + 1; j < inlineChildren.length; j++) {
+          if (inlineChildren[j]?.type === 'link_close') break;
+          if (inlineChildren[j]?.type === 'text') labelParts.push(inlineChildren[j]!.content);
+        }
+        links.push({ href, label: labelParts.join('') });
+      }
+    }
+
+    expect(links).toEqual([
+      { href: 'https://oecd.org/bs', label: 'foo\\' },
+      { href: 'https://oecd.org/bs2', label: 'foo\\[bar]' },
+    ]);
+  });
+
+  describe('description formatter linear-time scaling', () => {
+    const BASE_CHARS = 5_000;
+    const SIZES = [10_000, 20_000, 40_000, 80_000, 160_000, 320_000];
+    const TRIALS = 5;
+    const CHARS_PER_MEASUREMENT = 640_000;
+    const CPU_CEILING_US = 200_000;
+
+    function formatDesc(description: string): string {
+      const blocks = oecdGetDatasetInfo.format!({
+        flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+        description,
+        dimensions: [{ id: 'FREQ', name: 'Frequency', position: 1 }],
+        key_example: '.',
+        source: 'OECD',
+      });
+      return (blocks[0] as { text: string }).text;
+    }
+
+    function cpuPerCallUs(description: string, expectedFragment: string): number {
+      const calls = Math.max(1, Math.round(CHARS_PER_MEASUREMENT / description.length));
+      let last = '';
+      const start = process.threadCpuUsage();
+      for (let i = 0; i < calls; i++) last = formatDesc(description);
+      const { user, system } = process.threadCpuUsage(start);
+      expect(last).toContain(expectedFragment);
+      return (user + system) / calls;
+    }
+
+    function expectLinear(build: (n: number) => { input: string; expectedFragment: string }): void {
+      const base = build(BASE_CHARS);
+      for (const size of SIZES) {
+        const sample = build(size);
+        let leastGrowth = Number.POSITIVE_INFINITY;
+        let leastCpu = Number.POSITIVE_INFINITY;
+        for (let trial = 0; trial < TRIALS; trial++) {
+          const baseline = cpuPerCallUs(base.input, base.expectedFragment);
+          const cpu = cpuPerCallUs(sample.input, sample.expectedFragment);
+          leastGrowth = Math.min(leastGrowth, cpu / baseline);
+          leastCpu = Math.min(leastCpu, cpu);
+        }
+        expect(leastGrowth, `growth at ${size} characters`).toBeLessThan(4 * (size / BASE_CHARS));
+        expect(leastCpu, `CPU per call at ${size} characters`).toBeLessThan(CPU_CEILING_US);
+      }
+    }
+
+    it.each<[string, (n: number) => { input: string; expectedFragment: string }]>([
+      [
+        'nested unclosed [ openers',
+        (n) => ({
+          input: `${'[a'.repeat(Math.floor(n / 2))}[ok](https://oecd.org)`,
+          expectedFragment: '[ok](https://oecd.org)',
+        }),
+      ],
+      [
+        'repeated unclosed [label]( openers',
+        (n) => {
+          const unit = '[x](https://oecd.org/';
+          return {
+            input: `${unit.repeat(Math.floor(n / unit.length))}tail`,
+            expectedFragment: 'tail',
+          };
+        },
+      ],
+      [
+        'one long line ending in a break',
+        (n) => ({ input: `${'a b '.repeat(Math.floor(n / 4))}\nz`, expectedFragment: '\\\nz' }),
+      ],
+      [
+        'breaks throughout',
+        (n) => ({ input: `${'  \r\n'.repeat(Math.floor(n / 4))}ok`, expectedFragment: 'ok' }),
+      ],
+    ])('scales linearly on %s', (_shape, build) => expectLinear(build), 0);
   });
 });
 

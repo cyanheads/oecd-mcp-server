@@ -59,6 +59,14 @@ export interface OecdTimeDimension {
   position: number;
 }
 
+/** An external resource linked from a dataflow's `EXT_RESOURCE` annotation. */
+export interface OecdExternalResource {
+  /** Human-readable resource label. */
+  label: string;
+  /** Target URL (`http:` or `https:` only). */
+  url: string;
+}
+
 /** Datastructure metadata for a dataflow, at the revision the dataflow references. */
 export interface OecdDataStructure {
   agencyId: string;
@@ -71,9 +79,21 @@ export interface OecdDataStructure {
    * but answers its data and availability reads with a 500.
    */
   dataRoot: string;
+  /**
+   * Full dataflow abstract as plain text with valid `<a>` links preserved as
+   * Markdown `[label](url)`. Absent when OECD publishes no description.
+   */
+  description?: string | undefined;
   dimensions: OecdDimension[];
   dsdId: string;
   flowRef: string;
+  /** Human-readable dataflow name. Absent when the upstream response carries no dataflow entry. */
+  name?: string | undefined;
+  /**
+   * Linked external resources from the dataflow's `EXT_RESOURCE` annotations
+   * (`http:` / `https:` URLs only). Absent when the dataflow carries none.
+   */
+  resources?: OecdExternalResource[] | undefined;
   /**
    * OECD service root that served this datastructure — the configured base URL
    * for nearly every dataflow, and the root named in the catalog entry's
@@ -92,4 +112,6 @@ export interface OecdCode {
   id: string;
   /** Human-readable name. */
   name: string;
+  /** Parent code identifier in hierarchical codelists — e.g. `FRA` for French TL2 regions. */
+  parent?: string | undefined;
 }

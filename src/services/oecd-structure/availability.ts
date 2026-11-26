@@ -44,6 +44,42 @@ export function availabilityKey(key: string | undefined): string {
   return key === undefined || key === '' || NORMALIZED_AWAY_KEY.test(key) ? 'all' : key;
 }
 
+/** Result of checking and normalizing a caller's dimension key against a dataflow's dimension count. */
+export type DimensionKeyResult =
+  | { readonly key: string; readonly ok: true }
+  | {
+      readonly dimensionCount: number;
+      readonly ok: false;
+      readonly reason: 'too_long' | 'too_short';
+      readonly segmentCount: number;
+    };
+
+/**
+ * Validate and normalize a dimension key against a dataflow's dimension count.
+ *
+ * Every-series keys (`""`, `all`, `.`, `..`, `%2E`, `%2e%2E`) pass through
+ * unchanged. A key with fewer dot-separated segments than `dimensionCount`
+ * fails as `too_short`; one with extra trailing empty segments is trimmed to
+ * `dimensionCount`; one with any non-empty segment past `dimensionCount` fails
+ * as `too_long`.
+ */
+export function normalizeDimensionKey(key: string, dimensionCount: number): DimensionKeyResult {
+  if (availabilityKey(key) === 'all') return { ok: true, key };
+  const segments = key.split('.');
+  if (segments.length < dimensionCount) {
+    return { ok: false, reason: 'too_short', segmentCount: segments.length, dimensionCount };
+  }
+  if (segments.length > dimensionCount) {
+    for (let i = dimensionCount; i < segments.length; i++) {
+      if (segments[i] !== '') {
+        return { ok: false, reason: 'too_long', segmentCount: segments.length, dimensionCount };
+      }
+    }
+    return { ok: true, key: segments.slice(0, dimensionCount).join('.') };
+  }
+  return { ok: true, key };
+}
+
 /**
  * Read what OECD has data for under `key`: one unretried request, best-effort,
  * through the structure cache, spending what is left of the call's `budget`.
@@ -267,6 +303,23 @@ function periodDays(code: string): { first: string; last: string } | undefined {
     first: `${year}-${pad(firstMonth)}-01`,
     last: `${year}-${pad(lastMonth)}-${lastOfMonth(lastMonth)}`,
   };
+}
+
+/**
+ * Whether a parseable `startPeriod` begins strictly after a parseable
+ * `endPeriod` ends. Returns `false` when either bound is absent, unparseable,
+ * or overlaps the other (including mixed granularities like `2024` and
+ * `2024-Q1`).
+ */
+export function isInvertedPeriodRange(
+  startPeriod: string | undefined,
+  endPeriod: string | undefined,
+): boolean {
+  if (startPeriod === undefined || endPeriod === undefined) return false;
+  const start = periodDays(startPeriod);
+  const end = periodDays(endPeriod);
+  if (!start || !end) return false;
+  return start.first > end.last;
 }
 
 /**

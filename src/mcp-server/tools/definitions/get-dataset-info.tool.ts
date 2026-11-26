@@ -5,7 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
+import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
 import { UpstreamBudget } from '@/services/oecd-http/upstream-budget.js';
 import {
@@ -18,7 +18,7 @@ import { formatTable } from '@/utils/format-table.js';
 
 export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
   description:
-    "Fetch a dataflow's dimensions, their order, and how to construct a query key. " +
+    "Fetch a dataflow's metadata (name, full description, linked resources), dimensions, their order, and how to construct a query key. " +
     'Returns per-dimension names, codelist references, and position in the dot-delimited key. ' +
     'Required before calling oecd_query_dataset to understand key structure.',
   annotations: {
@@ -37,6 +37,18 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
   }),
   output: z.object({
     flow_ref: z.string().describe('The resolved flow reference.'),
+    name: z
+      .string()
+      .optional()
+      .describe(
+        'Human-readable dataflow name. Omitted when the upstream response carries no dataflow entry.',
+      ),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        'Full dataflow abstract with valid HTTP, HTTPS, and mailto links preserved as Markdown [label](url). Omitted when OECD publishes no description.',
+      ),
     dimensions: z
       .array(
         z
@@ -82,6 +94,21 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
       .describe(
         'Example dot-delimited key with wildcards — each dot corresponds to one dimension in position order. ' +
           'Empty segments are wildcards. Replace with actual codes from oecd_get_dimension_values.',
+      ),
+    resources: z
+      .array(
+        z
+          .object({
+            label: z.string().describe('Human-readable resource label.'),
+            url: z.string().describe('Target http or https URL for the linked resource.'),
+          })
+          .describe(
+            'An external resource published on the dataflow (methodology document, boundary file, or bulk download).',
+          ),
+      )
+      .optional()
+      .describe(
+        'External resources from the dataflow EXT_RESOURCE annotations. Omitted when none are present.',
       ),
     source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
   }),
@@ -196,6 +223,8 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
 
     return {
       flow_ref: input.flow_ref,
+      ...(dsd.name !== undefined ? { name: dsd.name } : {}),
+      ...(dsd.description !== undefined ? { description: dsd.description } : {}),
       dimensions: dsd.dimensions.map((d) => ({
         id: d.id,
         name: d.name,
@@ -210,6 +239,7 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
           }
         : undefined,
       key_example: keyExample,
+      ...(dsd.resources !== undefined ? { resources: dsd.resources } : {}),
       source: 'OECD' as const,
     };
   },
@@ -232,14 +262,169 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
 
     const lines = [
       `**Dataflow: ${escapeMarkdownInline(result.flow_ref)}**`,
+      ...(result.name ? [`**Name:** ${escapeMarkdownInline(result.name)}`] : []),
+      ...(result.description ? ['', formatDescriptionMarkdown(result.description)] : []),
       '',
       formatTable(['Pos', 'Dimension ID', 'Name', 'Codelist'], dimRows),
       '',
       `**Key example (all wildcards):** ${escapeMarkdownInline(result.key_example || '.')}`,
       'Replace empty segments with codes from oecd_get_dimension_values.',
+      ...(result.resources?.length
+        ? [
+            '',
+            '**Resources:**',
+            ...result.resources.map((r) => `- ${markdownLink(r.label, r.url)}`),
+          ]
+        : []),
       '',
       `Source: ${result.source}`,
     ];
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });
+
+/** Whether a Markdown link destination uses an allowed scheme (`http:`, `https:`, or `mailto:`). */
+function isAllowedDescriptionUrl(url: string): boolean {
+  if (!url || /[\s<>()]/.test(url)) return false;
+  if (/^mailto:/i.test(url)) return url.length > 7;
+  const protocol = URL.parse(url)?.protocol;
+  return protocol === 'http:' || protocol === 'https:';
+}
+
+/**
+ * Escape a prose run adjacent to a link without turning internal spaces at
+ * link boundaries into `&#32;`, while still escaping line-start and line-end
+ * edges and a trailing `!` before `[label](url)` (which would form an image).
+ */
+function escapeProseChunk(
+  text: string,
+  atStart: boolean,
+  atEnd: boolean,
+  beforeLink: boolean,
+): string {
+  if (!text) return '';
+  let lead = '';
+  let core = text;
+  let trail = '';
+  if (!atStart) {
+    let s = 0;
+    while (s < core.length && core[s] === ' ') s++;
+    lead = core.slice(0, s);
+    core = core.slice(s);
+  }
+  if (!atEnd) {
+    let e = core.length;
+    while (e > 0 && core[e - 1] === ' ') e--;
+    trail = core.slice(e);
+    core = core.slice(0, e);
+  }
+  let escaped = core ? escapeMarkdownInline(core) : '';
+  if (beforeLink && trail === '' && escaped.endsWith('!')) {
+    escaped = `${escaped.slice(0, -1)}\\!`;
+  }
+  return `${lead}${escaped}${trail}`;
+}
+
+/**
+ * Render a dataflow description for `content[]` in linear time: valid
+ * `[label](url)` links (`http:`, `https:`, `mailto:`) stay clickable Markdown
+ * links with escaped labels, while surrounding prose is escaped via
+ * {@link escapeMarkdownInline} so upstream punctuation never corrupts into
+ * unintended emphasis, raw HTML, headings, or unsafe links.
+ */
+function formatDescriptionMarkdown(text: string): string {
+  const tokens: Array<
+    { kind: 'link'; label: string; url: string } | { kind: 'prose'; value: string }
+  > = [];
+  const len = text.length;
+  let proseStart = 0;
+  let i = 0;
+
+  const pushProse = (end: number) => {
+    if (end <= proseStart) return;
+    const slice = text.slice(proseStart, end);
+    const prev = tokens.at(-1);
+    if (prev?.kind === 'prose') prev.value += slice;
+    else tokens.push({ kind: 'prose', value: slice });
+    proseStart = end;
+  };
+
+  while (i < len) {
+    const open = text.indexOf('[', i);
+    if (open < 0) break;
+
+    // Scan label linearly; an unescaped nested `[` invalidates the outer candidate.
+    let j = open + 1;
+    let nestedOpen = -1;
+    let closeBracket = -1;
+    while (j < len) {
+      const ch = text[j];
+      if (ch === '\\' && j + 1 < len) {
+        j += 2;
+        continue;
+      }
+      if (ch === '[') {
+        nestedOpen = j;
+        break;
+      }
+      if (ch === ']') {
+        closeBracket = j;
+        break;
+      }
+      j++;
+    }
+
+    if (nestedOpen >= 0) {
+      i = nestedOpen;
+      continue;
+    }
+    if (closeBracket < 0) break;
+
+    if (text[closeBracket + 1] !== '(') {
+      i = closeBracket + 1;
+      continue;
+    }
+
+    // Scan URL linearly; stop early on whitespace or disallowed chars.
+    let k = closeBracket + 2;
+    let closeParen = -1;
+    while (k < len) {
+      const ch = text[k];
+      if (ch === ')') {
+        closeParen = k;
+        break;
+      }
+      if (ch === '(' || ch === '<' || ch === '>' || /\s/.test(ch ?? '')) break;
+      k++;
+    }
+
+    if (closeParen < 0) {
+      i = closeBracket + 1;
+      continue;
+    }
+
+    const url = text.slice(closeBracket + 2, closeParen);
+    const rawLabel = text.slice(open + 1, closeBracket).replace(/\\([\\[\]])/g, '$1');
+    if (!rawLabel || !isAllowedDescriptionUrl(url)) {
+      i = closeBracket + 1;
+      continue;
+    }
+
+    pushProse(open);
+    tokens.push({ kind: 'link', label: rawLabel, url });
+    proseStart = closeParen + 1;
+    i = closeParen + 1;
+  }
+
+  pushProse(len);
+
+  return tokens
+    .map((tok, idx) => {
+      if (tok.kind === 'link') {
+        return `[${escapeMarkdownInline(tok.label)}](${tok.url})`;
+      }
+      const nextIsLink = tokens[idx + 1]?.kind === 'link';
+      return escapeProseChunk(tok.value, idx === 0, idx === tokens.length - 1, nextIsLink);
+    })
+    .join('');
+}

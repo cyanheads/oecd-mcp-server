@@ -797,6 +797,19 @@ describe('OecdDataService.fetchData — flow reference forms', () => {
     ).rejects.toThrow('Invalid flow_ref');
     expect(http.calls).toHaveLength(0);
   });
+
+  it('appends lastNObservations to the data URL when given and omits it when unset', async () => {
+    const withLastN = `${DATA_URL}&lastNObservations=2`;
+    http.route(
+      { match: withLastN, respond: () => Response.json(DATA_RESPONSE) },
+      { match: DATA_URL, respond: () => Response.json(DATA_RESPONSE) },
+    );
+
+    await service().fetchData(budget(), FLOW_REF, 'A.USA..');
+    await service().fetchData(budget(), FLOW_REF, 'A.USA..', undefined, undefined, 2);
+
+    expect(http.calls.map((c) => c.request.url)).toEqual([DATA_URL, withLastN]);
+  });
 });
 
 // ── Upstream boundary ─────────────────────────────────────────────────────────
@@ -1241,6 +1254,30 @@ describe('OecdDataService.fetchData — delegated service roots', () => {
 
     expect(result.rowCount).toBe(3);
     expect(http.calls.at(-1)?.request.url).toBe(delegatedWithPeriod);
+  });
+
+  it('carries lastNObservations through to the delegated root unchanged', async () => {
+    const delegatedWithLastN = `${DELEGATED_DATA_URL}&lastNObservations=3`;
+    http.route(
+      {
+        match: `${DATA_URL}&lastNObservations=3`,
+        respond: () => new Response('Object reference not set', { status: 500 }),
+      },
+      { match: delegatedWithLastN, respond: () => Response.json(DATA_RESPONSE) },
+    );
+    routeCatalog(`${BASE}/sti-public/rest/dataflow/OECD.SDD.NAD/DSD_NAAG@DF_NAAG_I/1.1`);
+
+    const result = await service().fetchData(
+      budget(),
+      FLOW_REF,
+      'A.USA..',
+      undefined,
+      undefined,
+      3,
+    );
+
+    expect(result.rowCount).toBe(3);
+    expect(http.calls.at(-1)?.request.url).toBe(delegatedWithLastN);
   });
 
   it('surfaces the delegated root’s own rejection rather than the first failure', async () => {

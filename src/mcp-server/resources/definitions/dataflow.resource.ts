@@ -33,6 +33,18 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
   }),
   output: z.object({
     flow_ref: z.string().describe('Canonical flow reference reconstructed from URI params.'),
+    name: z
+      .string()
+      .optional()
+      .describe(
+        'Human-readable dataflow name. Omitted when the upstream response carries no dataflow entry.',
+      ),
+    description: z
+      .string()
+      .optional()
+      .describe(
+        'Full dataflow abstract with valid HTTP, HTTPS, and mailto links preserved as Markdown [label](url). Omitted when OECD publishes no description.',
+      ),
     dimensions: z
       .array(
         z
@@ -68,6 +80,21 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
       .string()
       .describe(
         'Dot-delimited key with all segments empty (wildcards). Replace segments with codes from oecd_get_dimension_values.',
+      ),
+    resources: z
+      .array(
+        z
+          .object({
+            label: z.string().describe('Human-readable resource label.'),
+            url: z.string().describe('Target http or https URL for the linked resource.'),
+          })
+          .describe(
+            'An external resource published on the dataflow (methodology document, boundary file, or bulk download).',
+          ),
+      )
+      .optional()
+      .describe(
+        'External resources from the dataflow EXT_RESOURCE annotations. Omitted when none are present.',
       ),
     source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
   }),
@@ -200,6 +227,8 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
 
     return {
       flow_ref: flowRef,
+      ...(dsd.name !== undefined ? { name: dsd.name } : {}),
+      ...(dsd.description !== undefined ? { description: dsd.description } : {}),
       dimensions: dsd.dimensions.map((d) => ({
         id: d.id,
         name: d.name,
@@ -214,6 +243,7 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
           }
         : undefined,
       key_example: keyExample,
+      ...(dsd.resources !== undefined ? { resources: dsd.resources } : {}),
       source: 'OECD' as const,
     };
   },

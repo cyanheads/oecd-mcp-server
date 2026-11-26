@@ -17,6 +17,8 @@ import {
   availabilityKey,
   describeFindings,
   diagnoseKey,
+  isInvertedPeriodRange,
+  normalizeDimensionKey,
   type OecdAvailability,
   parseAvailability,
   periodOutside,
@@ -290,6 +292,134 @@ describe('availabilityKey', () => {
 
   it('sends any other key as written', () => {
     expect(availabilityKey('Q..usa+CAN...B1GQ......G1.')).toBe('Q..usa+CAN...B1GQ......G1.');
+  });
+});
+
+// ── normalizeDimensionKey ─────────────────────────────────────────────────────
+
+describe('normalizeDimensionKey', () => {
+  it.each(['', 'all', '.', '..', '%2E', '%2e%2E'])(
+    'passes every-series key %j through unchanged',
+    (key) => {
+      expect(normalizeDimensionKey(key, 13)).toEqual({ ok: true, key });
+      expect(normalizeDimensionKey(key, 1)).toEqual({ ok: true, key });
+    },
+  );
+
+  it('passes keys with exact dimension count unchanged', () => {
+    expect(normalizeDimensionKey('Q..USA...B1GQ......G1.', 13)).toEqual({
+      ok: true,
+      key: 'Q..USA...B1GQ......G1.',
+    });
+    expect(normalizeDimensionKey('A.B', 2)).toEqual({ ok: true, key: 'A.B' });
+    expect(normalizeDimensionKey('A', 1)).toEqual({ ok: true, key: 'A' });
+  });
+
+  it('rejects keys with fewer segments than dimensionCount as too_short', () => {
+    expect(normalizeDimensionKey('Q..USA', 13)).toEqual({
+      ok: false,
+      reason: 'too_short',
+      segmentCount: 3,
+      dimensionCount: 13,
+    });
+    expect(normalizeDimensionKey('...', 13)).toEqual({
+      ok: false,
+      reason: 'too_short',
+      segmentCount: 4,
+      dimensionCount: 13,
+    });
+    expect(normalizeDimensionKey('A', 2)).toEqual({
+      ok: false,
+      reason: 'too_short',
+      segmentCount: 1,
+      dimensionCount: 2,
+    });
+  });
+
+  it('trims extra trailing empty segments to dimensionCount', () => {
+    // 14-segment key with one extra empty segment on a 13-dimension flow
+    expect(normalizeDimensionKey('Q..USA...B1GQ......G1..', 13)).toEqual({
+      ok: true,
+      key: 'Q..USA...B1GQ......G1.',
+    });
+    // 15-segment key with two extra empty segments
+    expect(normalizeDimensionKey('Q..USA...B1GQ......G1...', 13)).toEqual({
+      ok: true,
+      key: 'Q..USA...B1GQ......G1.',
+    });
+    // 14-segment key with trailing empty segments after B1GQ
+    expect(normalizeDimensionKey('Q..USA...B1GQ........', 13)).toEqual({
+      ok: true,
+      key: 'Q..USA...B1GQ.......',
+    });
+    expect(normalizeDimensionKey('A..', 1)).toEqual({ ok: true, key: 'A' });
+    expect(normalizeDimensionKey('...', 3)).toEqual({ ok: true, key: '..' });
+  });
+
+  it('rejects keys with any non-empty segment past dimensionCount as too_long', () => {
+    expect(normalizeDimensionKey('Q..USA...B1GQ......G1..2025-Q1', 13)).toEqual({
+      ok: false,
+      reason: 'too_long',
+      segmentCount: 14,
+      dimensionCount: 13,
+    });
+    // Non-empty extra segment followed by another empty trailing segment
+    expect(normalizeDimensionKey('Q..USA...B1GQ......G1..2025-Q1.', 13)).toEqual({
+      ok: false,
+      reason: 'too_long',
+      segmentCount: 15,
+      dimensionCount: 13,
+    });
+    expect(normalizeDimensionKey('A.B.C', 2)).toEqual({
+      ok: false,
+      reason: 'too_long',
+      segmentCount: 3,
+      dimensionCount: 2,
+    });
+  });
+});
+
+// ── isInvertedPeriodRange ─────────────────────────────────────────────────────
+
+describe('isInvertedPeriodRange', () => {
+  it.each([
+    ['2024', '2020'],
+    ['2024-Q2', '2024-Q1'],
+    ['2024-S2', '2024-S1'],
+    ['2024-05', '2024-04'],
+    ['2024-M05', '2024-M04'],
+    ['2024-04-01', '2024-03-31'],
+    ['2024-Q2', '2024-03'],
+    ['2024-03-01', '2024-02'],
+    ['2024-S2', '2024-Q2'],
+    ['2025-Q1', '2024'],
+  ])('returns true when %s starts after %s ends', (start, end) => {
+    expect(isInvertedPeriodRange(start, end)).toBe(true);
+  });
+
+  it.each([
+    ['2020', '2024'],
+    ['2024', '2024'],
+    ['2024', '2024-Q1'],
+    ['2024-Q1', '2024'],
+    ['2024-Q4', '2024'],
+    ['2024', '2024-Q4'],
+    ['2024-02-29', '2024-02'],
+    ['2024-Q1', '2024-03'],
+    ['2024-01-01', '2024-01-01'],
+  ])('returns false when %s and %s are ordered or overlapping', (start, end) => {
+    expect(isInvertedPeriodRange(start, end)).toBe(false);
+  });
+
+  it.each([
+    [undefined, '2020'],
+    ['2024', undefined],
+    [undefined, undefined],
+    ['2024-Q5', '2020'],
+    ['2024', 'FY2020'],
+    ['bad', 'also-bad'],
+  ])('returns false when either bound (%j, %j) is missing or unparseable', (start, end) => {
+    expect(isInvertedPeriodRange(start, end)).toBe(false);
   });
 });
 

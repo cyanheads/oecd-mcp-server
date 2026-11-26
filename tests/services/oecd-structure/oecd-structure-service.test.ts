@@ -14,6 +14,7 @@ import {
   directorateCode,
   fetchExternalServiceRoot,
   getStructureService,
+  htmlToMarkdown,
   initStructureService,
   isDataflowNotFound,
   OecdStructureService,
@@ -273,6 +274,32 @@ describe('OecdStructureService.fetchDataflows', () => {
     expect(flows[1]?.description).toBe('Employment indicators by region.');
     // A dataflow OECD publishes without a description carries none.
     expect(flows[2]).not.toHaveProperty('description');
+  });
+
+  it('strips <head>, <style>, and <script> blocks including their contents from catalog descriptions', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        Response.json({
+          data: {
+            dataflows: [
+              {
+                agencyID: 'OECD.DCD.FSD',
+                id: 'DSD_PARIS@DF_PARIS',
+                name: 'PARIS21 Indicators',
+                description:
+                  '<!DOCTYPE html><html><head><title>PARIS</title><style>body { color: #333; font-family: Arial; }</style></head><body><script>window.x = 1;</script><p>Real abstract with >1 month and < 3 months, <6 months.</p></body></html>',
+              },
+            ],
+          },
+        }),
+      ),
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const flows = await svc.fetchDataflows(budget());
+
+    expect(flows[0]?.description).toBe('Real abstract with >1 month and < 3 months, <6 months.');
   });
 });
 
@@ -2706,6 +2733,685 @@ describe('OecdStructureService.fetchCodelist', () => {
     } finally {
       http.restore();
     }
+  });
+
+  it('preserves non-empty string parent on hierarchical codes and omits absent/empty/non-string parents', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          Response.json({
+            data: {
+              codelists: [
+                {
+                  codes: [
+                    { id: '_T', name: 'Total' },
+                    { id: 'T_1000', name: 'Taxes on income', parent: '_T' },
+                    { id: 'T_1100', name: { en: 'Individuals' }, parent: 'T_1000' },
+                    { id: 'T_1110', name: 'Wages', parent: 'T_1100' },
+                    { id: 'EMPTY_PARENT', name: 'Empty parent', parent: '' },
+                    { id: 'NULL_PARENT', name: 'Null parent', parent: null },
+                    { id: 'NUM_PARENT', name: 'Numeric parent', parent: 42 },
+                  ],
+                },
+              ],
+            },
+          }),
+        ),
+      ),
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const codes = await svc.fetchCodelist(budget(), 'OECD.CTP.TPS', 'CL_STANDARD_REVENUE');
+
+    expect(codes).toEqual([
+      { id: '_T', name: 'Total' },
+      { id: 'T_1000', name: 'Taxes on income', parent: '_T' },
+      { id: 'T_1100', name: 'Individuals', parent: 'T_1000' },
+      { id: 'T_1110', name: 'Wages', parent: 'T_1100' },
+      { id: 'EMPTY_PARENT', name: 'Empty parent' },
+      { id: 'NULL_PARENT', name: 'Null parent' },
+      { id: 'NUM_PARENT', name: 'Numeric parent' },
+    ]);
+    expect('parent' in (codes[0] ?? {})).toBe(false);
+    expect('parent' in (codes[4] ?? {})).toBe(false);
+    expect('parent' in (codes[5] ?? {})).toBe(false);
+    expect('parent' in (codes[6] ?? {})).toBe(false);
+  });
+});
+
+// ── htmlToMarkdown ────────────────────────────────────────────────────────────
+
+describe('htmlToMarkdown', () => {
+  it('converts double-quoted, single-quoted, unquoted, and reordered href anchors', () => {
+    const html =
+      '<p>See <a href="https://oecd.org/a">Double</a>, ' +
+      "<a href='http://oecd.org/b'>Single</a>, " +
+      '<a href=https://doi.org/10.1787/123 >(OECD, 2012)</a>, ' +
+      '<a href= "https://oecd.org/spaced" target="_blank">SpacedEq</a>, and ' +
+      '<a target="_blank" href="https://oecd.org/reordered">Reordered</a>.</p>';
+
+    expect(htmlToMarkdown(html)).toBe(
+      'See [Double](https://oecd.org/a), ' +
+        '[Single](http://oecd.org/b), ' +
+        '[(OECD, 2012)](https://doi.org/10.1787/123), ' +
+        '[SpacedEq](https://oecd.org/spaced), and ' +
+        '[Reordered](https://oecd.org/reordered).',
+    );
+  });
+
+  it('handles nested inline tags, mailto trimming, entities, label brackets, and URL encoding', () => {
+    const html =
+      '<a href="https://webfs-els.oecd.org/files/HCQO/Guide (Nov 2026).pdf"><i>User [Guide]</i></a> ' +
+      '<a href="https://data-explorer.oecd.org/vis?df[ds]=x&amp;df[id]=y"><b>Data</b> &amp; Explorer</a> ' +
+      '<a href="mailto: RegionStat@oecd.org">RegionStat@oecd.org</a>';
+
+    expect(htmlToMarkdown(html)).toBe(
+      '[User \\[Guide\\]](https://webfs-els.oecd.org/files/HCQO/Guide%20%28Nov%202026%29.pdf) ' +
+        '[Data & Explorer](https://data-explorer.oecd.org/vis?df[ds]=x&df[id]=y) ' +
+        '[RegionStat@oecd.org](mailto:RegionStat@oecd.org)',
+    );
+  });
+
+  it('emits plain text only for missing, empty, or unsafe hrefs', () => {
+    const html =
+      '<a>No href</a> · <a href="">Empty</a> · ' +
+      '<a href="javascript:alert(1)">JS</a> · ' +
+      '<a href="data:text/html,hi">Data</a> · ' +
+      '<a href="ftp://example.org/x">FTP</a> · ' +
+      '<a href="mailto:   ">BlankMail</a> · ' +
+      '<a href="ENV.Stat@oecd.org">NoScheme</a>';
+
+    expect(htmlToMarkdown(html)).toBe('No href · Empty · JS · Data · FTP · BlankMail · NoScheme');
+  });
+
+  it('handles unbalanced anchors, <a/> typos, and preserves bare < comparisons', () => {
+    expect(
+      htmlToMarkdown(
+        'Before <a href="https://a.test">first <a href="https://b.test">second</a></a> after',
+      ),
+    ).toBe('Before first [second](https://b.test) after');
+
+    expect(htmlToMarkdown('Start <a href="https://a.test">never closed')).toBe(
+      'Start never closed',
+    );
+
+    expect(htmlToMarkdown('Stray</a></a> and >1 month and < 3 months, <6 months')).toBe(
+      'Stray and >1 month and < 3 months, <6 months',
+    );
+
+    expect(
+      htmlToMarkdown('<a href="https://a.test">TypoClose<a/> next <a href="https://b.test">OK</a>'),
+    ).toBe('TypoClose next [OK](https://b.test)');
+  });
+
+  it('preserves links with unquoted trailing-slash href, quoted > in attributes, comments with >, backslashes in labels, mailto punctuation, and preceding !', () => {
+    // Unquoted href ending in `/` must not be treated as self-closing `<a/>`.
+    expect(htmlToMarkdown('<a href=https://oecd.org/x/>TrailSlash</a>')).toBe(
+      '[TrailSlash](https://oecd.org/x/)',
+    );
+    // `>` inside quoted attribute values and HTML comments must not terminate the tag early.
+    expect(
+      htmlToMarkdown(
+        '<!-- a > b --><a title="a > b" href="https://oecd.org/quoted">Quoted</a> after',
+      ),
+    ).toBe('[Quoted](https://oecd.org/quoted) after');
+    // Backslashes in anchor labels are escaped before `[`/`]` so the closing `]` stays unescaped.
+    expect(htmlToMarkdown('<a href="https://oecd.org/bs">foo\\</a>')).toBe(
+      '[foo\\\\](https://oecd.org/bs)',
+    );
+    expect(htmlToMarkdown('<a href="https://oecd.org/bs2">foo\\[bar]</a>')).toBe(
+      '[foo\\\\\\[bar\\]](https://oecd.org/bs2)',
+    );
+    // Parentheses/angle brackets in mailto: recipients are percent-encoded for CommonMark parity.
+    expect(htmlToMarkdown('<a href="mailto:foo(bar)@example.com">Mail</a>')).toBe(
+      '[Mail](mailto:foo%28bar%29@example.com)',
+    );
+    // A `!` directly before `<a ...>` must not turn into a CommonMark image `![label](url)`.
+    expect(htmlToMarkdown('Important!<a href="https://oecd.org/read">Read</a>')).toBe(
+      'Important! [Read](https://oecd.org/read)',
+    );
+  });
+
+  it('reads a quote as a value delimiter only after `=`, and a quoted value running past a tag end as broken', () => {
+    // A stray quote after a closed value (`"_blank"` with `target=` missing) is a literal character.
+    expect(
+      htmlToMarkdown(
+        '<a href="https://oecd.org/outlook"_blank">Outlook</a> and key findings <a href="https://oecd.org/paper"_blank">paper</a>.',
+      ),
+    ).toBe('[Outlook](https://oecd.org/outlook) and key findings [paper](https://oecd.org/paper).');
+    // Markup inside a quoted value stays inside it while no tag follows a `>` in the value.
+    expect(htmlToMarkdown('<a title="<b>" href="https://oecd.org/7">L</a>')).toBe(
+      '[L](https://oecd.org/7)',
+    );
+    // A typographic closing quote leaves `"` open past `>` and the next tag, so the tag ends at its first `>`.
+    expect(
+      htmlToMarkdown(
+        'from the <a href="https://oecd.org/q=FDI”>Data Portal</a>, and also <a href="https://oecd.org/fig.htm”>FDI in Figures</a>.',
+      ),
+    ).toBe(
+      'from the [Data Portal](https://oecd.org/q=FDI”), and also [FDI in Figures](https://oecd.org/fig.htm”).',
+    );
+    // Quotes inside unquoted values, attribute names, and end tags are literal.
+    expect(
+      htmlToMarkdown(
+        '<a href=https://oecd.org/it\'s>L</a> don\'t <td width=5">cell</td> <p data-x\'y=1>text</p> x</b "y>z" w',
+      ),
+    ).toBe("[L](https://oecd.org/it's) don't cell text xz\" w");
+  });
+
+  it('closes comments at `-->`, `--!>`, and the abrupt `<!-->` and `<!--->` forms', () => {
+    expect(htmlToMarkdown('a<!-->b <a href="https://oecd.org/1">L</a>')).toBe(
+      'a b [L](https://oecd.org/1)',
+    );
+    expect(htmlToMarkdown('a<!--->b')).toBe('a b');
+    expect(htmlToMarkdown('a<!---->b<!-- -- -->c<!-- x --!>d')).toBe('a b c d');
+    // `<!--!>` and `<!---!>` do not close: `--!>` needs both dashes after the opener.
+    expect(htmlToMarkdown('a<!--!>hidden-->b<!---!>hidden-->c')).toBe('a b c');
+  });
+
+  it('strips <head>, <style>, and <script> blocks including contents (closed and unclosed)', () => {
+    const html =
+      '<!DOCTYPE html><html><head><title>Title</title><style>.x { color: red; }</style></head>' +
+      '<body><script>alert(1)</script><p>Visible <a href="https://oecd.org">link</a>.</p></body></html>';
+    expect(htmlToMarkdown(html)).toBe('Visible [link](https://oecd.org).');
+    expect(htmlToMarkdown('<p>Keep</p><style>.unclosed { color: blue;')).toBe('Keep');
+  });
+
+  describe('linear-time scaling', () => {
+    const BASE_CHARS = 5_000;
+    const SIZES = [10_000, 20_000, 40_000, 80_000, 160_000, 320_000];
+    const TRIALS = 5;
+    const CHARS_PER_MEASUREMENT = 640_000;
+    const CPU_CEILING_US = 200_000;
+
+    function cpuPerCallUs(text: string, expected: string): number {
+      const calls = Math.max(1, Math.round(CHARS_PER_MEASUREMENT / text.length));
+      let last = '';
+      const start = process.threadCpuUsage();
+      for (let i = 0; i < calls; i++) last = htmlToMarkdown(text);
+      const { user, system } = process.threadCpuUsage(start);
+      expect(last).toBe(expected);
+      return (user + system) / calls;
+    }
+
+    function expectLinear(build: (n: number) => { input: string; expected: string }): void {
+      const base = build(BASE_CHARS);
+      for (const size of SIZES) {
+        const sample = build(size);
+        let leastGrowth = Number.POSITIVE_INFINITY;
+        let leastCpu = Number.POSITIVE_INFINITY;
+        for (let trial = 0; trial < TRIALS; trial++) {
+          const baseline = cpuPerCallUs(base.input, base.expected);
+          const cpu = cpuPerCallUs(sample.input, sample.expected);
+          leastGrowth = Math.min(leastGrowth, cpu / baseline);
+          leastCpu = Math.min(leastCpu, cpu);
+        }
+        expect(leastGrowth, `growth at ${size} characters`).toBeLessThan(4 * (size / BASE_CHARS));
+        expect(leastCpu, `CPU per call at ${size} characters`).toBeLessThan(CPU_CEILING_US);
+      }
+    }
+
+    it.each<[string, (n: number) => { input: string; expected: string }]>([
+      [
+        'repeated unclosed <a href> openers',
+        (n) => {
+          const unit = '<a href="https://x.test">';
+          return { input: `${unit.repeat(Math.floor(n / unit.length))}tail`, expected: 'tail' };
+        },
+      ],
+      [
+        'nested openers with inline tags',
+        (n) => {
+          const unit = '<a href="https://x.test"><b>x';
+          const count = Math.floor(n / unit.length);
+          return {
+            input: `${unit.repeat(count)}</a>`,
+            expected: `${'x'.repeat(count - 1)}[x](https://x.test)`,
+          };
+        },
+      ],
+      [
+        'overlapping unclosed <a prefixes',
+        (n) => {
+          const unit = '<<a href=';
+          const count = Math.floor(n / unit.length);
+          return { input: unit.repeat(count), expected: unit.repeat(count) };
+        },
+      ],
+      [
+        'one unclosed opener followed by long runs',
+        (n) => ({ input: `<a href="https://x.test">${'a'.repeat(n)}`, expected: 'a'.repeat(n) }),
+      ],
+      [
+        'unclosed style block opener followed by long runs',
+        (n) => ({
+          input: `ok<style>${'.a{color:red}'.repeat(Math.floor(n / 13))}`,
+          expected: 'ok',
+        }),
+      ],
+      [
+        'one long line ending in a break',
+        (n) => {
+          const body = 'x1 y'.repeat(Math.floor(n / 4));
+          return { input: `${body}\nz`, expected: `${body} z` };
+        },
+      ],
+      [
+        'breaks throughout',
+        (n) => ({ input: `${'  \r\n'.repeat(Math.floor(n / 4))}ok`, expected: 'ok' }),
+      ],
+      [
+        'repeated quoted > attributes',
+        (n) => {
+          const unit = '<a title="a > b">';
+          return { input: `${unit.repeat(Math.floor(n / unit.length))}ok`, expected: 'ok' };
+        },
+      ],
+      [
+        'unclosed HTML comment opener followed by long runs',
+        (n) => ({ input: `ok<!--${'x>'.repeat(Math.floor(n / 2))}`, expected: 'ok' }),
+      ],
+      [
+        'stray quotes after closed values',
+        (n) => {
+          const unit = '<a href="https://x.test"_blank">y</a>';
+          const count = Math.floor(n / unit.length);
+          return { input: unit.repeat(count), expected: '[y](https://x.test)'.repeat(count) };
+        },
+      ],
+      [
+        'quoted values left open past the next tag',
+        (n) => {
+          const unit = '<a href="https://x.test/q”>y</a> ';
+          const count = Math.floor(n / unit.length);
+          return {
+            input: unit.repeat(count),
+            expected: Array.from({ length: count }, () => '[y](https://x.test/q”)').join(' '),
+          };
+        },
+      ],
+      [
+        'one comment with dash runs before its close',
+        (n) => ({ input: `ok<!--${'-x'.repeat(Math.floor(n / 2))}-->`, expected: 'ok' }),
+      ],
+    ])('scales linearly on %s', (_shape, build) => expectLinear(build), 0);
+  });
+});
+
+// ── Dataflow metadata on fetchDataStructure (#57) ─────────────────────────────
+
+describe('OecdStructureService.fetchDataStructure — dataflow metadata', () => {
+  const http = createFetchMock();
+
+  beforeEach(() => {
+    http.reset();
+    http.install();
+  });
+
+  afterEach(() => {
+    http.restore();
+  });
+
+  const BASE = 'https://fake.oecd.test';
+  const DELEGATED = 'https://fake.oecd.test/sti-public/rest';
+
+  function dsdPayload(dataflows?: unknown[]) {
+    return {
+      data: {
+        ...(dataflows ? { dataflows } : {}),
+        dataStructures: [
+          {
+            id: 'DSD_META',
+            description: 'DSD-level description must not leak into dataflow description',
+            dataStructureComponents: {
+              dimensionList: {
+                dimensions: [{ id: 'FREQ', position: 0, name: 'Frequency' }],
+                timeDimensions: [{ id: 'TIME_PERIOD', name: 'Time Period' }],
+              },
+            },
+          },
+        ],
+      },
+    };
+  }
+
+  it('extracts name, Markdown description, and 2-/3-segment EXT_RESOURCE with zero extra requests', async () => {
+    const flowRef = 'OECD.SDD.NAD,DSD_META@DF_META';
+    http.route({
+      match: `${BASE}/dataflow/OECD.SDD.NAD/DSD_META@DF_META?references=datastructure`,
+      respond: () =>
+        Response.json(
+          dsdPayload([
+            {
+              agencyID: 'OECD.SDD.NAD',
+              id: 'DSD_META@DF_META',
+              name: { en: 'Quarterly GDP Growth' },
+              description:
+                '<p>Full abstract. See <a href="https://oecd.org/guide.pdf">User Guide</a> and <a href="mailto: stat@oecd.org">stat@oecd.org</a>.</p>',
+              annotations: [
+                { type: 'NonProductionDataflow', text: 'true' },
+                {
+                  type: 'EXT_RESOURCE',
+                  text: 'EXGR-csv-zip|https://webfs-sti.oecd.org/EXGR.zip',
+                },
+                {
+                  type: 'EXT_RESOURCE',
+                  texts: {
+                    en: 'Download ITID|https://webfs-ctp.oecd.org/itid.xlsx|https://upload.wikimedia.org/icon.svg',
+                  },
+                },
+                { type: 'EXT_RESOURCE', text: 'BrokenNoPipe' },
+                { type: 'EXT_RESOURCE', text: 'BadScheme|javascript:alert(1)' },
+                { type: 'EXT_RESOURCE', text: '|https://oecd.org/no-label' },
+              ],
+            },
+          ]),
+        ),
+    });
+
+    const svc = new OecdStructureService(BASE);
+    const dsd = await svc.fetchDataStructure(budget(), flowRef);
+
+    expect(http.calls).toHaveLength(1);
+    expect(dsd.name).toBe('Quarterly GDP Growth');
+    expect(dsd.description).toBe(
+      'Full abstract. See [User Guide](https://oecd.org/guide.pdf) and [stat@oecd.org](mailto:stat@oecd.org).',
+    );
+    expect(dsd.resources).toEqual([
+      { label: 'EXGR-csv-zip', url: 'https://webfs-sti.oecd.org/EXGR.zip' },
+      { label: 'Download ITID', url: 'https://webfs-ctp.oecd.org/itid.xlsx' },
+    ]);
+  });
+
+  it('omits description and resources on a bare flow whose dataflow entry carries only name', async () => {
+    const flowRef = 'OECD.TAD.ARP,DF_AEI2024_DASHBOARD';
+    http.route({
+      match: `${BASE}/dataflow/OECD.TAD.ARP/DF_AEI2024_DASHBOARD?references=datastructure`,
+      respond: () =>
+        Response.json(
+          dsdPayload([
+            {
+              agencyID: 'OECD.TAD.ARP',
+              id: 'DF_AEI2024_DASHBOARD',
+              name: 'Agri-Environmental indicators: 2024 Dashboard',
+              annotations: [{ type: 'NonProductionDataflow', text: 'true' }],
+            },
+          ]),
+        ),
+    });
+
+    const svc = new OecdStructureService(BASE);
+    const dsd = await svc.fetchDataStructure(budget(), flowRef);
+
+    expect(dsd.name).toBe('Agri-Environmental indicators: 2024 Dashboard');
+    expect(dsd.description).toBeUndefined();
+    expect(dsd.resources).toBeUndefined();
+    expect('description' in dsd).toBe(false);
+    expect('resources' in dsd).toBe(false);
+  });
+
+  it('preserves dataflow metadata from configured.reference when configured.direct answers without dataflows[]', async () => {
+    const flowRef = 'OECD.SDD.TPS,DSD_META@DF_ITIC';
+    http.route(
+      {
+        match: `${BASE}/dataflow/OECD.SDD.TPS/DSD_META@DF_ITIC?references=datastructure`,
+        respond: () =>
+          Response.json({
+            data: {
+              dataStructures: [],
+              dataflows: [
+                {
+                  agencyID: 'OECD.SDD.TPS',
+                  id: 'DSD_META@DF_ITIC',
+                  isExternalReference: true,
+                  name: 'ITIC Trade',
+                  description: '<p>From configured stub.</p>',
+                  annotations: [{ type: 'EXT_RESOURCE', text: 'Bulk|https://oecd.org/itic.zip' }],
+                  links: [
+                    {
+                      rel: 'external',
+                      href: `${DELEGATED}/dataflow/OECD.SDD.TPS/DSD_META@DF_ITIC/1.0`,
+                    },
+                  ],
+                },
+              ],
+            },
+          }),
+      },
+      {
+        match: `${BASE}/datastructure/OECD.SDD.TPS/DSD_META`,
+        respond: () => Response.json(dsdPayload()),
+      },
+    );
+
+    const svc = new OecdStructureService(BASE);
+    const dsd = await svc.fetchDataStructure(budget(), flowRef);
+
+    expect(dsd.name).toBe('ITIC Trade');
+    expect(dsd.description).toBe('From configured stub.');
+    expect(dsd.resources).toEqual([{ label: 'Bulk', url: 'https://oecd.org/itic.zip' }]);
+    expect(http.calls).toHaveLength(2);
+  });
+
+  it('prefers the delegated root dataflows[0] metadata when present, and preserves it on cached repeats', async () => {
+    const flowRef = 'OECD.STI.PIE,DSD_META@DF_TIVA';
+    const flowPath = '/dataflow/OECD.STI.PIE/DSD_META@DF_TIVA?references=datastructure';
+    http.route(
+      {
+        match: `${BASE}${flowPath}`,
+        respond: () =>
+          cacheableJson({
+            data: {
+              dataStructures: [],
+              dataflows: [
+                {
+                  agencyID: 'OECD.STI.PIE',
+                  id: 'DSD_META@DF_TIVA',
+                  isExternalReference: true,
+                  name: 'Stub Name',
+                  description: '<p>Stub description.</p>',
+                  links: [
+                    {
+                      rel: 'external',
+                      href: `${DELEGATED}/dataflow/OECD.STI.PIE/DSD_META@DF_TIVA/1.2`,
+                    },
+                  ],
+                },
+              ],
+            },
+          }),
+      },
+      {
+        match: `${BASE}/datastructure/OECD.STI.PIE/DSD_META`,
+        respond: () => new Response('Could not find requested structures', { status: 404 }),
+      },
+      {
+        match: `${DELEGATED}${flowPath}`,
+        respond: () =>
+          cacheableJson(
+            dsdPayload([
+              {
+                agencyID: 'OECD.STI.PIE',
+                id: 'DSD_META@DF_TIVA',
+                name: 'Delegated TiVA Name',
+                description:
+                  '<p>Delegated description with <a href="https://oecd.org/tiva">link</a>.</p>',
+                annotations: [{ type: 'EXT_RESOURCE', text: 'TiVA Zip|https://oecd.org/tiva.zip' }],
+              },
+            ]),
+          ),
+      },
+    );
+
+    const svc = new OecdStructureService(BASE);
+    const first = await svc.fetchDataStructure(budget(), flowRef);
+    const repeat = await svc.fetchDataStructure(budget(), flowRef);
+
+    expect(http.calls).toHaveLength(3);
+    expect(first.name).toBe('Delegated TiVA Name');
+    expect(first.description).toBe('Delegated description with [link](https://oecd.org/tiva).');
+    expect(first.resources).toEqual([{ label: 'TiVA Zip', url: 'https://oecd.org/tiva.zip' }]);
+    expect(repeat).toEqual(first);
+  });
+
+  it('falls through from empty singular name/description/text to plural localized maps', async () => {
+    const flowRef = 'OECD.SDD.NAD,DSD_META@DF_EMPTY_SINGULAR';
+    const refUrl = `${BASE}/dataflow/OECD.SDD.NAD/DSD_META@DF_EMPTY_SINGULAR?references=datastructure`;
+    http.route({
+      match: refUrl,
+      respond: () =>
+        Response.json(
+          dsdPayload([
+            {
+              agencyID: 'OECD.SDD.NAD',
+              id: 'DSD_META@DF_EMPTY_SINGULAR',
+              name: '',
+              names: { en: 'Plural Name' },
+              description: '   ',
+              descriptions: { en: '<p>Plural description.</p>' },
+              annotations: [
+                {
+                  type: 'EXT_RESOURCE',
+                  text: '',
+                  texts: { en: 'Plural Doc|https://oecd.org/plural.pdf' },
+                },
+              ],
+            },
+          ]),
+        ),
+    });
+
+    const svc = new OecdStructureService(BASE);
+    const dsd = await svc.fetchDataStructure(budget(), flowRef);
+
+    expect(dsd.name).toBe('Plural Name');
+    expect(dsd.description).toBe('Plural description.');
+    expect(dsd.resources).toEqual([{ label: 'Plural Doc', url: 'https://oecd.org/plural.pdf' }]);
+  });
+});
+
+// ── fetchDimensionCount (#54) ─────────────────────────────────────────────────
+
+describe('OecdStructureService.fetchDimensionCount', () => {
+  const http = createFetchMock();
+
+  beforeEach(() => {
+    http.reset();
+    http.install();
+  });
+
+  afterEach(() => {
+    http.restore();
+  });
+
+  const BASE = 'https://fake.oecd.test';
+  const FLOW_REF = 'OECD.SDD.NAD,DSD_CNT@DF_CNT';
+  const REF_URL = `${BASE}/dataflow/OECD.SDD.NAD/DSD_CNT@DF_CNT?references=datastructure`;
+  const SCHEME_URL = `${BASE}/conceptscheme/OECD.SDD.NAD/CS_CNT/1.0`;
+
+  const DSD_WITH_CONCEPTS = {
+    data: {
+      dataStructures: [
+        {
+          id: 'DSD_CNT',
+          dataStructureComponents: {
+            dimensionList: {
+              dimensions: [
+                {
+                  id: 'FREQ',
+                  position: 0,
+                  conceptIdentity:
+                    'urn:sdmx:org.sdmx.infomodel.conceptscheme.Concept=OECD.SDD.NAD:CS_CNT(1.0).FREQ',
+                },
+                {
+                  id: 'REF_AREA',
+                  position: 1,
+                  conceptIdentity:
+                    'urn:sdmx:org.sdmx.infomodel.conceptscheme.Concept=OECD.SDD.NAD:CS_CNT(1.0).REF_AREA',
+                },
+                {
+                  id: 'MEASURE',
+                  position: 2,
+                  conceptIdentity:
+                    'urn:sdmx:org.sdmx.infomodel.conceptscheme.Concept=OECD.SDD.NAD:CS_CNT(1.0).MEASURE',
+                },
+              ],
+              timeDimensions: [{ id: 'TIME_PERIOD' }],
+            },
+          },
+        },
+      ],
+    },
+  };
+
+  it('resolves dimension count in 1 structure request cold and 0 warm, without fetching concept schemes', async () => {
+    http.route(
+      { match: REF_URL, respond: () => cacheableJson(DSD_WITH_CONCEPTS) },
+      {
+        match: SCHEME_URL,
+        respond: () =>
+          cacheableJson({
+            data: { conceptSchemes: [{ concepts: [{ id: 'FREQ', name: 'Frequency' }] }] },
+          }),
+      },
+    );
+
+    const svc = new OecdStructureService(BASE);
+    const coldCount = await svc.fetchDimensionCount(budget(), FLOW_REF);
+    const warmCount = await svc.fetchDimensionCount(budget(), FLOW_REF);
+
+    expect(coldCount).toBe(3);
+    expect(warmCount).toBe(3);
+    // Only the structure request ran — never the concept scheme.
+    expect(http.calls.map((c) => c.request.url)).toEqual([REF_URL]);
+
+    // A subsequent fetchDataStructure reuses the cached structure and only fetches the concept scheme.
+    const dsd = await svc.fetchDataStructure(budget(), FLOW_REF);
+    expect(dsd.dimensions[0]?.name).toBe('Frequency');
+    expect(http.calls.map((c) => c.request.url)).toEqual([REF_URL, SCHEME_URL]);
+  });
+
+  it('throws notFound for unknown dataflows and 0-dimension datastructures', async () => {
+    http.route(
+      {
+        match: `${BASE}/dataflow/OECD.SDD.NAD/DSD_NONE@DF_NONE?references=datastructure`,
+        respond: () => noResultsFound(),
+      },
+      {
+        match: `${BASE}/dataflow/OECD.SDD.NAD/DSD_ZERO@DF_ZERO?references=datastructure`,
+        respond: () =>
+          Response.json({
+            data: {
+              dataStructures: [
+                {
+                  id: 'DSD_ZERO',
+                  dataStructureComponents: { dimensionList: { dimensions: [] } },
+                },
+              ],
+            },
+          }),
+      },
+    );
+
+    const svc = new OecdStructureService(BASE);
+    const missingErr = await svc
+      .fetchDimensionCount(budget(), 'OECD.SDD.NAD,DSD_NONE@DF_NONE')
+      .catch((e: Error) => e);
+    const zeroErr = await svc
+      .fetchDimensionCount(budget(), 'OECD.SDD.NAD,DSD_ZERO@DF_ZERO')
+      .catch((e: Error) => e);
+
+    expect(isDataflowNotFound(missingErr as Error)).toBe(true);
+    expect(isDataflowNotFound(zeroErr as Error)).toBe(true);
+  });
+
+  it('rejects malformed flow_ref without issuing any upstream request', async () => {
+    http.route({ match: () => true, respond: () => Response.json(DSD_WITH_CONCEPTS) });
+    const svc = new OecdStructureService(BASE);
+
+    await expect(svc.fetchDimensionCount(budget(), 'BAD_REF')).rejects.toThrow(/Invalid flow_ref/);
+    expect(http.calls).toHaveLength(0);
   });
 });
 

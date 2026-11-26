@@ -144,6 +144,53 @@ describe('oecdDataflowResource', () => {
 
     expect(result.flow_ref).toBe('OECD.TAD.ARP,DF_AEI2024_DASHBOARD');
     expect(result.dimensions).toHaveLength(2);
+    expect(result).not.toHaveProperty('name');
+    expect(result).not.toHaveProperty('description');
+    expect(result).not.toHaveProperty('resources');
+  });
+
+  it('returns name, full description, and resources from data.dataflows[0] with zero extra requests', async () => {
+    const fetchSpy = vi.fn(() =>
+      Promise.resolve(
+        Response.json({
+          data: {
+            dataflows: [
+              {
+                agencyID: 'OECD.SDD.NAD',
+                id: 'DSD_NAAG@DF_NAAG_I',
+                name: 'National Accounts at a Glance',
+                description:
+                  '<p>See <a href="https://oecd.org/naag">NAAG guide</a> and <a href="mailto: stat@oecd.org">stat@oecd.org</a>.</p>',
+                annotations: [
+                  {
+                    type: 'EXT_RESOURCE',
+                    text: 'NAAG Zip|https://oecd.org/naag.zip|https://cdn.example/icon.svg',
+                  },
+                ],
+              },
+            ],
+            dataStructures: DSD_RESPONSE.data.dataStructures,
+          },
+        }),
+      ),
+    );
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const ctx = createMockContext({ errors: oecdDataflowResource.errors });
+    const params = resourceParams.parse({
+      agency_id: 'OECD.SDD.NAD',
+      flow_id: 'DSD_NAAG%40DF_NAAG_I',
+    });
+    const result = await oecdDataflowResource.handler(params, ctx);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(resourceOutput.parse(result)).toMatchObject({
+      flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+      name: 'National Accounts at a Glance',
+      description:
+        'See [NAAG guide](https://oecd.org/naag) and [stat@oecd.org](mailto:stat@oecd.org).',
+      resources: [{ label: 'NAAG Zip', url: 'https://oecd.org/naag.zip' }],
+    });
   });
 
   it('throws ctx.fail(invalid_flow_ref) for a flow_id carrying path characters', async () => {

@@ -1113,6 +1113,62 @@ describe('oecdGetDimensionValues available_only and key', () => {
     );
   });
 
+  it('trims extra trailing empty segments before calling availability and diagnosing the key', async () => {
+    const http = serve({
+      availability: json(
+        availabilityOf({ FREQ: ['A', 'Q'], MEASURE: ['B1GQ'] }, 40, {
+          start: '2000-01-01',
+          end: '2009-12-31',
+        }),
+      ),
+    });
+
+    const result = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      key: 'Q.B1GQ..',
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(http.requestsTo('/availableconstraint/').map((r) => r.url)).toEqual([
+      availabilityUrl('Q.B1GQ'),
+    ]);
+    expect(result.structuredContent).toMatchObject({
+      available_only: true,
+      codes: [
+        { id: 'A', name: 'Annual' },
+        { id: 'Q', name: 'Quarterly' },
+      ],
+      observation_count: 40,
+      time_range: { start: '2000-01-01', end: '2009-12-31' },
+    });
+  });
+
+  it('rejects a key with an extra non-empty segment as invalid_key without calling codelist or availability', async () => {
+    const http = serve({ availability: json(ALL_SERIES) });
+
+    const error = await toolWireError(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      key: 'Q.B1GQ.2025-Q1',
+    });
+
+    expect(http.requests.map((r) => r.url)).toEqual([REFERENCE_URL]);
+    expect(http.requestsTo('/codelist/')).toHaveLength(0);
+    expect(http.requestsTo('/availableconstraint/')).toHaveLength(0);
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: {
+        reason: 'invalid_key',
+        recovery: { hint: declaredRecovery(oecdGetDimensionValues, 'invalid_key') },
+      },
+    });
+    expect(error.message).toContain('3 segments');
+    expect(error.message).toContain('2 dimensions');
+    expect(error.message).toContain('time is not a key segment');
+    expect(error.message).toContain('on oecd_query_dataset');
+  });
+
   it('lists a dimension with no codelist from availability, each code under its id', async () => {
     const http = serve({ availability: json(ALL_SERIES) });
 
@@ -1696,6 +1752,358 @@ describe('oecdGetDimensionValues available_only and key', () => {
         maximum: 10_000,
         description: 'Maximum codes to return. Default 50, at most 10,000.',
       });
+    });
+  });
+});
+
+// ── Hierarchical codelists: codes[].parent and parent filter ──────────────────
+
+/** Regional codelist spanning country → TL2 → TL3, plus non-French regions whose names contain "Fr". */
+const REGIONAL_CODELIST_RESPONSE = {
+  data: {
+    codelists: [
+      {
+        codes: [
+          { id: 'FRA', name: 'France' },
+          { id: 'FR1', name: 'Île-de-France', parent: 'FRA' },
+          { id: 'FRB', name: 'Centre — Val de Loire', parent: 'FRA' },
+          { id: 'FRC', name: 'Bourgogne-Franche-Comté', parent: 'FRA' },
+          { id: 'FR101', name: 'Paris', parent: 'FR1' },
+          { id: 'FR102', name: 'Seine-et-Marne', parent: 'FR1' },
+          { id: 'ITA', name: 'Italy' },
+          { id: 'ITH', name: 'Friuli-Venezia Giulia', parent: 'ITA' },
+          { id: 'NLD', name: 'Netherlands' },
+          { id: 'NL1', name: 'Friesland', parent: 'NLD' },
+        ],
+      },
+    ],
+  },
+};
+
+/** Four-level tax-revenue hierarchy: _T → T_1000 → T_1100 → T_1110. */
+const REVENUE_CODELIST_RESPONSE = {
+  data: {
+    codelists: [
+      {
+        codes: [
+          { id: '_T', name: 'Total tax revenue' },
+          { id: 'T_1000', name: 'Taxes on income, profits and capital gains', parent: '_T' },
+          {
+            id: 'T_1100',
+            name: 'Taxes on income, profits and capital gains of individuals',
+            parent: 'T_1000',
+          },
+          { id: 'T_1110', name: 'On income and profits of individuals', parent: 'T_1100' },
+          { id: 'T_2000', name: 'Social security contributions', parent: '_T' },
+        ],
+      },
+    ],
+  },
+};
+
+describe('oecdGetDimensionValues hierarchy (parent)', () => {
+  let fake: ScriptedFetch | undefined;
+
+  function serveHierarchy(
+    codelist: unknown = REGIONAL_CODELIST_RESPONSE,
+    availability?: ScriptedAnswer,
+  ): ScriptedFetch {
+    fake = installScriptedFetch((url) => {
+      if (url.includes('/availableconstraint/')) {
+        if (!availability) throw new Error(`Unexpected availability request: ${url}`);
+        return availability;
+      }
+      if (url.includes('/codelist/')) return json(codelist);
+      return json(DSD_RESPONSE);
+    });
+    return fake;
+  }
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    process.env.OECD_BASE_URL = FAKE_BASE;
+    process.env.OECD_TIMEOUT_MS = '5000';
+    initStructureService();
+  });
+
+  afterEach(() => {
+    const installed = fake;
+    fake = undefined;
+    installed?.restore();
+  });
+
+  it('preserves codes[].parent for child codes, omits it for top-level codes, and renders a Parent column on mixed pages', async () => {
+    serveHierarchy();
+
+    const result = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      limit: 3,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      code_count: 3,
+      codes: [
+        { id: 'FRA', name: 'France' },
+        { id: 'FR1', name: 'Île-de-France', parent: 'FRA' },
+        { id: 'FRB', name: 'Centre — Val de Loire', parent: 'FRA' },
+      ],
+    });
+    const codes = (result.structuredContent as { codes: Array<Record<string, unknown>> }).codes;
+    expect(codes[0]).not.toHaveProperty('parent');
+
+    const text = textOf(result);
+    expect(text).toContain('| Code | Name | Parent |');
+    expect(text).toContain('| FRA | France | — |');
+    expect(text).toContain('| FR1 | Île-de-France | FRA |');
+    expect(text).toContain('| FRB | Centre — Val de Loire | FRA |');
+  });
+
+  it('keeps the two-column table on flat pages where no returned code has a parent', async () => {
+    serveHierarchy(CODELIST_RESPONSE);
+
+    const result = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+    });
+
+    const text = textOf(result);
+    expect(text).toContain('| Code | Name |');
+    expect(text).not.toContain('| Parent |');
+  });
+
+  it('filters by exact parent across TL2 and TL3 levels and excludes non-French regions containing FR', async () => {
+    serveHierarchy();
+
+    const tl2 = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      parent: 'FRA',
+    });
+
+    expect(tl2.structuredContent).toMatchObject({
+      code_count: 3,
+      codes: [
+        { id: 'FR1', name: 'Île-de-France', parent: 'FRA' },
+        { id: 'FRB', name: 'Centre — Val de Loire', parent: 'FRA' },
+        { id: 'FRC', name: 'Bourgogne-Franche-Comté', parent: 'FRA' },
+      ],
+    });
+    expect(tl2.structuredContent).not.toHaveProperty('notice');
+    const tl2Text = textOf(tl2);
+    expect(tl2Text).toContain('| Code | Name | Parent |');
+    expect(tl2Text).toContain('| FR1 | Île-de-France | FRA |');
+    expect(tl2Text).not.toContain('Friuli-Venezia Giulia');
+    expect(tl2Text).not.toContain('Friesland');
+    expect(tl2Text).not.toContain('Paris');
+
+    const tl3 = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      parent: 'FR1',
+    });
+
+    expect(tl3.structuredContent).toMatchObject({
+      code_count: 2,
+      codes: [
+        { id: 'FR101', name: 'Paris', parent: 'FR1' },
+        { id: 'FR102', name: 'Seine-et-Marne', parent: 'FR1' },
+      ],
+    });
+  });
+
+  it('walks a four-level hierarchy (_T → T_1000 → T_1100 → T_1110) via parent', async () => {
+    serveHierarchy(REVENUE_CODELIST_RESPONSE);
+
+    const level1 = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      parent: '_T',
+    });
+    const level2 = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      parent: 'T_1000',
+    });
+    const level3 = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      parent: 'T_1100',
+    });
+
+    expect(level1.structuredContent).toMatchObject({
+      code_count: 2,
+      codes: [
+        { id: 'T_1000', name: 'Taxes on income, profits and capital gains', parent: '_T' },
+        { id: 'T_2000', name: 'Social security contributions', parent: '_T' },
+      ],
+    });
+    expect(level2.structuredContent).toMatchObject({
+      code_count: 1,
+      codes: [
+        {
+          id: 'T_1100',
+          name: 'Taxes on income, profits and capital gains of individuals',
+          parent: 'T_1000',
+        },
+      ],
+    });
+    expect(level3.structuredContent).toMatchObject({
+      code_count: 1,
+      codes: [{ id: 'T_1110', name: 'On income and profits of individuals', parent: 'T_1100' }],
+    });
+  });
+
+  it('applies available_only, then parent, then query, then offset and limit', async () => {
+    serveHierarchy(
+      REGIONAL_CODELIST_RESPONSE,
+      json(
+        availabilityOf({ FREQ: ['FRA', 'FR1', 'FRB', 'ITH'], MEASURE: ['B1GQ'] }, 99, {
+          start: '2010-01-01',
+          end: '2023-12-31',
+        }),
+      ),
+    );
+
+    // FRC is omitted by availability; ITH is omitted by parent; FRB is omitted by query.
+    const narrowed = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      available_only: true,
+      parent: 'FRA',
+      query: 'île',
+    });
+
+    expect(narrowed.structuredContent).toMatchObject({
+      available_only: true,
+      code_count: 1,
+      codes: [{ id: 'FR1', name: 'Île-de-France', parent: 'FRA' }],
+      effectiveQuery: 'île',
+    });
+
+    // Pagination reflects the 2 available children under FRA, not all 3 in the codelist.
+    const page1 = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      available_only: true,
+      parent: 'FRA',
+      limit: 1,
+      offset: 0,
+    });
+    expect(page1.structuredContent).toMatchObject({
+      code_count: 1,
+      codes: [{ id: 'FR1', name: 'Île-de-France', parent: 'FRA' }],
+      totalCount: 2,
+      notice:
+        'Showing codes 1–1 of 2. Advance offset to 1 for the next page, or pass query to narrow by code or label.',
+    });
+
+    const pastEnd = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      available_only: true,
+      parent: 'FRA',
+      offset: 5,
+    });
+    expect(pastEnd.structuredContent).toMatchObject({
+      code_count: 0,
+      codes: [],
+      totalCount: 2,
+      notice: 'Offset 5 is past the 2 matching codes — lower offset to page back into the list.',
+    });
+  });
+
+  it.each(['', '   '])('treats blank or whitespace parent %j as unset', async (blankParent) => {
+    serveHierarchy();
+
+    const result = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      parent: blankParent,
+    });
+
+    expect(result.structuredContent).toMatchObject({ code_count: 10 });
+    expect(result.structuredContent).not.toHaveProperty('notice');
+  });
+
+  it('names the exact-case parent code in notice when parent differs only by letter case', async () => {
+    serveHierarchy();
+
+    const result = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      parent: 'fra',
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      code_count: 0,
+      codes: [],
+      notice: expect.stringContaining('FRA'),
+    });
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toContain('"fra"');
+    expect(notice).toContain('"FRA"');
+    expect(renderedOf(result)).toContain(notice);
+  });
+
+  it('emits an actionable miss notice when parent matches no codes and escapes Markdown in content[]', async () => {
+    serveHierarchy();
+    const rawParent = '*NOPE* [x](y)';
+
+    const result = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      parent: rawParent,
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      code_count: 0,
+      codes: [],
+      notice: expect.stringContaining(`"${rawParent}"`),
+    });
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toContain('Omit parent');
+    expect(notice).not.toContain('no fixed codelist');
+    expect(renderedOf(result)).toContain(notice);
+  });
+
+  it('reports the post-parent count when parent matches codes but query matches none', async () => {
+    serveHierarchy();
+
+    const result = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      parent: 'FRA',
+      query: 'zzz-nothing',
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      code_count: 0,
+      codes: [],
+      effectiveQuery: 'zzz-nothing',
+      notice: expect.stringContaining('3'),
+    });
+    const notice = (result.structuredContent as { notice: string }).notice;
+    expect(notice).toContain('FRA');
+    expect(notice).toContain('zzz-nothing');
+    expect(notice).not.toContain('10');
+  });
+
+  it('does not add a parent miss notice when available_only already returned zero codes', async () => {
+    serveHierarchy(REGIONAL_CODELIST_RESPONSE, json(availabilityOf({}, 0)));
+
+    const result = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      available_only: true,
+      parent: 'FRA',
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      available_only: true,
+      code_count: 0,
+      codes: [],
+      notice: 'OECD records no observations for this dataflow.',
     });
   });
 });

@@ -12,14 +12,20 @@ import {
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline, idGenerator } from '@cyanheads/mcp-ts-core/utils';
 import { getCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
-import { getDataService, invalidQueryText } from '@/services/oecd-data/oecd-data-service.js';
+import {
+  getDataService,
+  invalidQueryText,
+  SDMX_KEY_SAFE,
+} from '@/services/oecd-data/oecd-data-service.js';
 import type { OecdDataResult } from '@/services/oecd-data/types.js';
-import { throttleText, upstreamRefusal, upstreamStatus } from '@/services/oecd-http/oecd-http.js';
+import { throttleText, upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
 import { UpstreamBudget } from '@/services/oecd-http/upstream-budget.js';
 import {
   availabilityKey,
   describeFindings,
   diagnoseKey,
+  isInvertedPeriodRange,
+  normalizeDimensionKey,
   type OecdAvailability,
   periodOutside,
   readAvailability,
@@ -45,28 +51,31 @@ interface ConstantColumn {
 type ConstantColumns = Record<string, ConstantColumn>;
 
 /**
- * Character budget for the inline preview: the `JSON.stringify` length of
- * `constant_columns` plus the accumulated length of the rows taken so far —
- * what the caller receives. One constant drives both paths, so the preview is
- * the same size whether or not a canvas is configured; only the fate of the
- * remainder differs.
+ * Character threshold for spilling to DataCanvas: the `JSON.stringify` length
+ * of `constant_columns` plus the accumulated length of the rows taken so far.
+ * When DataCanvas is configured and the result crosses this threshold, every
+ * decoded row stages on the canvas and the inline response carries a short
+ * preview head capped at {@link SPILL_PREVIEW_ROWS}.
  */
-const PREVIEW_CHARS = 100_000;
+const INLINE_BUDGET_CHARS = 100_000;
+
+/** Maximum preview rows returned alongside a spilled DataCanvas handle. */
+const SPILL_PREVIEW_ROWS = 25;
 
 /** Alphabet of the suffix a generated canvas table name carries after `spilled_`. */
 const TABLE_NAME_HEX = '0123456789abcdef';
 
 /**
- * Number of leading rows that fit {@link PREVIEW_CHARS} beside the constants.
- * The first row that crosses the budget is excluded, so a spilled preview and
- * an inline one cut at the same row. Applied to a preview that was already cut
- * this way it is a no-op.
+ * Number of leading rows that fit {@link INLINE_BUDGET_CHARS} beside the
+ * constants. The first row that crosses the budget is excluded, so a spill
+ * triggers whenever the result exceeds the threshold and a gigantic single row
+ * still yields zero preview rows rather than blowing the inline budget.
  */
-function previewRowCount(rows: readonly OutputRow[], constantColumns: ConstantColumns): number {
+function inlineRowCount(rows: readonly OutputRow[], constantColumns: ConstantColumns): number {
   let chars = JSON.stringify(constantColumns).length;
   for (const [index, row] of rows.entries()) {
     chars += JSON.stringify(row).length;
-    if (chars > PREVIEW_CHARS) return index;
+    if (chars > INLINE_BUDGET_CHARS) return index;
   }
   return rows.length;
 }
@@ -161,6 +170,7 @@ interface EmptyQuery {
   endPeriod: string | undefined;
   flowRef: string;
   key: string;
+  lastNObservations: number | undefined;
   /** The root that answered the query, and so holds the key's availability record. */
   serviceRoot: string;
   startPeriod: string | undefined;
@@ -200,7 +210,8 @@ async function emptyResultCause(
  * segments none of whose codes has data given the rest of the key, each code
  * that matches only by letter case named as such; then a key whose pinned
  * segments OECD records no series for together; then a period wholly outside
- * the range the key's series cover.
+ * the range the key's series cover; then `last_n_observations` with
+ * `end_period`, which OECD applies in that order.
  */
 function causeOf(
   availability: OecdAvailability,
@@ -220,16 +231,15 @@ function causeOf(
   if (range && periodOutside(range, query.startPeriod, query.endPeriod)) {
     return `the requested period lies outside ${range.start} to ${range.end}, the range OECD records for this key`;
   }
+  if (query.lastNObservations !== undefined && query.endPeriod !== undefined) {
+    return `last_n_observations (${query.lastNObservations}) is applied before end_period ("${query.endPeriod}"), so series whose latest observations are newer than end_period return nothing — omit end_period for the latest observations, or drop last_n_observations and bound the window with start_period / end_period`;
+  }
   return;
 }
 
 export const oecdQueryDataset = tool('oecd_query_dataset', {
   description:
-    'Fetch observations from an OECD dataflow filtered by a dimension key and optional time range. ' +
-    'Returns one row per observation, sorted by dimension code and then period, carrying the dimensions and attributes that vary — each label with its SDMX code beside it as <ID>_code — and values already scaled by the unit multiplier; the components holding one value across the whole result come back once, in constant_columns. ' +
-    'Large multi-country time-series spill to a DataCanvas table holding every column, codes included — inspect columns with oecd_dataframe_describe, then query the full table with SQL using oecd_dataframe_query; ' +
-    'without DataCanvas every row still comes back, but the rendered table stops at a preview slice. ' +
-    'Call oecd_get_dataset_info first to learn the dimension order for constructing the key.',
+    'Fetch observations from an OECD dataflow filtered by a dimension key, optional time range, and optional last_n_observations. Returns one row per observation, sorted by dimension code and then period, carrying the dimensions and attributes that vary — each label with its SDMX code beside it as <ID>_code — and values already scaled by the unit multiplier; the components holding one value across the whole result come back once, in constant_columns. Large multi-country time-series spill to a DataCanvas table holding every column, codes included, returning a preview head of up to 25 rows — inspect columns with oecd_dataframe_describe, then query the full table with SQL using oecd_dataframe_query; without DataCanvas every row comes back inline on both surfaces. Call oecd_get_dataset_info first to learn the dimension order for constructing the key.',
   annotations: {
     readOnlyHint: true,
     idempotentHint: true,
@@ -239,44 +249,43 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     flow_ref: z
       .string()
       .describe(
-        'Full flow reference — e.g. "OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I", or the bare ' +
-          '"OECD.TAD.ARP,DF_AEI2024_DASHBOARD" form for a dataflow published without a ' +
-          'datastructure prefix. Obtain from oecd_search_datasets and pass it through unchanged.',
+        'Full flow reference — e.g. "OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I", or the bare "OECD.TAD.ARP,DF_AEI2024_DASHBOARD" form for a dataflow published without a datastructure prefix. Obtain from oecd_search_datasets and pass it through unchanged.',
       ),
     key: z
       .string()
       .describe(
-        'Dot-delimited dimension key matching the dimension order from oecd_get_dataset_info. ' +
-          'Empty segments are wildcards; "+" separates multiple values per segment. ' +
-          'Example: "A.USA+DEU.B1GQ.." — Annual, USA or Germany, GDP, all remaining dimensions.',
+        'Dot-delimited dimension key matching the dimension order from oecd_get_dataset_info. Empty segments are wildcards; "+" separates multiple values per segment. Example: "A.USA+DEU.B1GQ.." — Annual, USA or Germany, GDP, all remaining dimensions.',
       ),
     start_period: z
       .string()
       .optional()
       .describe(
-        'Start of the time range — ISO period code such as "2010", "2010-Q1", or "2010-01". ' +
-          'Omit to include all history (may produce very large results).',
+        'Start of the time range — ISO period code such as "2010", "2010-Q1", or "2010-01". Omit to include all history (may produce very large results).',
       ),
     end_period: z
       .string()
       .optional()
       .describe(
-        'End of the time range — ISO period code such as "2023" or "2023-Q4". ' +
-          'Omit to include up to the latest available period.',
+        'End of the time range — ISO period code such as "2023" or "2023-Q4". Omit to include up to the latest available period.',
+      ),
+    last_n_observations: z
+      .number()
+      .int()
+      .min(1)
+      .max(100_000)
+      .optional()
+      .describe(
+        'Return only the most recent N observations per series (SDMX lastNObservations, 1 to 100,000). OECD applies lastNObservations to each series before start_period / end_period, so setting end_period before a series’s latest N periods excludes those observations — omit end_period when asking for the latest N observations.',
       ),
     canvas_id: CanvasIdSchema.optional().describe(
-      'Canvas ID from a prior oecd_query_dataset call — exactly 10 characters of letters, digits, ' +
-        'hyphens, and underscores — to stage this result alongside that one if it spills; a ' +
-        'result that fits inline comes back inline and leaves that canvas unchanged. Omit to let ' +
-        'the server mint a canvas if this result needs one; a canvas_id comes back only when the ' +
-        'result was large enough to spill.',
+      'Canvas ID from a prior oecd_query_dataset call — exactly 10 characters of letters, digits, hyphens, and underscores — to stage this result alongside that one if it spills; a result that fits inline comes back inline and leaves that canvas unchanged. Omit to let the server mint a canvas if this result needs one; a canvas_id comes back only when the result was large enough to spill.',
     ),
   }),
   output: z.object({
     rows: z
       .array(DecodedRowSchema)
       .describe(
-        "Observation rows, sorted by each dimension's code in key order with TIME_PERIOD last. Every row of the result when truncated is absent; the leading preview slice when truncated is true — query the canvas table for the rest.",
+        "Observation rows, sorted by each dimension's code in key order with TIME_PERIOD last. Every row of the result when truncated is absent; a leading preview head of up to 25 rows when truncated is true — query the canvas table for the rest.",
       ),
     row_count: z.number().describe('Total rows in the result (or on the canvas when truncated).'),
     constant_columns: z
@@ -306,13 +315,15 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       .string()
       .optional()
       .describe('End period filter applied in this query, if any.'),
+    query_last_n_observations: z
+      .number()
+      .optional()
+      .describe('Most recent N observations per series filter applied in this query, if any.'),
     canvas_id: z
       .string()
       .optional()
       .describe(
-        'Canvas handle for the staged result. Present only when DataCanvas is configured and the ' +
-          'result exceeded the inline budget; absent when DataCanvas is off, and absent when it is ' +
-          'on but the result fit inline. Pass to oecd_dataframe_query or oecd_dataframe_describe.',
+        'Canvas handle for the staged result. Present only when DataCanvas is configured and the result exceeded the inline threshold; absent when DataCanvas is off, and absent when it is on but the result fit inline. Pass to oecd_dataframe_query or oecd_dataframe_describe.',
       ),
     table_name: z
       .string()
@@ -324,10 +335,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       .boolean()
       .optional()
       .describe(
-        'True when rows is a preview slice and the full result was staged on DataCanvas; omitted ' +
-          'entirely (never false) when rows holds the complete result. Use oecd_dataframe_query ' +
-          'with the canvas_id for analytics over the full set. A complete rows never means a ' +
-          'complete rendered table — content_table_capped reports that separately.',
+        'True when rows is a preview head of up to 25 rows and the full result was staged on DataCanvas; omitted entirely (never false) when rows holds the complete result. Use oecd_dataframe_query with the canvas_id for analytics over the full set.',
       ),
     source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
   }),
@@ -338,20 +346,6 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       .describe(
         'How to inspect and query the staged result, including its canvas_id and table name; present only after a spill.',
       ),
-    content_table_capped: z
-      .boolean()
-      .optional()
-      .describe(
-        'True when the rendered table shows only the leading rows of the result. Distinct from ' +
-          'truncated: nothing was staged anywhere, and structuredContent.rows still holds every ' +
-          'row. To shrink the result itself, name fewer values per key segment or set a narrower ' +
-          'start_period / end_period; to reach the full set as a queryable table instead, run ' +
-          'with CANVAS_PROVIDER_TYPE=duckdb and follow up with oecd_dataframe_query.',
-      ),
-    content_table_rows: z
-      .number()
-      .optional()
-      .describe('Rows the rendered table shows when content_table_capped is true.'),
   },
   errors: [
     {
@@ -359,8 +353,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       code: JsonRpcErrorCode.ValidationError,
       when: 'The flow_ref parameter matches neither the {agencyID},{dsd_id}@{df_id} nor the {agencyID},{df_id} format.',
       recovery:
-        'Obtain valid flow_ref values from oecd_search_datasets and pass one unchanged, ' +
-        'e.g. "OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I".',
+        'Obtain valid flow_ref values from oecd_search_datasets and pass one unchanged, e.g. "OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I".',
     },
     {
       reason: 'dataflow_not_found',
@@ -378,18 +371,16 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     {
       reason: 'invalid_key',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'The key holds a character outside the SDMX key set, or OECD rejected it — the wrong number of segments, or an unsupported format.',
+      when: 'The key holds a character outside the SDMX key set, fewer dot-delimited segments than the dataflow has dimensions, a non-empty segment past the dimension count, or a format OECD rejected.',
       recovery:
-        'Use oecd_get_dataset_info to check dimension order and count, ' +
-        'then rebuild the dot-delimited key matching that order.',
+        'Use oecd_get_dataset_info to check dimension order and count, then rebuild the dot-delimited key matching that order — pass time filters via start_period / end_period instead of an extra segment.',
     },
     {
       reason: 'invalid_period',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'OECD could not parse start_period or end_period.',
+      when: 'start_period is after end_period, or OECD could not parse start_period or end_period.',
       recovery:
-        'Reformat the period as an ISO code matching the dataflow frequency — ' +
-        '"2022" for annual, "2022-Q1" for quarterly, "2022-01" for monthly.',
+        'Ensure start_period is on or before end_period and format each as an ISO code matching the dataflow frequency — "2022" for annual, "2022-Q1" for quarterly, "2022-01" for monthly.',
     },
     {
       reason: 'rate_limited',
@@ -468,6 +459,20 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       );
     }
 
+    if (!SDMX_KEY_SAFE.test(input.key)) {
+      throw ctx.fail(
+        'invalid_key',
+        `Key "${input.key}" holds a character outside the SDMX key set — letters, digits, ".", "+", "_", "-", and "%"`,
+      );
+    }
+
+    if (isInvertedPeriodRange(input.start_period, input.end_period)) {
+      throw ctx.fail(
+        'invalid_period',
+        `start_period "${input.start_period}" is after end_period "${input.end_period}"`,
+      );
+    }
+
     /**
      * Resolve a caller's canvas before the download, so a stale or mistyped id
      * fails without spending an OECD download. Resolving an existing id mints
@@ -495,23 +500,61 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       }
     }
 
+    // One budget for key validation, the query, and — when it matches nothing — a capped share for diagnosis.
+    const budget = new UpstreamBudget(ctx.signal);
+
+    let normalizedKey = input.key;
+    if (availabilityKey(input.key) !== 'all') {
+      let dimensionCount: number;
+      try {
+        dimensionCount = await getStructureService().fetchDimensionCount(budget, input.flow_ref);
+      } catch (err) {
+        const e = err as Error;
+        if (isDataflowNotFound(e)) {
+          throw ctx.fail('dataflow_not_found', `Dataflow not found: ${input.flow_ref}`, undefined, {
+            cause: e,
+          });
+        }
+        const refusal = upstreamRefusal(e);
+        if (refusal) {
+          throw ctx.fail(refusal.reason, refusal.message, undefined, { cause: e });
+        }
+        throw err;
+      }
+
+      const keyCheck = normalizeDimensionKey(input.key, dimensionCount);
+      if (!keyCheck.ok) {
+        if (keyCheck.reason === 'too_short') {
+          throw ctx.fail(
+            'invalid_key',
+            `Key "${input.key}" has ${keyCheck.segmentCount} ${keyCheck.segmentCount === 1 ? 'segment' : 'segments'}, but ${input.flow_ref} has ${keyCheck.dimensionCount} dimensions — one segment each, empty for a wildcard`,
+          );
+        }
+        throw ctx.fail(
+          'invalid_key',
+          `Key "${input.key}" has ${keyCheck.segmentCount} segments, but ${input.flow_ref} has ${keyCheck.dimensionCount} dimensions — pass time filters via start_period / end_period instead of an extra key segment`,
+        );
+      }
+      normalizedKey = keyCheck.key;
+    }
+
     ctx.log.info('Querying OECD dataset', {
       flowRef: input.flow_ref,
-      key: input.key,
+      key: normalizedKey,
       startPeriod: input.start_period,
       endPeriod: input.end_period,
+      lastNObservations: input.last_n_observations,
     });
 
-    // One budget for the query and, when it matches nothing, a capped share of it for the diagnosis.
-    const budget = new UpstreamBudget(ctx.signal);
     let dataResult: OecdDataResult;
     try {
       dataResult = await getDataService().fetchData(
         budget,
         input.flow_ref,
-        input.key,
+        normalizedKey,
         input.start_period,
         input.end_period,
+        input.last_n_observations,
       );
     } catch (err) {
       const e = err as Error;
@@ -522,15 +565,6 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       }
       const rejection = invalidQueryText(e);
       if (rejection !== undefined) {
-        // The service's own key check: no request left, so OECD said nothing.
-        if (upstreamStatus(e) === undefined) {
-          throw ctx.fail(
-            'invalid_key',
-            `Key "${input.key}" holds a character outside the SDMX key set — letters, digits, ".", "+", "_", "-", and "%"`,
-            undefined,
-            { cause: e },
-          );
-        }
         // OECD's own wording names the mistake; the two cases need different fixes.
         if (PERIOD_REJECTION.test(rejection)) {
           throw ctx.fail(
@@ -542,7 +576,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
         }
         throw ctx.fail(
           'invalid_key',
-          `OECD rejected the dimension key "${input.key}": ${rejection}`,
+          `OECD rejected the dimension key "${normalizedKey}": ${rejection}`,
           undefined,
           { cause: e },
         );
@@ -568,90 +602,88 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       const cause = await emptyResultCause(budget.within(DIAGNOSIS_CAP_MS), {
         endPeriod: input.end_period,
         flowRef: input.flow_ref,
-        key: input.key,
+        key: normalizedKey,
+        lastNObservations: input.last_n_observations,
         serviceRoot: dataResult.serviceRoot,
         startPeriod: input.start_period,
       });
       throw ctx.fail(
         'no_results',
-        `No observations found for key "${input.key}" in ${input.flow_ref}${cause ? `: ${cause}.` : ''}`,
+        `No observations found for key "${normalizedKey}" in ${input.flow_ref}${cause ? `: ${cause}.` : ''}`,
       );
     }
 
     ctx.log.info('OECD data fetched', { rowCount: dataResult.rows.length });
 
     const { constantColumns, rows } = hoistConstantColumns(dataResult);
-    const shown = previewRowCount(rows, constantColumns);
 
-    // Only a result that spills needs a canvas, so an omitted id mints one only here.
-    if (canvas && shown < rows.length) {
-      const instance = callerCanvas ?? (await canvas.acquire(undefined, ctx));
-      /**
-       * Declare the schema rather than letting the provider sniff it. Attribute
-       * columns are sparse — one that resolves on no row inside the sniff window
-       * would be missing from the registered table entirely, so a later SQL
-       * query against it fails instead of returning nulls.
-       */
-      const schema: ColumnSchema[] = dataResult.columns.map((column) => ({
-        name: column.name,
-        type: column.type === 'number' ? 'DOUBLE' : 'VARCHAR',
-      }));
-      /**
-       * The table takes the decoded rows whole — `source`, every constant, and
-       * every code — so SQL never has to join `constant_columns` back in. The
-       * decision to stage is the budget's above, over what the caller
-       * receives: a full row serializes differently from a hoisted one, so
-       * `spillover()`'s own drain over the full rows could disagree with it.
-       */
-      const handle = await instance
-        .registerTable(
-          `spilled_${idGenerator.generateRandomString(8, TABLE_NAME_HEX)}`,
-          dataResult.rows,
-          { schema, signal: ctx.signal },
-        )
-        .catch(async (err: unknown) => {
-          if (instance.isNew) {
-            try {
-              await canvas.drop(instance.canvasId, ctx);
-            } catch (cleanupError) {
-              ctx.log.warning('Failed to release a canvas after staging failed', { cleanupError });
+    // Only a result that exceeds the inline threshold needs a canvas, so an omitted id mints one only here.
+    if (canvas) {
+      const shown = inlineRowCount(rows, constantColumns);
+      if (shown < rows.length) {
+        const instance = callerCanvas ?? (await canvas.acquire(undefined, ctx));
+        /**
+         * Declare the schema rather than letting the provider sniff it. Attribute
+         * columns are sparse — one that resolves on no row inside the sniff window
+         * would be missing from the registered table entirely, so a later SQL
+         * query against it fails instead of returning nulls.
+         */
+        const schema: ColumnSchema[] = dataResult.columns.map((column) => ({
+          name: column.name,
+          type: column.type === 'number' ? 'DOUBLE' : 'VARCHAR',
+        }));
+        /**
+         * The table takes the decoded rows whole — `source`, every constant, and
+         * every code — so SQL never has to join `constant_columns` back in. The
+         * decision to stage is the threshold's above, over what the caller
+         * receives: a full row serializes differently from a hoisted one, so
+         * `spillover()`'s own drain over the full rows could disagree with it.
+         */
+        const handle = await instance
+          .registerTable(
+            `spilled_${idGenerator.generateRandomString(8, TABLE_NAME_HEX)}`,
+            dataResult.rows,
+            { schema, signal: ctx.signal },
+          )
+          .catch(async (err: unknown) => {
+            if (instance.isNew) {
+              try {
+                await canvas.drop(instance.canvasId, ctx);
+              } catch (cleanupError) {
+                ctx.log.warning('Failed to release a canvas after staging failed', {
+                  cleanupError,
+                });
+              }
             }
-          }
-          throw err;
-        });
+            throw err;
+          });
 
-      /**
-       * A notice is authored Markdown, and the canvas_id can be the caller's.
-       * Both identifiers are code spans: neither can hold a backtick (canvas IDs
-       * are `[A-Za-z0-9_-]{10}`, generated table names `spilled_<hex>`), so the
-       * notice reads the same on both surfaces and copies without escapes.
-       */
-      ctx.enrich.notice(
-        `The full result is in table \`${handle.tableName}\` on canvas \`${instance.canvasId}\`. Call oecd_dataframe_describe with this canvas_id to inspect columns, then oecd_dataframe_query with this canvas_id and SQL to query the full table.`,
-      );
-      return {
-        rows: rows.slice(0, shown),
-        row_count: handle.rowCount,
-        constant_columns: constantColumns,
-        query_flow_ref: input.flow_ref,
-        query_key: input.key,
-        query_start_period: input.start_period,
-        query_end_period: input.end_period,
-        canvas_id: instance.canvasId,
-        table_name: handle.tableName,
-        truncated: true,
-        source: 'OECD' as const,
-      };
-    }
-
-    /**
-     * No canvas, or a result that fits inline. Every row rides in
-     * structuredContent either way; the rendered table stops at the preview
-     * budget, so a caller with nowhere to spill still gets a bounded
-     * `content[]` instead of the whole result twice.
-     */
-    if (shown < rows.length) {
-      ctx.enrich({ content_table_capped: true, content_table_rows: shown });
+        /**
+         * A notice is authored Markdown, and the canvas_id can be the caller's.
+         * Both identifiers are code spans: neither can hold a backtick (canvas IDs
+         * are `[A-Za-z0-9_-]{10}`, generated table names `spilled_<hex>`), so the
+         * notice reads the same on both surfaces and copies without escapes.
+         */
+        ctx.enrich.notice(
+          `The full result is in table \`${handle.tableName}\` on canvas \`${instance.canvasId}\`. Call oecd_dataframe_describe with this canvas_id to inspect columns, then oecd_dataframe_query with this canvas_id and SQL to query the full table.`,
+        );
+        return {
+          rows: rows.slice(0, Math.min(SPILL_PREVIEW_ROWS, shown)),
+          row_count: handle.rowCount,
+          constant_columns: constantColumns,
+          query_flow_ref: input.flow_ref,
+          query_key: normalizedKey,
+          query_start_period: input.start_period,
+          query_end_period: input.end_period,
+          ...(input.last_n_observations !== undefined
+            ? { query_last_n_observations: input.last_n_observations }
+            : {}),
+          canvas_id: instance.canvasId,
+          table_name: handle.tableName,
+          truncated: true,
+          source: 'OECD' as const,
+        };
+      }
     }
 
     return {
@@ -659,9 +691,12 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       row_count: rows.length,
       constant_columns: constantColumns,
       query_flow_ref: input.flow_ref,
-      query_key: input.key,
+      query_key: normalizedKey,
       query_start_period: input.start_period,
       query_end_period: input.end_period,
+      ...(input.last_n_observations !== undefined
+        ? { query_last_n_observations: input.last_n_observations }
+        : {}),
       source: 'OECD' as const,
     };
   },
@@ -673,40 +708,30 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
      * otherwise be dropped from the table.
      */
     const allKeys = [...new Set(result.rows.flatMap((r) => Object.keys(r)))];
-    const shown = previewRowCount(result.rows as OutputRow[], result.constant_columns);
-    const visible = result.rows.slice(0, shown);
-    const rows = visible.map((r) => allKeys.map((k) => String(r[k] ?? '')));
+    const rows = result.rows.map((r) => allKeys.map((k) => String(r[k] ?? '')));
     const constants = Object.entries(result.constant_columns);
 
     const periodRange =
       result.query_start_period || result.query_end_period
         ? ` | Period: ${escapeMarkdownInline(result.query_start_period ?? '…')} – ${escapeMarkdownInline(result.query_end_period ?? '…')}`
         : '';
+    const lastN =
+      result.query_last_n_observations !== undefined
+        ? ` | Last N: ${result.query_last_n_observations}`
+        : '';
 
     const scaled = result.rows.some(
       (r) => typeof r.value_scale === 'number' && r.value_scale !== 1,
     );
 
-    /**
-     * Three outcomes, three different next moves: the rest is on a canvas, the
-     * rest is in structuredContent, or there is no rest. Each says where the
-     * missing rows are and how to reach them.
-     */
     const note =
       result.truncated && result.canvas_id
-        ? `\n> Truncated — showing the first ${shown} of ${result.row_count} rows. The rest is on DataCanvas ` +
-          `(canvas_id: ${escapeMarkdownInline(result.canvas_id)}, table: ${escapeMarkdownInline(String(result.table_name))}).\n`
-        : shown < result.rows.length
-          ? `\n> Truncated for display — this table shows the first ${shown} of ${result.row_count} rows, ` +
-            'but `structuredContent.rows` carries every one of them. To make the result itself ' +
-            'smaller, name fewer values per `key` segment or narrow `start_period` / `end_period`. ' +
-            'To reach the full set as a queryable table, run with `CANVAS_PROVIDER_TYPE=duckdb` ' +
-            'and follow up with **oecd_dataframe_query**.\n'
-          : `\n> Not truncated — all ${shown} rows of the result are shown below.\n`;
+        ? `\n> Truncated — showing the first ${result.rows.length} of ${result.row_count} rows. The rest is on DataCanvas (canvas_id: ${escapeMarkdownInline(result.canvas_id)}, table: ${escapeMarkdownInline(String(result.table_name))}).\n`
+        : `\n> Not truncated — all ${result.rows.length} rows of the result are shown below.\n`;
 
     const lines = [
       `**OECD Dataset Query** — ${result.row_count} observations`,
-      `Query: ${escapeMarkdownInline(result.query_flow_ref)} key=${escapeMarkdownInline(result.query_key)}${periodRange}`,
+      `Query: ${escapeMarkdownInline(result.query_flow_ref)} key=${escapeMarkdownInline(result.query_key)}${periodRange}${lastN}`,
       note,
       scaled
         ? '> Values are scaled by the unit multiplier (UNIT_MULT) — divide `value` by `value_scale` for the figure as OECD published it.\n'
@@ -718,7 +743,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
             constants.map(([component, { code, label }]) => [component, code, label]),
           )}\n`
         : '',
-      visible.length > 0 ? formatTable(allKeys, rows) : '_(no rows)_',
+      result.rows.length > 0 ? formatTable(allKeys, rows) : '_(no rows)_',
       '',
       `Source: ${result.source}`,
     ];
