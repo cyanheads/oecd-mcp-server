@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.8.0](changelog/0.8.x/0.8.0.md) — 2026-11-25 · ⚠️ Breaking
+
+oecd_query_dataset gains last_n_observations, drops content_table_capped and content_table_rows, and caps a spilled preview at 25 rows; oecd_get_dimension_values returns code parents; oecd_get_dataset_info returns the dataflow description; oecd_search_datasets lists without a query; over-long keys fail up front.
+
 ## [0.7.0](changelog/0.7.x/0.7.0.md) — 2026-11-16 · ⚠️ Breaking
 
 oecd_query_dataset rows drop constant columns for a new constant_columns and gain _code columns; oecd_search_datasets matches at word starts and loses non_production; each call spends one upstream budget; structure responses are cached; limits clamp; DuckDB 2 and mcp-ts-core 0.13.22.
