@@ -16,9 +16,12 @@ import {
   fetchOecd,
   type RequestWindow,
   readJsonBody,
+  sdmxRecord,
+  sdmxRecords,
   upstreamStatus,
 } from '@/services/oecd-http/oecd-http.js';
 import type { UpstreamBudget } from '@/services/oecd-http/upstream-budget.js';
+import { sdmxVersion, versionFromDataflowUrn } from '@/services/oecd-structure/dataflow-version.js';
 import {
   fetchExternalServiceRoot,
   parseFlowRef,
@@ -209,7 +212,7 @@ const NO_MATCH_BODY = /No(?:Results|Records)Found|no result/;
 function emptyResultFor(err: unknown, serviceRoot: string): OecdDataResult | undefined {
   const upstream = upstreamStatus(err);
   if (upstream?.status === 404 && NO_MATCH_BODY.test(upstream.body)) {
-    return { columns: [], rowCount: 0, rows: [], serviceRoot, source: 'OECD' };
+    return { columns: [], keyDimensionIds: [], rowCount: 0, rows: [], serviceRoot, source: 'OECD' };
   }
   return;
 }
@@ -264,10 +267,11 @@ async function settleObservations(
   load: Promise<unknown>,
   flowRef: string,
   serviceRoot: string,
+  version?: string,
 ): Promise<OecdDataResult> {
   try {
     const data = await load;
-    return { ...decodeUpstream(() => decodeObservations(data)), serviceRoot };
+    return { ...decodeUpstream(() => decodeObservations(data, flowRef, version)), serviceRoot };
   } catch (err) {
     const empty = emptyResultFor(err, serviceRoot);
     if (empty) return empty;
@@ -321,10 +325,15 @@ export class OecdDataService {
     startPeriod?: string,
     endPeriod?: string,
     lastNObservations?: number,
+    options?: { dataRoot?: string; version?: string },
   ): Promise<OecdDataResult> {
     const parts = parseFlowRef(flowRef);
     if (!parts) {
       throw new Error(`Invalid flow_ref format: ${flowRef}`);
+    }
+    const { dataRoot, version } = options ?? {};
+    if (version !== undefined && sdmxVersion(version) === undefined) {
+      throw validationError('Invalid dataflow version', { version });
     }
 
     // Validate the key before inserting it into the URL path.
@@ -338,15 +347,28 @@ export class OecdDataService {
     // datastructure part and is sent as published.
     const encodedFlowId = parts.dsdId ? `${parts.dsdId}%40${parts.dfId}` : parts.dfId;
     const pathKey = NORMALIZED_AWAY_KEY.test(key) ? 'all' : key;
-    let path = `/data/${parts.agencyId},${encodedFlowId}/${pathKey}?dimensionAtObservation=AllDimensions`;
+    let path = `/data/${parts.agencyId},${encodedFlowId}${version === undefined ? '' : `,${version}`}/${pathKey}?dimensionAtObservation=AllDimensions`;
     if (startPeriod) path += `&startPeriod=${encodeURIComponent(startPeriod)}`;
     if (endPeriod) path += `&endPeriod=${encodeURIComponent(endPeriod)}`;
     if (lastNObservations !== undefined) path += `&lastNObservations=${lastNObservations}`;
 
+    // A structure lookup can establish that a different root owns the data.
+    // Reuse that decision and keep configured-root discovery for other calls.
+    if (dataRoot !== undefined && dataRoot !== this.baseUrl) {
+      return settleObservations(
+        loadObservations(budget, `${dataRoot}${path}`),
+        flowRef,
+        dataRoot,
+        version,
+      );
+    }
     const primary = `${this.baseUrl}${path}`;
     try {
       const data = await probeConfiguredRoot(budget, primary);
-      return { ...decodeUpstream(() => decodeObservations(data)), serviceRoot: this.baseUrl };
+      return {
+        ...decodeUpstream(() => decodeObservations(data, flowRef, version)),
+        serviceRoot: this.baseUrl,
+      };
     } catch (err) {
       const empty = emptyResultFor(err, this.baseUrl);
       if (empty) return empty;
@@ -359,6 +381,7 @@ export class OecdDataService {
           loadObservations(budget, `${serviceRoot}${path}`),
           flowRef,
           serviceRoot,
+          version,
         );
       }
 
@@ -367,7 +390,12 @@ export class OecdDataService {
       // transient fault it looked like before delegation was ruled out, and
       // gets the attempts the probe withheld, less the one already spent.
       if (upstreamStatus(err)?.status !== 500) throw dataFetchFailure(err, flowRef);
-      return settleObservations(loadObservations(budget, primary, 1), flowRef, this.baseUrl);
+      return settleObservations(
+        loadObservations(budget, primary, 1),
+        flowRef,
+        this.baseUrl,
+        version,
+      );
     }
   }
 }
@@ -565,19 +593,43 @@ function applyScale(value: number, exponent: number): number {
 }
 
 /** Decode an SDMX-JSON v2 AllDimensions body; the caller records the root that sent it. */
-function decodeObservations(data: unknown): Omit<OecdDataResult, 'serviceRoot'> {
-  const root = data as Record<string, unknown>;
-  const dataRoot = root?.data as Record<string, unknown> | undefined;
-  const dataSets = (dataRoot?.dataSets ?? []) as Array<Record<string, unknown>>;
-  const structures = (dataRoot?.structures ?? []) as Array<Record<string, unknown>>;
+function decodeObservations(
+  data: unknown,
+  flowRef: string,
+  requestedVersion?: string,
+): Omit<OecdDataResult, 'serviceRoot'> {
+  const dataRoot = sdmxRecord(sdmxRecord(data, 'response').data, 'data');
+  const dataSets = sdmxRecords(dataRoot.dataSets, 'dataSets');
+  const structures = sdmxRecords(dataRoot.structures, 'structures');
 
-  if (!dataSets.length || !structures.length) {
-    return { columns: [], rowCount: 0, rows: [], source: 'OECD' };
+  const [dataSet] = dataSets;
+  const [structure] = structures;
+  const links = structure?.links;
+  let resolvedVersion: string | undefined;
+  if (Array.isArray(links)) {
+    for (const link of links) {
+      resolvedVersion = versionFromDataflowUrn(link?.urn, flowRef);
+      if (resolvedVersion !== undefined) break;
+    }
   }
-
-  // Safe: length checks above guarantee both arrays have at least one element
-  const dataSet = dataSets[0] as Record<string, unknown>;
-  const structure = structures[0] as Record<string, unknown>;
+  if (
+    requestedVersion !== undefined &&
+    resolvedVersion !== undefined &&
+    requestedVersion !== resolvedVersion
+  ) {
+    throw new TypeError('The observation response identifies a different dataflow edition');
+  }
+  const version = resolvedVersion ?? requestedVersion;
+  if (!dataSet || !structure) {
+    return {
+      columns: [],
+      keyDimensionIds: [],
+      rowCount: 0,
+      rows: [],
+      source: 'OECD',
+      ...(version === undefined ? {} : { version }),
+    };
+  }
 
   /**
    * AllDimensions puts every dimension in the observation keys except one that
@@ -599,6 +651,18 @@ function decodeObservations(data: unknown): Omit<OecdDataResult, 'serviceRoot'> 
       true,
     ),
   ].sort((a, b) => a.keyPosition - b.keyPosition);
+  // Preserve holes in the published positions so a missing dimension cannot shift later slots.
+  const keyDimensionIds: Array<string | undefined> = [];
+  const timePosition = dimensions.find((dimension) => dimension.id === TIME_PERIOD)?.keyPosition;
+  for (const { id, keyPosition } of dimensions) {
+    if (id === TIME_PERIOD) continue;
+    const slot =
+      timePosition !== undefined && keyPosition > timePosition ? keyPosition - 1 : keyPosition;
+    keyDimensionIds[slot] = id || undefined;
+  }
+  if (timePosition !== undefined && timePosition > keyDimensionIds.length) {
+    keyDimensionIds[timePosition - 1] = undefined;
+  }
 
   /**
    * Attributes arrive at three levels — the dataset, a dimension group, and
@@ -653,11 +717,12 @@ function decodeObservations(data: unknown): Omit<OecdDataResult, 'serviceRoot'> 
    * colon-delimited dimension index tuple, e.g. `"0:0:2:3:0:0"` — so attribute
    * n sits at array position n + 1.
    */
-  const observations = (dataSet.observations ?? {}) as Record<string, Array<unknown>>;
+  const observations = sdmxRecord(dataSet.observations, 'observations');
 
   const decoded: Array<{ codes: string[]; row: DecodedRow }> = [];
 
   for (const [key, obsValues] of Object.entries(observations)) {
+    if (!Array.isArray(obsValues)) throw new TypeError('Expected SDMX observation array');
     const indices = key.split(':').map(Number);
     // Key order is the rendered column order — keep it aligned with `columns`.
     const row: DecodedRow = { value: null, value_scale: 1, source: 'OECD' };
@@ -698,5 +763,12 @@ function decodeObservations(data: unknown): Omit<OecdDataResult, 'serviceRoot'> 
   }
 
   const rows = decoded.sort((a, b) => compareCodes(a.codes, b.codes)).map(({ row }) => row);
-  return { columns, rowCount: rows.length, rows, source: 'OECD' };
+  return {
+    columns,
+    keyDimensionIds,
+    rowCount: rows.length,
+    rows,
+    source: 'OECD',
+    ...(version === undefined ? {} : { version }),
+  };
 }

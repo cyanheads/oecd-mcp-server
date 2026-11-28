@@ -11,6 +11,7 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { NORMALIZED_AWAY_KEY } from '@/services/oecd-data/oecd-data-service.js';
 import { upstreamStatus } from '@/services/oecd-http/oecd-http.js';
 import { isBudgetExpiry, type UpstreamBudget } from '@/services/oecd-http/upstream-budget.js';
+import { versionFromDataflowUrn } from './dataflow-version.js';
 import { getStructureService } from './oecd-structure-service.js';
 import type { OecdDataStructure, OecdDimension } from './types.js';
 
@@ -23,6 +24,8 @@ export interface OecdAvailability {
    * dimension OECD leaves out has no code with data given the other segments.
    */
   readonly codes: ReadonlyMap<string, readonly string[]>;
+  /** Dataflow editions identified by this availability record's own attachment. */
+  readonly dataflowVersions?: readonly string[];
   /** OECD's `obs_count` annotation — observations under the key. Undefined when OECD sends none. */
   readonly observationCount: number | undefined;
   /**
@@ -38,6 +41,12 @@ export type AvailabilityOutcome =
   | { readonly availability: OecdAvailability; readonly kind: 'read' }
   /** `failure` says what went wrong, in a clause fit for a notice. */
   | { readonly failure: string; readonly kind: 'failed' };
+
+/** Optional SDMX period bounds as passed to an upstream read. */
+interface PeriodBounds {
+  readonly endPeriod: string | undefined;
+  readonly startPeriod: string | undefined;
+}
 
 /** The key as the availability URL carries it: `all` for no key or an every-series key. */
 export function availabilityKey(key: string | undefined): string {
@@ -80,6 +89,20 @@ export function normalizeDimensionKey(key: string, dimensionCount: number): Dime
   return { ok: true, key };
 }
 
+/** Explain the arity of a successful dot-only selector, including a legacy encoded alias. */
+export function dotOnlyKeyNotice(key: string, dimensionCount: number): string | undefined {
+  let segments: number;
+  if (NORMALIZED_AWAY_KEY.test(key)) {
+    segments = key.replaceAll(/%2e/gi, '.').length + 1;
+  } else if (/^\.+$/.test(key)) {
+    segments = key.length + 1;
+  } else {
+    return;
+  }
+  if (segments === dimensionCount) return;
+  return `The dot-only key has ${segments} segments; this dataflow has ${dimensionCount} dimensions. Selected all series.`;
+}
+
 /**
  * Read what OECD has data for under `key`: one unretried request, best-effort,
  * through the structure cache, spending what is left of the call's `budget`.
@@ -100,23 +123,45 @@ export function normalizeDimensionKey(key: string, dimensionCount: number): Dime
  * an `McpError`, which is this server's own fault.
  *
  * `root` becomes the request URL, so it must have passed the origin check: a
- * datastructure's `dataRoot` or a data result's `serviceRoot`.
+ * datastructure's `dataRoot` or a data result's `serviceRoot`. Bounds narrow
+ * available codes and the count. OECD may still report the source time range.
  */
 export async function readAvailability(
   budget: UpstreamBudget,
-  dsd: Pick<OecdDataStructure, 'dataRoot' | 'flowRef'>,
+  dsd: Pick<OecdDataStructure, 'dataRoot' | 'flowRef' | 'version'>,
   key: string | undefined,
   root: string = dsd.dataRoot,
+  bounds?: PeriodBounds,
+  version?: string,
 ): Promise<AvailabilityOutcome> {
   // The path percent-encodes the `@` of a combined flow ref.
-  const flow = dsd.flowRef.replaceAll('@', '%40');
+  const flow = dsd.flowRef.replaceAll('@', '%40') + (version === undefined ? '' : `,${version}`);
+  const search = new URLSearchParams({ mode: 'available' });
+  if (bounds?.startPeriod !== undefined) search.set('startPeriod', bounds.startPeriod);
+  if (bounds?.endPeriod !== undefined) search.set('endPeriod', bounds.endPeriod);
   try {
-    const availability = await getStructureService().readStructure(budget, {
-      attempts: 'once',
-      decode: parseAvailability,
-      failureMessage: `Failed to fetch OECD availability for ${dsd.flowRef}`,
-      url: `${root}/availableconstraint/${flow}/${availabilityKey(key)}/all/all?mode=available`,
-    });
+    const { dataflowVersions, ...availability } = await getStructureService().readStructure(
+      budget,
+      {
+        attempts: 'once',
+        decode: (payload) => parseAvailability(payload, dsd.flowRef),
+        failureMessage: `Failed to fetch OECD availability for ${dsd.flowRef}`,
+        url: `${root}/availableconstraint/${flow}/${availabilityKey(key)}/all/all?${search}`,
+      },
+    );
+    // The cache holds what OECD sent, independent of the DSD edition each
+    // waiter is comparing it with. An unversioned URL can survive a rollover.
+    const expected = version ?? dsd.version;
+    const different =
+      expected === undefined
+        ? undefined
+        : dataflowVersions?.find((edition) => edition !== expected);
+    if (different !== undefined) {
+      return {
+        kind: 'failed',
+        failure: `OECD returned availability for edition ${different} instead of ${expected}`,
+      };
+    }
     return { availability, kind: 'read' };
   } catch (err) {
     if (budget.signal?.aborted || isBudgetExpiry(err) || !(err instanceof McpError)) throw err;
@@ -145,11 +190,21 @@ const ISO_DATE = /^\d{4}-\d{2}-\d{2}/;
  * Decode an `availableconstraint` structure message. A field of the wrong type
  * throws `TypeError`, which the read reports as an unreadable body.
  */
-export function parseAvailability(payload: unknown): OecdAvailability {
+export function parseAvailability(payload: unknown, flowRef?: string): OecdAvailability {
   const constraints = (payload as { data: { contentConstraints: unknown[] } }).data
     .contentConstraints;
   const constraint = constraints[0] as Record<string, unknown> | undefined;
   if (!constraint) throw new TypeError('availableconstraint answered with no content constraint');
+
+  const attachments = (constraint.constraintAttachment as { dataflows?: unknown } | undefined)
+    ?.dataflows;
+  const editions = new Set<string>();
+  if (flowRef !== undefined && Array.isArray(attachments)) {
+    for (const urn of attachments) {
+      const edition = versionFromDataflowUrn(urn, flowRef);
+      if (edition !== undefined) editions.add(edition);
+    }
+  }
 
   const codes = new Map<string, string[]>();
   let start: string | undefined;
@@ -184,6 +239,7 @@ export function parseAvailability(payload: unknown): OecdAvailability {
   const count = annotations.find((a) => a.id === 'obs_count')?.title;
   return {
     codes,
+    ...(editions.size === 0 ? {} : { dataflowVersions: [...editions] }),
     observationCount: typeof count === 'string' && /^\d+$/.test(count) ? Number(count) : undefined,
     // The inverted sentinel orders start after end; so would any range with no series.
     timeRange: start && end && start <= end ? { end, start } : undefined,
@@ -280,14 +336,31 @@ export function describeFindings(findings: readonly SegmentFinding[]): string[] 
   ]);
 }
 
-/** First and last day of an SDMX period code (`2019`, `2019-Q2`, `2019-S1`, `2019-04`, `2019-M04`, `2019-04-15`). */
-function periodDays(code: string): { first: string; last: string } | undefined {
+type PeriodDays = { first: string; last: string } | null | undefined;
+
+/**
+ * First and last day of a recognized SDMX period. An impossible calendar day
+ * returns null. Other forms we cannot interpret are left to OECD.
+ */
+function periodDays(code: string): PeriodDays {
   const match = /^(\d{4})(?:-(?:([QS])(\d)|M?(\d{2})(?:-(\d{2}))?))?$/.exec(code.trim());
   if (!match) return;
   const [, year, unit, part, month, day] = match;
   const pad = (n: number) => String(n).padStart(2, '0');
-  const lastOfMonth = (m: number) => pad(new Date(Date.UTC(Number(year), m, 0)).getUTCDate());
-  if (day && month) return { first: `${year}-${month}-${day}`, last: `${year}-${month}-${day}` };
+  const lastOfMonth = (m: number) => {
+    // setUTCFullYear preserves years 0000–0099 as written.
+    const date = new Date(0);
+    date.setUTCFullYear(Number(year), m, 0);
+    return pad(date.getUTCDate());
+  };
+  if (day && month) {
+    const monthNumber = Number(month);
+    if (monthNumber < 1 || monthNumber > 12 || day === '00' || day > lastOfMonth(monthNumber)) {
+      return null;
+    }
+    const date = `${year}-${month}-${day}`;
+    return { first: date, last: date };
+  }
   let firstMonth = 1;
   let lastMonth = 12;
   if (month) {
@@ -305,21 +378,28 @@ function periodDays(code: string): { first: string; last: string } | undefined {
   };
 }
 
-/**
- * Whether a parseable `startPeriod` begins strictly after a parseable
- * `endPeriod` ends. Returns `false` when either bound is absent, unparseable,
- * or overlaps the other (including mixed granularities like `2024` and
- * `2024-Q1`).
- */
-export function isInvertedPeriodRange(
+/** Normalize blank bounds, reject impossible days and inversions, and retain other SDMX forms. */
+export function validatePeriodBounds(
   startPeriod: string | undefined,
   endPeriod: string | undefined,
-): boolean {
-  if (startPeriod === undefined || endPeriod === undefined) return false;
-  const start = periodDays(startPeriod);
-  const end = periodDays(endPeriod);
-  if (!start || !end) return false;
-  return start.first > end.last;
+): ({ ok: true } & PeriodBounds) | { ok: false; message: string } {
+  const startBound = startPeriod?.trim() ? startPeriod : undefined;
+  const endBound = endPeriod?.trim() ? endPeriod : undefined;
+  const start = startBound === undefined ? undefined : periodDays(startBound);
+  const end = endBound === undefined ? undefined : periodDays(endBound);
+  if (start === null) {
+    return { ok: false, message: `start_period "${startPeriod}" is not a valid calendar date` };
+  }
+  if (end === null) {
+    return { ok: false, message: `end_period "${endPeriod}" is not a valid calendar date` };
+  }
+  if (start && end && start.first > end.last) {
+    return {
+      ok: false,
+      message: `start_period "${startPeriod}" is after end_period "${endPeriod}"`,
+    };
+  }
+  return { ok: true, startPeriod: startBound, endPeriod: endBound };
 }
 
 /**

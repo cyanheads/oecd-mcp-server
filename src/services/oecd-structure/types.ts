@@ -70,6 +70,8 @@ export interface OecdExternalResource {
 /** Datastructure metadata for a dataflow, at the revision the dataflow references. */
 export interface OecdDataStructure {
   agencyId: string;
+  /** Dimension IDs, including time, whose concept schemes could not be read. */
+  conceptLookupFailedFor?: string[];
   /**
    * OECD service root that serves this dataflow's data, and so its availability
    * record: the root the configured catalog's dataflow entry delegates to when
@@ -104,6 +106,8 @@ export interface OecdDataStructure {
    */
   serviceRoot: string;
   timeDimension?: OecdTimeDimension | undefined;
+  /** Edition published by the dataflow, independent of the datastructure revision. */
+  version?: string;
 }
 
 /** A single code in a codelist. */

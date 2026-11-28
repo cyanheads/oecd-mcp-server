@@ -17,12 +17,12 @@ import {
   availabilityKey,
   describeFindings,
   diagnoseKey,
-  isInvertedPeriodRange,
   normalizeDimensionKey,
   type OecdAvailability,
   parseAvailability,
   periodOutside,
   readAvailability,
+  validatePeriodBounds,
 } from '@/services/oecd-structure/availability.js';
 import { initStructureService } from '@/services/oecd-structure/oecd-structure-service.js';
 import type { OecdDimension } from '@/services/oecd-structure/types.js';
@@ -148,6 +148,25 @@ function availability(
 // ── parseAvailability ─────────────────────────────────────────────────────────
 
 describe('parseAvailability', () => {
+  it('retains the matching dataflow edition for callers comparing cached availability', () => {
+    const message = {
+      data: {
+        contentConstraints: [
+          {
+            constraintAttachment: {
+              dataflows: [
+                'urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow=OECD.STI.PIE:DSD_TIVA_MAINLV@DF_MAINLV(1.2)',
+              ],
+            },
+            cubeRegions: [],
+          },
+        ],
+      },
+    };
+    const flowRef = 'OECD.STI.PIE,DSD_TIVA_MAINLV@DF_MAINLV';
+    expect(parseAvailability(message, flowRef).dataflowVersions).toEqual(['1.2']);
+    expect(parseAvailability(message, 'OTHER,FLOW').dataflowVersions).toBeUndefined();
+  });
   it('reads every dimension’s codes, the time range as dates, and the observation count', () => {
     const read = parseAvailability(G1);
 
@@ -379,9 +398,9 @@ describe('normalizeDimensionKey', () => {
   });
 });
 
-// ── isInvertedPeriodRange ─────────────────────────────────────────────────────
+// ── validatePeriodBounds ──────────────────────────────────────────────────────
 
-describe('isInvertedPeriodRange', () => {
+describe('validatePeriodBounds', () => {
   it.each([
     ['2024', '2020'],
     ['2024-Q2', '2024-Q1'],
@@ -393,8 +412,11 @@ describe('isInvertedPeriodRange', () => {
     ['2024-03-01', '2024-02'],
     ['2024-S2', '2024-Q2'],
     ['2025-Q1', '2024'],
-  ])('returns true when %s starts after %s ends', (start, end) => {
-    expect(isInvertedPeriodRange(start, end)).toBe(true);
+  ])('rejects %s when it starts after %s ends', (start, end) => {
+    expect(validatePeriodBounds(start, end)).toEqual({
+      ok: false,
+      message: `start_period "${start}" is after end_period "${end}"`,
+    });
   });
 
   it.each([
@@ -407,8 +429,12 @@ describe('isInvertedPeriodRange', () => {
     ['2024-02-29', '2024-02'],
     ['2024-Q1', '2024-03'],
     ['2024-01-01', '2024-01-01'],
-  ])('returns false when %s and %s are ordered or overlapping', (start, end) => {
-    expect(isInvertedPeriodRange(start, end)).toBe(false);
+  ])('keeps ordered or overlapping bounds %s and %s', (startPeriod, endPeriod) => {
+    expect(validatePeriodBounds(startPeriod, endPeriod)).toEqual({
+      ok: true,
+      startPeriod,
+      endPeriod,
+    });
   });
 
   it.each([
@@ -418,8 +444,12 @@ describe('isInvertedPeriodRange', () => {
     ['2024-Q5', '2020'],
     ['2024', 'FY2020'],
     ['bad', 'also-bad'],
-  ])('returns false when either bound (%j, %j) is missing or unparseable', (start, end) => {
-    expect(isInvertedPeriodRange(start, end)).toBe(false);
+  ])('preserves missing or unsupported bounds %j and %j', (startPeriod, endPeriod) => {
+    expect(validatePeriodBounds(startPeriod, endPeriod)).toEqual({
+      ok: true,
+      startPeriod,
+      endPeriod,
+    });
   });
 });
 

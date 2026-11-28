@@ -440,6 +440,31 @@ describe('oecdDataflowResource dimension names', () => {
     expect(result.time_dimension).toMatchObject({ id: 'TIME_PERIOD', name: 'Time period' });
   });
 
+  it.each([
+    {
+      reply: () => new Response('Forbidden', { status: 403 }),
+      affected: ['ADJUSTMENT', 'TIME_PERIOD'],
+    },
+    { reply: () => Response.json({ data: { conceptSchemes: [] } }), affected: undefined },
+  ])(
+    'distinguishes a failed scheme from unpublished resource labels',
+    async ({ reply, affected }) => {
+      http.route(
+        {
+          match: `${FAKE_BASE}/dataflow/OECD.SDD.NAD/DSD_NAMAIN1@DF_QNA?references=datastructure`,
+          respond: () => Response.json(NAMELESS_DSD_RESPONSE),
+        },
+        { match: `${FAKE_BASE}/conceptscheme/OECD.SDD.NAD/CS_NA/1.0`, respond: reply },
+      );
+
+      const ctx = createMockContext({ errors: oecdDataflowResource.errors });
+      const result = resourceOutput.parse(await oecdDataflowResource.handler(params, ctx));
+      expect(result.dimensions[0]).toMatchObject({ id: 'ADJUSTMENT', name: 'ADJUSTMENT' });
+      expect(result.time_dimension).toMatchObject({ id: 'TIME_PERIOD', name: 'TIME_PERIOD' });
+      expect(result.concept_lookup_failed_for).toEqual(affected);
+    },
+  );
+
   it('reports no non_production status, since OECD annotates every flow alike', async () => {
     // The dataflow route answers with the dataflow entry beside its datastructure.
     routeReference({

@@ -689,10 +689,63 @@ describe('oecdGetDatasetInfo dimension names', () => {
     expect(text).toContain('Financial instruments and non-financial assets');
   });
 
+  it.each([true, false])(
+    'identifies the edition even if the list fails (list succeeds: %s)',
+    async (listOK) => {
+      const response = {
+        data: {
+          dataStructures: NAMELESS_DSD_RESPONSE.data.dataStructures,
+          dataflows: [
+            {
+              agencyID: 'OECD.SDD.NAD',
+              id: 'DSD_NAMAIN1@DF_QNA_EXPENDITURE_GROWTH_OECD',
+              version: '1.1',
+            },
+          ],
+        },
+      };
+      http.route(
+        { match: REFERENCE_URL.replace('?', '/1.1?'), respond: () => Response.json(response) },
+        { match: REFERENCE_URL, respond: () => Response.json(response) },
+        { match: SCHEME_URL, respond: () => Response.json(CONCEPT_SCHEME_RESPONSE) },
+        {
+          match: REFERENCE_URL.replace(/\?.*$/, '/all'),
+          respond: () =>
+            listOK
+              ? Response.json({
+                  data: {
+                    dataflows: [
+                      { ...response.data.dataflows[0], version: '1.0' },
+                      response.data.dataflows[0],
+                    ],
+                  },
+                })
+              : new Response('Forbidden', { status: 403 }),
+        },
+      );
+
+      const result = await runToolContract(oecdGetDatasetInfo, {
+        flow_ref: NAMAIN_FLOW_REF,
+        ...(listOK ? { version: '1.1' } : {}),
+      });
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({ version: '1.1' });
+      expect(result.content[0]).toMatchObject({ text: expect.stringContaining('Edition: 1.1') });
+      if (listOK) {
+        expect(result.structuredContent).toMatchObject({ published_versions: ['1.0', '1.1'] });
+        expect(result.content[0]).toMatchObject({
+          text: expect.stringContaining('Published editions: 1.0, 1.1'),
+        });
+      } else {
+        expect(result.structuredContent).not.toHaveProperty('published_versions');
+      }
+    },
+  );
+
   it('answers with ids rather than failing when the concept scheme is down', async () => {
     http.route(
       { match: REFERENCE_URL, respond: () => Response.json(NAMELESS_DSD_RESPONSE) },
-      { match: SCHEME_URL, respond: () => new Response('upstream boom', { status: 503 }) },
+      { match: SCHEME_URL, respond: () => new Response('Forbidden', { status: 403 }) },
     );
 
     const ctx = createMockContext({ errors: oecdGetDatasetInfo.errors });
@@ -700,6 +753,98 @@ describe('oecdGetDatasetInfo dimension names', () => {
     const result = await oecdGetDatasetInfo.handler(input, ctx);
 
     expect(result.dimensions.map((d) => d.name)).toEqual(['INSTR_ASSET', 'ADJUSTMENT']);
+    expect(result).toMatchObject({ concept_lookup_failed_for: ['INSTR_ASSET', 'ADJUSTMENT'] });
+    expect(oecdGetDatasetInfo.format!(result)[0]).toMatchObject({
+      text: expect.stringContaining('Concept-name lookup failed for INSTR_ASSET, ADJUSTMENT.'),
+    });
+  });
+
+  it('reports the published alternatives when an explicit edition does not exist', async () => {
+    const flow = { agencyID: 'OECD.SDD.NAD', id: 'DSD_NAMAIN1@DF_QNA_EXPENDITURE_GROWTH_OECD' };
+    http.route(
+      { match: REFERENCE_URL.replace('?', '/999.999?'), respond: noResultsFound },
+      { match: REFERENCE_URL, respond: () => Response.json(NAMELESS_DSD_RESPONSE) },
+      {
+        match: REFERENCE_URL.replace(/\?.*$/, '/all'),
+        respond: () =>
+          Response.json({
+            data: {
+              dataflows: [
+                { ...flow, version: '1.0' },
+                { ...flow, version: '1.1' },
+              ],
+            },
+          }),
+      },
+    );
+    const { error, text } = await toolWireFailure(oecdGetDatasetInfo, {
+      flow_ref: NAMAIN_FLOW_REF,
+      version: '999.999',
+    });
+    expect(error.data).toMatchObject({
+      reason: 'dataflow_not_found',
+      recovery: { hint: declaredRecovery(oecdGetDatasetInfo, 'dataflow_not_found') },
+    });
+    expect(error.message).toContain('edition 999.999. Published editions: 1.0, 1.1.');
+    expect(text).toContain('Published editions: 1.0, 1.1.');
+  });
+
+  it('reports a missing pinned concept scheme without using its latest revision', async () => {
+    const reference = REFERENCE_URL.replace('?', '/1.1?');
+    http.route(
+      { match: reference, respond: () => Response.json(NAMELESS_DSD_RESPONSE) },
+      { match: SCHEME_URL, respond: noResultsFound },
+      {
+        match: SCHEME_URL.replace(/\/1\.0$/, ''),
+        respond: () => Response.json(CONCEPT_SCHEME_RESPONSE),
+      },
+      { match: REFERENCE_URL.replace(/\?.*$/, '/all'), respond: noResultsFound },
+    );
+    const result = await runToolContract(oecdGetDatasetInfo, {
+      flow_ref: NAMAIN_FLOW_REF,
+      version: '1.1',
+    });
+    expect(result.structuredContent).toMatchObject({
+      version: '1.1',
+      concept_lookup_failed_for: ['INSTR_ASSET', 'ADJUSTMENT'],
+      dimensions: [{ name: 'INSTR_ASSET' }, { name: 'ADJUSTMENT' }],
+    });
+    expect(http.calls.map((call) => call.request.url)).not.toContain(
+      SCHEME_URL.replace(/\/1\.0$/, ''),
+    );
+  });
+
+  it('marks only the failed scheme’s time dimension while retaining other resolved labels', async () => {
+    const response = structuredClone(NAMELESS_DSD_RESPONSE);
+    Object.assign(
+      response.data.dataStructures[0]!.dataStructureComponents.dimensionList.timeDimensions[0]!,
+      {
+        conceptIdentity:
+          'urn:sdmx:org.sdmx.infomodel.conceptscheme.Concept=OECD.SDD.NAD:CS_TIME(1.0).TIME_PERIOD',
+      },
+    );
+    http.route(
+      { match: REFERENCE_URL, respond: () => Response.json(response) },
+      { match: SCHEME_URL, respond: () => Response.json(CONCEPT_SCHEME_RESPONSE) },
+      {
+        match: `${FAKE_BASE}/conceptscheme/OECD.SDD.NAD/CS_TIME/1.0`,
+        respond: () => Response.json({}),
+      },
+    );
+
+    const ctx = createMockContext({ errors: oecdGetDatasetInfo.errors });
+    const result = await oecdGetDatasetInfo.handler({ flow_ref: NAMAIN_FLOW_REF }, ctx);
+    expect(result).toMatchObject({
+      concept_lookup_failed_for: ['TIME_PERIOD'],
+      dimensions: [
+        { id: 'INSTR_ASSET', name: 'Financial instruments and non-financial assets', position: 1 },
+        { id: 'ADJUSTMENT', name: 'Adjustment', position: 2 },
+      ],
+      time_dimension: { id: 'TIME_PERIOD', name: 'TIME_PERIOD' },
+    });
+    expect(oecdGetDatasetInfo.format!(result)[0]).toMatchObject({
+      text: expect.stringContaining('Concept-name lookup failed for TIME_PERIOD.'),
+    });
   });
 });
 

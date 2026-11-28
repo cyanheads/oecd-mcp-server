@@ -24,19 +24,23 @@ import {
   availabilityKey,
   describeFindings,
   diagnoseKey,
-  isInvertedPeriodRange,
+  dotOnlyKeyNotice,
   normalizeDimensionKey,
   type OecdAvailability,
   periodOutside,
   readAvailability,
+  validatePeriodBounds,
 } from '@/services/oecd-structure/availability.js';
+import { dataflowVersionInput } from '@/services/oecd-structure/dataflow-version.js';
 import {
   getStructureService,
   isDataflowNotFound,
+  type OecdStructureService,
   parseFlowRef,
 } from '@/services/oecd-structure/oecd-structure-service.js';
 import type { OecdDimension } from '@/services/oecd-structure/types.js';
-import { formatTable } from '@/utils/format-table.js';
+import { applyCountLimit, optionalCountLimitSchema } from '@/utils/count-limit.js';
+import { formatRecordTable, formatTable } from '@/utils/format-table.js';
 
 /** A decoded observation row as it leaves the handler. */
 type OutputRow = Record<string, string | number | null>;
@@ -61,6 +65,12 @@ const INLINE_BUDGET_CHARS = 100_000;
 
 /** Maximum preview rows returned alongside a spilled DataCanvas handle. */
 const SPILL_PREVIEW_ROWS = 25;
+
+const LAST_N_LIMIT = {
+  cap: 100_000,
+  tool: 'oecd_query_dataset',
+  parameter: 'last_n_observations',
+};
 
 /** Alphabet of the suffix a generated canvas table name carries after `spilled_`. */
 const TABLE_NAME_HEX = '0123456789abcdef';
@@ -127,6 +137,57 @@ function hoistConstantColumns(result: OecdDataResult): {
   return { constantColumns, rows };
 }
 
+/** Compare requested codes only where the observations establish a reliable dimension binding. */
+function missingCodesNotice(
+  key: string,
+  structure: { dimensionIds: readonly string[]; version?: string },
+  result: OecdDataResult,
+): string[] {
+  if (availabilityKey(key) === 'all') return [];
+  const segments = key.split('.');
+  const decodedDimensions = new Set(Object.values(result.keyDimensionIds).filter(Boolean));
+  const completeCoordinates =
+    result.keyDimensionIds.length === segments.length && decodedDimensions.size === segments.length;
+  const differentEditions =
+    structure.version !== undefined &&
+    result.version !== undefined &&
+    structure.version !== result.version;
+  if (!completeCoordinates && differentEditions) return [];
+  const dimensionIds = completeCoordinates ? result.keyDimensionIds : structure.dimensionIds;
+  const codeColumns = new Map(result.columns.map(({ name, codeColumn }) => [name, codeColumn]));
+  const notices: string[] = [];
+  for (const [slot, segment] of segments.entries()) {
+    const dimension = dimensionIds[slot];
+    if (!dimension || segment.length === 0 || !decodedDimensions.has(dimension)) continue;
+    const missing = new Set(
+      segment
+        .split('+')
+        .filter(Boolean)
+        .map((code) => {
+          try {
+            return decodeURIComponent(code);
+          } catch {
+            return code;
+          }
+        }),
+    );
+    const column = codeColumns.get(dimension) ?? dimension;
+    for (const row of result.rows) {
+      const code = row[column];
+      if (typeof code === 'string') missing.delete(code);
+      if (missing.size === 0) break;
+    }
+    if (missing.size > 0) {
+      const codeSpan = (code: string) =>
+        SDMX_KEY_SAFE.test(code) ? `\`${code}\`` : escapeMarkdownInline(code);
+      notices.push(
+        `No observations returned for ${codeSpan(dimension)} codes ${[...missing].map(codeSpan).join(', ')}.`,
+      );
+    }
+  }
+  return notices;
+}
+
 // Passthrough schema — dimension keys are dynamic per-dataflow and cannot be
 // enumerated at schema definition time. z.object({}).passthrough() forwards all
 // fields to structuredContent without linter false-positives for undefined keys.
@@ -151,11 +212,18 @@ const DOWNLOAD_THROTTLE = /\b(downloads?|data ranges?)\b/i;
 
 /**
  * Which of OECD's two throttles refused the query, read off its own wording.
- * Only this tool splits them: the download cap clears by asking for less, and
- * this is the only surface whose caller has a key and a period to shrink.
+ * Only this tool splits them: its caller has a key and a period to shrink
+ * if OECD refused the range rather than the hourly quota.
  */
 function throttleReason(throttle: string): 'download_limit' | 'rate_limited' {
   return DOWNLOAD_THROTTLE.test(throttle) ? 'download_limit' : 'rate_limited';
+}
+
+/** Describe either form of a received Retry-After without inventing a delay. */
+function retryAfterHint(value: string): string | undefined {
+  if (/^\d+$/.test(value)) return `OECD's Retry-After specifies ${value} seconds.`;
+  if (Number.isFinite(Date.parse(value))) return `OECD's Retry-After specifies ${value}.`;
+  return undefined;
 }
 
 /**
@@ -167,6 +235,7 @@ const DIAGNOSIS_CAP_MS = 10_000;
 
 /** A query that matched no observations. */
 interface EmptyQuery {
+  dataVersion: string | undefined;
   endPeriod: string | undefined;
   flowRef: string;
   key: string;
@@ -174,6 +243,7 @@ interface EmptyQuery {
   /** The root that answered the query, and so holds the key's availability record. */
   serviceRoot: string;
   startPeriod: string | undefined;
+  version: string | undefined;
 }
 
 /**
@@ -196,8 +266,25 @@ async function emptyResultCause(
   query: EmptyQuery,
 ): Promise<string | undefined> {
   try {
-    const dsd = await getStructureService().fetchDataStructure(budget, query.flowRef);
-    const read = await readAvailability(budget, dsd, query.key, query.serviceRoot);
+    const dsd = await getStructureService().fetchDataStructure(
+      budget,
+      query.flowRef,
+      query.version,
+    );
+    if (
+      query.dataVersion !== undefined &&
+      dsd.version !== undefined &&
+      query.dataVersion !== dsd.version
+    )
+      return;
+    const read = await readAvailability(
+      budget,
+      query.dataVersion === undefined ? dsd : { ...dsd, version: query.dataVersion },
+      query.key,
+      query.serviceRoot,
+      undefined,
+      query.version,
+    );
     return read.kind === 'read' ? causeOf(read.availability, dsd.dimensions, query) : undefined;
   } catch (err) {
     if (budget.signal?.aborted || !(err instanceof McpError)) throw err;
@@ -251,6 +338,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       .describe(
         'Full flow reference — e.g. "OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I", or the bare "OECD.TAD.ARP,DF_AEI2024_DASHBOARD" form for a dataflow published without a datastructure prefix. Obtain from oecd_search_datasets and pass it through unchanged.',
       ),
+    version: dataflowVersionInput,
     key: z
       .string()
       .describe(
@@ -268,15 +356,10 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       .describe(
         'End of the time range — ISO period code such as "2023" or "2023-Q4". Omit to include up to the latest available period.',
       ),
-    last_n_observations: z
-      .number()
-      .int()
-      .min(1)
-      .max(100_000)
-      .optional()
-      .describe(
-        'Return only the most recent N observations per series (SDMX lastNObservations, 1 to 100,000). OECD applies lastNObservations to each series before start_period / end_period, so setting end_period before a series’s latest N periods excludes those observations — omit end_period when asking for the latest N observations.',
-      ),
+    last_n_observations: optionalCountLimitSchema(
+      LAST_N_LIMIT,
+      'Return only the most recent N observations per series (SDMX lastNObservations). OECD applies lastNObservations to each series before start_period / end_period, so setting end_period before a series’s latest N periods excludes those observations. Omit end_period when asking for the latest N observations.',
+    ),
     canvas_id: CanvasIdSchema.optional().describe(
       'Canvas ID from a prior oecd_query_dataset call — exactly 10 characters of letters, digits, hyphens, and underscores — to stage this result alongside that one if it spills; a result that fits inline comes back inline and leaves that canvas unchanged. Omit to let the server mint a canvas if this result needs one; a canvas_id comes back only when the result was large enough to spill.',
     ),
@@ -306,6 +389,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
         'Each dimension and attribute holding one value on every row of the whole result — the staged canvas table included, not only the rows returned here — keyed by component ID in structure order: dimensions in key order, then attributes. These components are left out of rows. Empty when every component varies.',
       ),
     query_flow_ref: z.string().describe('Flow reference used in this query.'),
+    version: z.string().optional().describe('Resolved dataflow edition.'),
     query_key: z.string().describe('Dimension key used in this query.'),
     query_start_period: z
       .string()
@@ -344,7 +428,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       .string()
       .optional()
       .describe(
-        'How to inspect and query the staged result, including its canvas_id and table name; present only after a spill.',
+        'Reports any applied latest-N reduction, dot-only key arity mismatch, requested codes absent from the observations, and how to query the full result after it spills.',
       ),
   },
   errors: [
@@ -378,7 +462,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     {
       reason: 'invalid_period',
       code: JsonRpcErrorCode.ValidationError,
-      when: 'start_period is after end_period, or OECD could not parse start_period or end_period.',
+      when: 'A period bound is an impossible calendar date, start_period is after end_period, or OECD could not parse start_period or end_period.',
       recovery:
         'Ensure start_period is on or before end_period and format each as an ISO code matching the dataflow frequency — "2022" for annual, "2022-Q1" for quarterly, "2022-01" for monthly.',
     },
@@ -394,11 +478,10 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     {
       reason: 'download_limit',
       code: JsonRpcErrorCode.RateLimited,
-      retryable: false,
+      retryable: true,
       when: 'OECD refused the query for exceeding its data-download or data-range limit.',
       recovery:
-        'Shrink the query itself — name fewer values per key segment, or set a shorter ' +
-        'start_period / end_period span — because waiting will not clear this limit.',
+        'If you hit the hourly download quota, wait for it to clear. If the request was oversized, name fewer values per key segment or set a shorter start_period / end_period span.',
     },
     {
       reason: 'canvas_not_found',
@@ -466,12 +549,9 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       );
     }
 
-    if (isInvertedPeriodRange(input.start_period, input.end_period)) {
-      throw ctx.fail(
-        'invalid_period',
-        `start_period "${input.start_period}" is after end_period "${input.end_period}"`,
-      );
-    }
+    const bounds = validatePeriodBounds(input.start_period, input.end_period);
+    if (!bounds.ok) throw ctx.fail('invalid_period', bounds.message);
+    const { startPeriod, endPeriod } = bounds;
 
     /**
      * Resolve a caller's canvas before the download, so a stale or mistyped id
@@ -504,16 +584,25 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     const budget = new UpstreamBudget(ctx.signal);
 
     let normalizedKey = input.key;
-    if (availabilityKey(input.key) !== 'all') {
-      let dimensionCount: number;
+    let structure: Awaited<ReturnType<OecdStructureService['fetchQueryStructure']>> | undefined;
+    if (input.version !== undefined || availabilityKey(input.key) !== 'all') {
       try {
-        dimensionCount = await getStructureService().fetchDimensionCount(budget, input.flow_ref);
+        structure = await getStructureService().fetchQueryStructure(
+          budget,
+          input.flow_ref,
+          input.version,
+        );
       } catch (err) {
         const e = err as Error;
         if (isDataflowNotFound(e)) {
-          throw ctx.fail('dataflow_not_found', `Dataflow not found: ${input.flow_ref}`, undefined, {
-            cause: e,
-          });
+          throw ctx.fail(
+            'dataflow_not_found',
+            input.version === undefined ? `Dataflow not found: ${input.flow_ref}` : e.message,
+            undefined,
+            {
+              cause: e,
+            },
+          );
         }
         const refusal = upstreamRefusal(e);
         if (refusal) {
@@ -522,7 +611,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
         throw err;
       }
 
-      const keyCheck = normalizeDimensionKey(input.key, dimensionCount);
+      const keyCheck = normalizeDimensionKey(input.key, structure.dimensionCount);
       if (!keyCheck.ok) {
         if (keyCheck.reason === 'too_short') {
           throw ctx.fail(
@@ -538,12 +627,18 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       normalizedKey = keyCheck.key;
     }
 
+    const lastN =
+      input.last_n_observations === undefined
+        ? undefined
+        : applyCountLimit(input.last_n_observations, LAST_N_LIMIT, ctx);
+    const lastNObservations = lastN?.applied;
+
     ctx.log.info('Querying OECD dataset', {
       flowRef: input.flow_ref,
       key: normalizedKey,
-      startPeriod: input.start_period,
-      endPeriod: input.end_period,
-      lastNObservations: input.last_n_observations,
+      startPeriod,
+      endPeriod,
+      lastNObservations,
     });
 
     let dataResult: OecdDataResult;
@@ -552,9 +647,13 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
         budget,
         input.flow_ref,
         normalizedKey,
-        input.start_period,
-        input.end_period,
-        input.last_n_observations,
+        startPeriod,
+        endPeriod,
+        lastNObservations,
+        {
+          ...(structure === undefined ? {} : { dataRoot: structure.dataRoot }),
+          ...(input.version === undefined ? {} : { version: input.version }),
+        },
       );
     } catch (err) {
       const e = err as Error;
@@ -584,10 +683,22 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       const throttle = throttleText(e);
       if (throttle !== undefined) {
         const reason = throttleReason(throttle);
+        const header =
+          e instanceof McpError ? (e.data?.retryAfter ?? e.data?.receivedRetryAfter) : undefined;
+        const retryAfter =
+          reason === 'download_limit' && typeof header === 'string' ? header : undefined;
+        const wait = retryAfter === undefined ? undefined : retryAfterHint(retryAfter);
         throw ctx.fail(
           reason,
           `OECD throttled the query for ${input.flow_ref}: ${throttle}`,
-          undefined,
+          retryAfter === undefined
+            ? undefined
+            : {
+                retryAfter,
+                ...(wait && {
+                  recovery: { hint: `${ctx.recoveryFor(reason).recovery.hint} ${wait}` },
+                }),
+              },
           { cause: e },
         );
       }
@@ -600,20 +711,45 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
 
     if (dataResult.rows.length === 0) {
       const cause = await emptyResultCause(budget.within(DIAGNOSIS_CAP_MS), {
-        endPeriod: input.end_period,
+        dataVersion: dataResult.version,
+        endPeriod,
         flowRef: input.flow_ref,
         key: normalizedKey,
-        lastNObservations: input.last_n_observations,
+        lastNObservations,
         serviceRoot: dataResult.serviceRoot,
-        startPeriod: input.start_period,
+        startPeriod,
+        version: input.version,
       });
       throw ctx.fail(
         'no_results',
-        `No observations found for key "${normalizedKey}" in ${input.flow_ref}${cause ? `: ${cause}.` : ''}`,
+        `No observations found for key "${normalizedKey}" in ${input.flow_ref}${input.version ? ` edition ${input.version}` : ''}${cause ? `: ${cause}.` : ''}`,
       );
     }
 
     ctx.log.info('OECD data fetched', { rowCount: dataResult.rows.length });
+
+    const notes = lastN?.notice ? [lastN.notice] : [];
+    const decodedDimensionIds = dataResult.keyDimensionIds;
+    const dimensionCount =
+      structure?.dimensionCount ??
+      (decodedDimensionIds.length > 0 &&
+      Object.values(decodedDimensionIds).filter(Boolean).length === decodedDimensionIds.length
+        ? decodedDimensionIds.length
+        : undefined);
+    if (dimensionCount !== undefined) {
+      const keyNotice = dotOnlyKeyNotice(input.key, dimensionCount);
+      if (keyNotice) notes.push(keyNotice);
+    }
+    if (structure !== undefined)
+      notes.push(...missingCodesNotice(normalizedKey, structure, dataResult));
+    const queryEcho = {
+      query_flow_ref: input.flow_ref,
+      ...(dataResult.version === undefined ? {} : { version: dataResult.version }),
+      query_key: normalizedKey,
+      ...(startPeriod !== undefined && { query_start_period: startPeriod }),
+      ...(endPeriod !== undefined && { query_end_period: endPeriod }),
+      ...(lastNObservations !== undefined && { query_last_n_observations: lastNObservations }),
+    };
 
     const { constantColumns, rows } = hoistConstantColumns(dataResult);
 
@@ -664,20 +800,15 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
          * are `[A-Za-z0-9_-]{10}`, generated table names `spilled_<hex>`), so the
          * notice reads the same on both surfaces and copies without escapes.
          */
-        ctx.enrich.notice(
+        notes.push(
           `The full result is in table \`${handle.tableName}\` on canvas \`${instance.canvasId}\`. Call oecd_dataframe_describe with this canvas_id to inspect columns, then oecd_dataframe_query with this canvas_id and SQL to query the full table.`,
         );
+        ctx.enrich.notice(notes.join(' '));
         return {
           rows: rows.slice(0, Math.min(SPILL_PREVIEW_ROWS, shown)),
           row_count: handle.rowCount,
           constant_columns: constantColumns,
-          query_flow_ref: input.flow_ref,
-          query_key: normalizedKey,
-          query_start_period: input.start_period,
-          query_end_period: input.end_period,
-          ...(input.last_n_observations !== undefined
-            ? { query_last_n_observations: input.last_n_observations }
-            : {}),
+          ...queryEcho,
           canvas_id: instance.canvasId,
           table_name: handle.tableName,
           truncated: true,
@@ -686,17 +817,13 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
       }
     }
 
+    if (notes.length > 0) ctx.enrich.notice(notes.join(' '));
+
     return {
       rows,
       row_count: rows.length,
       constant_columns: constantColumns,
-      query_flow_ref: input.flow_ref,
-      query_key: normalizedKey,
-      query_start_period: input.start_period,
-      query_end_period: input.end_period,
-      ...(input.last_n_observations !== undefined
-        ? { query_last_n_observations: input.last_n_observations }
-        : {}),
+      ...queryEcho,
       source: 'OECD' as const,
     };
   },
@@ -708,7 +835,6 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
      * otherwise be dropped from the table.
      */
     const allKeys = [...new Set(result.rows.flatMap((r) => Object.keys(r)))];
-    const rows = result.rows.map((r) => allKeys.map((k) => String(r[k] ?? '')));
     const constants = Object.entries(result.constant_columns);
 
     const periodRange =
@@ -732,6 +858,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
     const lines = [
       `**OECD Dataset Query** — ${result.row_count} observations`,
       `Query: ${escapeMarkdownInline(result.query_flow_ref)} key=${escapeMarkdownInline(result.query_key)}${periodRange}${lastN}`,
+      ...(result.version ? [`Edition: ${result.version}`] : []),
       note,
       scaled
         ? '> Values are scaled by the unit multiplier (UNIT_MULT) — divide `value` by `value_scale` for the figure as OECD published it.\n'
@@ -743,7 +870,7 @@ export const oecdQueryDataset = tool('oecd_query_dataset', {
             constants.map(([component, { code, label }]) => [component, code, label]),
           )}\n`
         : '',
-      result.rows.length > 0 ? formatTable(allKeys, rows) : '_(no rows)_',
+      result.rows.length > 0 ? formatRecordTable(allKeys, result.rows) : '_(no rows)_',
       '',
       `Source: ${result.source}`,
     ];

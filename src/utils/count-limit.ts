@@ -15,21 +15,26 @@ const clamps = createCounter(
   '{clamps}',
 );
 
-/** One tool's `limit`: the most a call serves and the default it gets. */
-export interface CountLimit {
+/** The cap a count input applies. */
+interface CountCap {
   /**
    * The most one call serves. A function when the cap follows other
    * configuration, which is then read on every call rather than at import.
    */
   readonly cap: number | (() => number);
-  /** Value a call that names no `limit` gets; below the cap. */
-  readonly defaultValue: number;
+  /** Input name used in notices. Defaults to `limit`. */
+  readonly parameter?: string;
   /** The tool the input belongs to, as the log line and the counter name it. */
   readonly tool: string;
 }
 
+/** A count input with a default. */
+export interface CountLimit extends CountCap {
+  readonly defaultValue: number;
+}
+
 /** The cap in force for this call. */
-export function capOf(limit: CountLimit): number {
+export function capOf(limit: CountCap): number {
   return typeof limit.cap === 'function' ? limit.cap() : limit.cap;
 }
 
@@ -53,8 +58,8 @@ function clamping(): boolean {
  * `maximum` and `description` getters), never at import, so a value from `.env`
  * applies however early this module loads.
  */
-export function countLimitSchema(limit: CountLimit, lead: string) {
-  const integer = z
+function countSchema(limit: CountCap) {
+  return z
     .number()
     .min(1)
     .check((payload) => {
@@ -79,15 +84,35 @@ export function countLimitSchema(limit: CountLimit, lead: string) {
         return clamping() ? undefined : capOf(limit);
       },
     });
-  return integer.default(limit.defaultValue).meta({
-    get description() {
-      const cap = capOf(limit).toLocaleString('en-US');
-      const def = limit.defaultValue.toLocaleString('en-US');
-      return clamping()
-        ? `${lead} Default ${def}; a larger value returns at most ${cap} and says so.`
-        : `${lead} Default ${def}, at most ${cap}.`;
-    },
-  });
+}
+
+/** Validate a defaulted count input, enforcing its maximum in strict mode. */
+export function countLimitSchema(limit: CountLimit, lead: string) {
+  return countSchema(limit)
+    .default(limit.defaultValue)
+    .meta({
+      get description() {
+        const cap = capOf(limit).toLocaleString('en-US');
+        const def = limit.defaultValue.toLocaleString('en-US');
+        return clamping()
+          ? `${lead} Default ${def}; a larger value returns at most ${cap} and says so.`
+          : `${lead} Default ${def}, at most ${cap}.`;
+      },
+    });
+}
+
+/** Validate a count whose omission is passed through to the upstream service. */
+export function optionalCountLimitSchema(limit: CountCap, lead: string) {
+  return countSchema(limit)
+    .optional()
+    .meta({
+      get description() {
+        const cap = capOf(limit).toLocaleString('en-US');
+        return clamping()
+          ? `${lead} A larger value is capped at ${cap} and the response reports the reduction.`
+          : `${lead} Maximum ${cap}.`;
+      },
+    });
 }
 
 /** A `limit` as one call applies it. */
@@ -107,13 +132,18 @@ export interface AppliedLimit {
  * that discloses it. Under `OECD_CLAMP_LIMITS=false` the schema has already
  * rejected anything above the cap, so this returns the request unchanged.
  */
-export function applyCountLimit(requested: number, limit: CountLimit, ctx: Context): AppliedLimit {
+export function applyCountLimit(requested: number, limit: CountCap, ctx: Context): AppliedLimit {
   const cap = capOf(limit);
   if (requested <= cap) return { applied: requested, notice: undefined };
-  ctx.log.info('Served limit at its per-call cap', { tool: limit.tool, requested, applied: cap });
+  const parameter = limit.parameter ?? 'limit';
+  ctx.log.info(`Served ${parameter} at its per-call cap`, {
+    tool: limit.tool,
+    requested,
+    applied: cap,
+  });
   clamps.add(1, { [ATTR_MCP_TOOL_NAME]: limit.tool, 'oecd.count_input.cap': cap });
   return {
     applied: cap,
-    notice: `\`limit\` ${requested} is above the per-call maximum of ${cap}; served ${cap}.`,
+    notice: `\`${parameter}\` ${requested} is above the per-call maximum of ${cap}; served ${cap}.`,
   };
 }

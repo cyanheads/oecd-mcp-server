@@ -72,19 +72,30 @@ function dsdResponse(): Response {
   });
 }
 
-/** Three observations; only the dimension label changes to force overflow. */
-function respond(large = false): void {
+/** Three observations; a large label forces overflow and a partial layout omits pinned dimensions. */
+function respond(large = false, layout: 'full' | 'partial' = 'full'): void {
+  const full = layout === 'full';
+  const prefix = full ? '0:0:0:0:' : '0:';
   const payload = {
     data: {
-      dataSets: [{ observations: { '0:0': [7], '0:1': [8], '0:2': [9] } }],
+      dataSets: [
+        { observations: { [`${prefix}0`]: [7], [`${prefix}1`]: [8], [`${prefix}2`]: [9] } },
+      ],
       structures: [
         {
           dimensions: {
             observation: [
+              ...(full ? [{ id: 'FREQ', values: [{ id: 'A', name: 'Annual' }] }] : []),
               {
                 id: 'REF_AREA',
                 values: [{ id: 'USA', name: large ? 'x'.repeat(110_000) : 'United States' }],
               },
+              ...(full
+                ? [
+                    { id: 'MEASURE', values: [{ id: 'GDP' }] },
+                    { id: 'UNIT_MEASURE', values: [{ id: 'USD' }] },
+                  ]
+                : []),
               { id: 'TIME_PERIOD', values: [{ id: '2020' }, { id: '2021' }, { id: '2022' }] },
             ],
           },
@@ -148,6 +159,19 @@ afterEach(async () => {
 });
 
 describe('query dataset real canvas lifecycle', () => {
+  it('uses the DSD order when observation metadata omits the pinned first dimension', async () => {
+    respond(false, 'partial');
+
+    const result = await runToolContract(oecdQueryDataset, input);
+
+    expect(result.structuredContent).toMatchObject({
+      row_count: 3,
+      constant_columns: { REF_AREA: { code: 'USA' } },
+    });
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(textOf(result)).not.toContain('No observations returned');
+  });
+
   it('preserves caller tables when an explicit canvas holds an inline result', async () => {
     const existing = await canvas.acquire(undefined, ctx);
     await existing.registerTable('keep', [{ value: 17 }], {

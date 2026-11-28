@@ -17,7 +17,7 @@ import type { OecdDataStructure } from '@/services/oecd-structure/types.js';
 export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_id}', {
   name: 'oecd-dataflow',
   description:
-    'Dimension metadata for a single OECD dataflow — same content as oecd_get_dataset_info. ' +
+    'Dimension metadata for the latest edition of a single OECD dataflow. ' +
     '{flow_id} is the combined {dsd_id}@{df_id} string with @ percent-encoded as %40 in the URI, ' +
     'or the bare {df_id} for the few dataflows OECD publishes without a datastructure prefix. ' +
     'Example: oecd://dataflow/OECD.SDD.NAD/DSD_NAAG%40DF_NAAG_I',
@@ -33,6 +33,7 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
   }),
   output: z.object({
     flow_ref: z.string().describe('Canonical flow reference reconstructed from URI params.'),
+    version: z.string().optional().describe('Resolved dataflow edition.'),
     name: z
       .string()
       .optional()
@@ -54,7 +55,7 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
               .string()
               .describe(
                 'Concept name for the dimension — e.g. "Reference area" for REF_AREA. ' +
-                  'Repeats the id when OECD publishes no concept for it.',
+                  'Repeats the id when no concept name was resolved.',
               ),
             position: z.number().describe('1-based position in the dot-delimited key.'),
             codelist_ref: z.string().optional().describe('Codelist reference, if any.'),
@@ -68,13 +69,19 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
         name: z
           .string()
           .describe(
-            'Concept name for the time dimension, repeating the id when none is published.',
+            'Concept name for the time dimension, repeating the id when no name was resolved.',
           ),
         position: z.number().describe('Position in the key after all regular dimensions.'),
       })
       .optional()
       .describe(
         'Time dimension, if present — used for start_period/end_period filtering in oecd_query_dataset.',
+      ),
+    concept_lookup_failed_for: z
+      .array(z.string().describe('Dimension ID whose concept scheme could not be read.'))
+      .optional()
+      .describe(
+        'Dimensions affected by a failed concept-name lookup, including time when affected.',
       ),
     key_example: z
       .string()
@@ -227,6 +234,7 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
 
     return {
       flow_ref: flowRef,
+      ...(dsd.version === undefined ? {} : { version: dsd.version }),
       ...(dsd.name !== undefined ? { name: dsd.name } : {}),
       ...(dsd.description !== undefined ? { description: dsd.description } : {}),
       dimensions: dsd.dimensions.map((d) => ({
@@ -243,6 +251,9 @@ export const oecdDataflowResource = resource('oecd://dataflow/{agency_id}/{flow_
           }
         : undefined,
       key_example: keyExample,
+      ...(dsd.conceptLookupFailedFor
+        ? { concept_lookup_failed_for: dsd.conceptLookupFailedFor }
+        : {}),
       ...(dsd.resources !== undefined ? { resources: dsd.resources } : {}),
       source: 'OECD' as const,
     };

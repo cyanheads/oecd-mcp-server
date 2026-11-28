@@ -2,7 +2,7 @@
 
 **Server:** oecd-mcp-server
 **Version:** 0.8.0
-**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.22`
+**Framework:** [@cyanheads/mcp-ts-core](https://www.npmjs.com/package/@cyanheads/mcp-ts-core) `^0.13.24`
 **Engines:** Bun ≥1.4.4, Node ≥24.0.0
 **MCP SDK:** `@modelcontextprotocol/server` `^2.4.0`
 **Zod:** `^4.6.7`
@@ -126,9 +126,9 @@ export function getServerConfig() {
 }
 ```
 
-`parseEnvConfig` maps Zod schema paths → env var names so errors name the variable (`OECD_BASE_URL`) not the path (`baseUrl`). Throws `ConfigurationError`, which the framework prints as a clean startup banner.
+`parseEnvConfig` loads `.env` before it reads server settings, including at import time under Node. It maps Zod schema paths to env var names so validation errors name the variable (`OECD_BASE_URL`). The framework renders a `ConfigurationError` thrown in `setup()` as a startup banner. An import-time validation failure, such as the module-scope `disabledTool()` gate, exits with a stack trace.
 
-For env booleans use `z.stringbool()`, never `z.coerce.boolean()` — `Boolean("false")` is `true`, so a coerced flag can't be disabled through the environment. `z.stringbool()` parses `true/false/1/0/yes/no/on/off` and rejects anything else, so `=false` actually disables.
+Use `z.stringbool()` for env booleans. It accepts `true/false`, `1/0`, `yes/no`, `on/off`, `y/n`, and `enabled/disabled` in any case. `z.coerce.boolean()` reads the string `"false"` as true.
 
 ### Server identity and instructions
 
@@ -187,7 +187,7 @@ Handlers receive a unified `ctx` object. Key properties:
 
 Handlers throw — the framework catches, classifies, and formats.
 
-**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive `ctx.fail(reason, …)` typed against the reason union. TypeScript catches typos at compile time, `data.reason` is auto-populated for observability, linter enforces conformance against the handler body. `recovery` is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. The framework puts it on the wire whenever a failure carrying that `reason` arrives without a hint — a bare `ctx.fail('reason')` or a service throw with `data: { reason }` — as `data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim; override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. Every error envelope also carries `data.requestId`, the id the server's log records for that call carry, and `content[]` closes with `(reason … · request <id>)`. Mark an entry the service layer throws with `thrownBy: 'service'` so `error-contract-unthrown` skips it — lint-only metadata, nothing at runtime reads it. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
+**Recommended: typed error contract.** Declare `errors: [{ reason, code, when, recovery, retryable?, severity?, thrownBy? }]` on `tool()` / `resource()` to receive `ctx.fail(reason, …)` typed against the reason union. TypeScript catches typos at compile time, `data.reason` is auto-populated for observability, linter enforces conformance against the handler body. `recovery` is required (≥ 5 words, lint-validated) — the single source of truth for the agent's next move. The framework puts it on the wire whenever a failure carrying that `reason` arrives without a hint — a bare `ctx.fail('reason')` or a service throw with `data: { reason }` — as `data.recovery.hint`, mirrored into `content[]` text unless the message already contains it verbatim; override with an explicit `{ recovery: { hint: '...' } }` when dynamic runtime context matters. A declared `retryable` also reaches these failures as `data.retryable` unless the throw sets its own value. Every error envelope also carries `data.requestId`, the id the server's log records for that call carry, and `content[]` closes with `(reason … · request <id>)`. Mark an entry the service layer throws with `thrownBy: 'service'` so `error-contract-unthrown` skips it — lint-only metadata, nothing at runtime reads it. Baseline codes (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`, `RequestCancelled`) bubble freely and don't need declaring.
 
 A reason resolved at runtime — `ctx.fail(refusal.reason, …)`, as every OECD-reaching definition here does for the six upstream reasons — puts unknown reasons in play, so both conformance scans bail on that whole definition. The contracts are held together by `tests/error-contract-coherence.test.ts` instead.
 
@@ -221,7 +221,7 @@ throw new Error('Item not found');           // → NotFound
 throw new Error('Invalid query format');     // → ValidationError
 
 // McpError — when no factory exists for the code
-import { McpError, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 throw new McpError(JsonRpcErrorCode.InitializationFailed, 'Connection failed', { pool: 'primary' });
 ```
 
@@ -252,7 +252,7 @@ src/
     canvas-accessor/
       canvas-accessor.ts                # DataCanvas instance accessor for tools
   utils/
-    count-limit.ts                      # limit inputs served at a per-call cap with a notice (OECD_CLAMP_LIMITS)
+    count-limit.ts                      # limit and last_n_observations caps and notices (OECD_CLAMP_LIMITS)
     word-start-text.ts                  # Case-insensitive token matching anchored at word starts
     format-table.ts                     # Markdown table rendering for content[]
   mcp-server/
@@ -420,7 +420,7 @@ security: false                            # optional — true ONLY for a source
 ```ts
 // Framework — z is re-exported, no separate zod import needed
 import { tool, z } from '@cyanheads/mcp-ts-core';
-import { McpError, JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 
 // Server's own code — via path alias
 import { getMyService } from '@/services/my-domain/my-service.js';

@@ -54,6 +54,8 @@ export interface OecdDataResult {
    * the rows, so a downstream consumer sees the full shape without sampling.
    */
   columns: OecdColumn[];
+  /** Non-time dimensions indexed by SDMX key slot. A missing slot has no known dimension ID. */
+  keyDimensionIds: readonly (string | undefined)[];
   rowCount: number;
   /** Sorted by each observation-level dimension's code in key order, `TIME_PERIOD` last. */
   rows: DecodedRow[];
@@ -66,4 +68,6 @@ export interface OecdDataResult {
    */
   serviceRoot: string;
   source: 'OECD';
+  /** Edition identified by the response's Dataflow URN or by an explicit request. */
+  version?: string;
 }

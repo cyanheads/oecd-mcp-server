@@ -15,10 +15,13 @@ import {
   availabilityKey,
   describeFindings,
   diagnoseKey,
+  dotOnlyKeyNotice,
   normalizeDimensionKey,
   type OecdAvailability,
   readAvailability,
+  validatePeriodBounds,
 } from '@/services/oecd-structure/availability.js';
+import { dataflowVersionInput } from '@/services/oecd-structure/dataflow-version.js';
 import {
   getStructureService,
   isDataflowNotFound,
@@ -53,9 +56,17 @@ function keyNotes(
   availability: OecdAvailability,
   dsd: OecdDataStructure,
   key: string | undefined,
+  hasPeriod: boolean,
 ): string[] {
   const clauses = describeFindings(diagnoseKey(availability, dsd.dimensions, key ?? 'all'));
   if (availability.observationCount === 0) {
+    if (hasPeriod) {
+      return [
+        availabilityKey(key) === 'all'
+          ? 'OECD records no observations for this dataflow in the requested period.'
+          : 'OECD records no observations for the requested period under this key.',
+      ];
+    }
     if (availabilityKey(key) === 'all') return ['OECD records no observations for this dataflow.'];
     return [
       `The key matches no series: ${clauses.length > 0 ? clauses.join('; ') : 'its pinned segments match no series together'}.`,
@@ -78,6 +89,7 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       .describe(
         'Full flow reference — e.g. "OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I", or the bare "OECD.TAD.ARP,DF_AEI2024_DASHBOARD" form for a dataflow published without a datastructure prefix. Obtain from oecd_search_datasets.',
       ),
+    version: dataflowVersionInput,
     dimension_id: z
       .string()
       .describe(
@@ -107,6 +119,18 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       .describe(
         'Dot-delimited key in the oecd_query_dataset form, one segment per dimension in the order oecd_get_dataset_info gives — empty for a wildcard, "+" between codes, or "all". Lists the codes of this dimension that have data given the key\'s other segments, so pass the key you plan to query. Implies available_only.',
       ),
+    start_period: z
+      .string()
+      .optional()
+      .describe(
+        'Inclusive lower SDMX period bound, e.g. "2024" or "2024-Q1". A nonblank value implies available_only.',
+      ),
+    end_period: z
+      .string()
+      .optional()
+      .describe(
+        'Inclusive upper SDMX period bound, e.g. "2024" or "2024-Q4". A nonblank value implies available_only.',
+      ),
     limit: countLimitSchema(LIMIT, 'Maximum codes to return.'),
     offset: z
       .number()
@@ -119,6 +143,7 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
   }),
   output: z.object({
     flow_ref: z.string().describe('The flow reference this dimension belongs to.'),
+    version: z.string().optional().describe('Resolved dataflow edition.'),
     dimension_id: z.string().describe('The dimension whose codes are listed.'),
     codes: z
       .array(
@@ -150,20 +175,28 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       .describe(
         'True when codes holds only the codes with data, as OECD records them. False for the whole codelist, including when availability was asked for and could not be read — the notice then says why.',
       ),
+    query_start_period: z
+      .string()
+      .optional()
+      .describe('Requested lower period bound, present when applied to availability.'),
+    query_end_period: z
+      .string()
+      .optional()
+      .describe('Requested upper period bound, present when applied to availability.'),
     time_range: z
       .object({
-        start: z.string().describe('First day the observations cover, YYYY-MM-DD, inclusive.'),
-        end: z.string().describe('Last day the observations cover, YYYY-MM-DD, inclusive.'),
+        start: z.string().describe('First day of OECD’s reported coverage, YYYY-MM-DD, inclusive.'),
+        end: z.string().describe('Last day of OECD’s reported coverage, YYYY-MM-DD, inclusive.'),
       })
       .optional()
       .describe(
-        'Span of the observations under key (the whole dataflow without one). Present when available_only applied and some series matches.',
+        'Time range reported by OECD, when available. Can describe source coverage beyond the applied period bounds.',
       ),
     observation_count: z
       .number()
       .optional()
       .describe(
-        'Observations under key (the whole dataflow without one), as OECD counts them. Present when available_only applied and OECD reported a count.',
+        'Observations under the key and applied period bounds, as OECD counts them. Present when available_only applied and OECD reported a count.',
       ),
     source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
   }),
@@ -214,11 +247,25 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
         'then use one of the returned dimension IDs.',
     },
     {
+      reason: 'codelist_not_found',
+      code: JsonRpcErrorCode.NotFound,
+      when: 'OECD does not serve the codelist revision referenced by an explicitly selected edition.',
+      recovery:
+        'Inspect the published editions with oecd_get_dataset_info and choose an edition whose codelist is available.',
+    },
+    {
       reason: 'invalid_key',
       code: JsonRpcErrorCode.ValidationError,
       when: 'The key holds a character outside the SDMX key set, fewer dot-delimited segments than the dataflow has dimensions, or a non-empty segment past the dimension count.',
       recovery:
         'Use oecd_get_dataset_info to check dimension order and count, then rebuild the key with one segment per dimension — empty for a wildcard, "+" between codes — or pass "all".',
+    },
+    {
+      reason: 'invalid_period',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A period bound is an impossible calendar date or start_period is after end_period.',
+      recovery:
+        'Use valid SDMX period codes such as "2024", "2024-Q1", or "2024-02-29", with start_period on or before end_period.',
     },
     {
       reason: 'rate_limited',
@@ -299,7 +346,10 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
         `Key "${key}" holds a character outside the SDMX key set — letters, digits, ".", "+", "_", "-", and "%"`,
       );
     }
-    const availableOnly = input.available_only || key !== undefined;
+    const bounds = validatePeriodBounds(input.start_period, input.end_period);
+    if (!bounds.ok) throw ctx.fail('invalid_period', bounds.message);
+    const hasPeriod = bounds.startPeriod !== undefined || bounds.endPeriod !== undefined;
+    const availableOnly = input.available_only || key !== undefined || hasPeriod;
     const parentFilter = input.parent?.trim() || undefined;
     const limit = applyCountLimit(input.limit, LIMIT, ctx);
 
@@ -334,10 +384,13 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
     // Fetch the datastructure to find the codelist ref for this dimension
     let dsd: OecdDataStructure;
     try {
-      dsd = await getStructureService().fetchDataStructure(budget, input.flow_ref);
+      dsd = await getStructureService().fetchDataStructure(budget, input.flow_ref, input.version);
     } catch (err) {
-      if (isDataflowNotFound(err as Error)) {
-        throw ctx.fail('dataflow_not_found', `Dataflow not found: ${input.flow_ref}`);
+      if (err instanceof Error && isDataflowNotFound(err)) {
+        throw ctx.fail(
+          'dataflow_not_found',
+          input.version === undefined ? `Dataflow not found: ${input.flow_ref}` : err.message,
+        );
       }
       throw asUpstreamFailure(err);
     }
@@ -361,7 +414,7 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
           'invalid_key',
           checked.reason === 'too_short'
             ? `Key "${key}" has ${checked.segmentCount} ${checked.segmentCount === 1 ? 'segment' : 'segments'}, but ${input.flow_ref} has ${checked.dimensionCount} dimensions — one segment each, empty for a wildcard`
-            : `Key "${key}" has ${checked.segmentCount} segments, but ${input.flow_ref} has ${checked.dimensionCount} dimensions — drop the extra segments; time is not a key segment (pass start_period / end_period on oecd_query_dataset)`,
+            : `Key "${key}" has ${checked.segmentCount} segments, but ${input.flow_ref} has ${checked.dimensionCount} dimensions — time is not a key segment; pass time filters via start_period / end_period`,
         );
       }
       normalizedKey = checked.key;
@@ -379,8 +432,23 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       const clAgencyId = clCommaIdx >= 0 ? dim.codelistRef.slice(0, clCommaIdx) : parts.agencyId;
       const codelistId = clCommaIdx >= 0 ? dim.codelistRef.slice(clCommaIdx + 1) : dim.codelistRef;
       codelistRead = getStructureService()
-        .fetchCodelist(budget, clAgencyId, codelistId, dsd.serviceRoot, dim.codelistVersion)
+        .fetchCodelist(
+          budget,
+          clAgencyId,
+          codelistId,
+          dsd.serviceRoot,
+          dim.codelistVersion,
+          input.version === undefined ? 'latest' : 'fail',
+        )
         .catch((err: unknown) => {
+          if (
+            input.version !== undefined &&
+            dim.codelistVersion !== undefined &&
+            err instanceof Error &&
+            isDataflowNotFound(err)
+          ) {
+            throw ctx.fail('codelist_not_found', err.message, undefined, { cause: err });
+          }
           throw asUpstreamFailure(err);
         });
     }
@@ -396,9 +464,11 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       await Promise.all([
         codelistRead,
         availableOnly
-          ? readAvailability(budget, dsd, normalizedKey).catch((err: unknown) => {
-              throw asUpstreamFailure(err);
-            })
+          ? readAvailability(budget, dsd, normalizedKey, dsd.dataRoot, bounds, input.version).catch(
+              (err: unknown) => {
+                throw asUpstreamFailure(err);
+              },
+            )
           : undefined,
       ]);
     const availability = read?.kind === 'read' ? read.availability : undefined;
@@ -412,8 +482,14 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
           ? `Availability could not be read (${read.failure}), so this lists the whole codelist, which can hold codes this dataflow has no data for.`
           : `Availability could not be read (${read.failure}), and this dimension has no codelist to list instead.`,
       );
+      if (hasPeriod) notes.push('The requested period was not applied.');
     }
-    if (availability) notes.push(...keyNotes(availability, dsd, normalizedKey));
+    if (availability) {
+      const keyNotice =
+        key === undefined ? undefined : dotOnlyKeyNotice(key, dsd.dimensions.length);
+      if (keyNotice) notes.push(keyNotice);
+      notes.push(...keyNotes(availability, dsd, normalizedKey, hasPeriod));
+    }
     if (!codelist && !read) {
       notes.push(
         'This dimension has no fixed codelist — it accepts dynamic or free-form values. Pass available_only: true to list the values that have data in this dataflow.',
@@ -485,6 +561,7 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
 
     return {
       flow_ref: input.flow_ref,
+      ...(dsd.version === undefined ? {} : { version: dsd.version }),
       dimension_id: input.dimension_id,
       codes: page.map((c) => ({
         id: c.id,
@@ -493,6 +570,9 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
       })),
       code_count: page.length,
       available_only: availability !== undefined,
+      ...(availability &&
+        bounds.startPeriod !== undefined && { query_start_period: bounds.startPeriod }),
+      ...(availability && bounds.endPeriod !== undefined && { query_end_period: bounds.endPeriod }),
       ...(availability?.timeRange && {
         time_range: { start: availability.timeRange.start, end: availability.timeRange.end },
       }),
@@ -505,15 +585,29 @@ export const oecdGetDimensionValues = tool('oecd_get_dimension_values', {
 
   format: (result) => {
     const hasParent = result.codes.some((c) => c.parent !== undefined);
+    const start = result.query_start_period;
+    const end = result.query_end_period;
+    const period =
+      start !== undefined
+        ? end !== undefined
+          ? `${escapeMarkdownInline(start)} to ${escapeMarkdownInline(end)}`
+          : `from ${escapeMarkdownInline(start)}`
+        : end !== undefined
+          ? `through ${escapeMarkdownInline(end)}`
+          : undefined;
     const lines = [
       `**Dimension: ${escapeMarkdownInline(result.dimension_id)}** (flow: ${escapeMarkdownInline(result.flow_ref)})`,
+      ...(result.version ? [`Edition: ${result.version}`] : []),
       `${result.code_count} ${result.code_count === 1 ? 'code' : 'codes'} in this page, ${
         result.available_only
           ? 'only codes with data in this dataflow (available_only: true)'
           : 'from the whole codelist (available_only: false)'
       }`,
+      ...(period !== undefined ? [`Period: ${period}`] : []),
       ...(result.time_range
-        ? [`Time range: ${result.time_range.start} to ${result.time_range.end}`]
+        ? [
+            `${period === undefined ? 'Time range' : 'OECD time range'}: ${result.time_range.start} to ${result.time_range.end}`,
+          ]
         : []),
       ...(result.observation_count !== undefined
         ? [`Observations: ${result.observation_count}`]

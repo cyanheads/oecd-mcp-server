@@ -221,6 +221,34 @@ describe('oecdGetDimensionValues', () => {
     }
   });
 
+  it('reports a missing pinned codelist without using its latest revision', async () => {
+    const http = createFetchMock();
+    const reference = REFERENCE_URL.replace('?', '/1.1?');
+    const pinned = `${FAKE_BASE}/codelist/OECD/CL_FREQ/1.0`;
+    http.route(
+      { match: reference, respond: () => Response.json(DSD_RESPONSE) },
+      { match: pinned, respond: noResultsFound },
+      {
+        match: `${FAKE_BASE}/codelist/OECD/CL_FREQ`,
+        respond: () => Response.json(CODELIST_RESPONSE),
+      },
+    );
+    http.install();
+    try {
+      const { error, text } = await toolWireFailure(oecdGetDimensionValues, {
+        flow_ref: 'OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I',
+        dimension_id: 'FREQ',
+        version: '1.1',
+      });
+      const hint = declaredRecovery(oecdGetDimensionValues, 'codelist_not_found');
+      expect(error.data).toMatchObject({ reason: 'codelist_not_found', recovery: { hint } });
+      expect(text).toContain(hint);
+      expect(http.calls.map((call) => call.request.url)).toEqual([reference, pinned]);
+    } finally {
+      http.restore();
+    }
+  });
+
   it('throws ctx.fail(invalid_flow_ref) for malformed flow_ref', async () => {
     // No request is issued for a string that is not a flow reference, so
     // "not found" would assert something this tool never checked — and its hint
@@ -973,6 +1001,214 @@ describe('oecdGetDimensionValues available_only and key', () => {
     expect(urls).toEqual(expect.arrayContaining([REFERENCE_URL, CODELIST_URL, availabilityUrl()]));
   });
 
+  it('uses the same unbounded availability URL for an omitted key and explicit all', async () => {
+    const http = serve({ availability: json(ALL_SERIES) });
+    const base = { flow_ref: FLOW_REF, dimension_id: 'FREQ' };
+    const withoutKey = await runToolContract(oecdGetDimensionValues, {
+      ...base,
+      available_only: true,
+    });
+    const withAll = await runToolContract(oecdGetDimensionValues, { ...base, key: 'all' });
+
+    expect(withAll.structuredContent).toEqual(withoutKey.structuredContent);
+    expect(textOf(withAll)).toEqual(textOf(withoutKey));
+    expect(http.requestsTo('/availableconstraint/').map(({ url }) => url)).toEqual([
+      availabilityUrl(),
+      availabilityUrl(),
+    ]);
+  });
+
+  it('keeps a dot alias exact on a two-dimension flow', async () => {
+    const http = serve({ availability: json(ALL_SERIES) });
+    const result = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      key: '.',
+    });
+    expect(result.structuredContent).toMatchObject({ code_count: 3, available_only: true });
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(http.requestsTo('/availableconstraint/').map(({ url }) => url)).toEqual([
+      availabilityUrl(),
+    ]);
+  });
+
+  it('combines dot-only key arity and paging notices', async () => {
+    const structure = structuredClone(DSD_RESPONSE);
+    const dimensions =
+      structure.data.dataStructures[0]!.dataStructureComponents.dimensionList.dimensions;
+    dimensions.push({
+      id: 'REF_AREA',
+      position: 2,
+      name: 'Reference area',
+      localRepresentation: {},
+    });
+    const http = serve({ availability: json(ALL_SERIES), datastructure: json(structure) });
+    const result = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      key: '%2E',
+      limit: 1,
+    });
+    const note =
+      'The dot-only key has 2 segments; this dataflow has 3 dimensions. Selected all series.';
+    expect(result.structuredContent).toMatchObject({
+      code_count: 1,
+      available_only: true,
+      notice: expect.stringContaining(note),
+    });
+    expect(renderedOf(result)).toContain(note);
+    expect(renderedOf(result)).toContain('Showing codes 1–1 of 3');
+    expect(http.requestsTo('/availableconstraint/').map(({ url }) => url)).toEqual([
+      availabilityUrl(),
+    ]);
+  });
+
+  it('filters by each period bound and caches availability separately for each window', async () => {
+    const http = createFetchMock();
+    const coverage = { start: '1990-01-01', end: '2024-12-31' };
+    const byStart = `${availabilityUrl()}&startPeriod=2024-02-29`;
+    const byEnd = `${availabilityUrl()}&endPeriod=1990-Q1`;
+    http.route(
+      { match: REFERENCE_URL, respond: () => cacheableJson(DSD_RESPONSE) },
+      { match: CODELIST_URL, respond: () => cacheableJson(CODELIST_RESPONSE) },
+      {
+        match: byStart,
+        respond: () => cacheableJson(availabilityOf({ FREQ: ['Q', 'M'] }, 8, coverage)),
+      },
+      { match: byEnd, respond: () => cacheableJson(availabilityOf({ FREQ: ['A'] }, 1, coverage)) },
+    );
+    http.install();
+    const base = { flow_ref: FLOW_REF, dimension_id: 'FREQ', limit: 1 };
+    try {
+      const start = { ...base, start_period: '2024-02-29' };
+      const first = await runToolContract(oecdGetDimensionValues, start);
+      const second = await runToolContract(oecdGetDimensionValues, {
+        ...base,
+        end_period: '1990-Q1',
+      });
+      const page = await runToolContract(oecdGetDimensionValues, { ...start, offset: 1 });
+      const pastEnd = await runToolContract(oecdGetDimensionValues, { ...start, offset: 2 });
+
+      expect(http.calls).toHaveLength(4);
+      expect(first.structuredContent).toMatchObject({
+        codes: [{ id: 'Q', name: 'Quarterly' }],
+        available_only: true,
+        query_start_period: '2024-02-29',
+        time_range: coverage,
+        observation_count: 8,
+      });
+      expect(first.structuredContent).not.toHaveProperty('query_end_period');
+      expect(textOf(first)).toContain('Period: from 2024-02-29');
+      expect(textOf(first)).toContain('OECD time range: 1990-01-01 to 2024-12-31');
+      expect(second.structuredContent).toMatchObject({
+        codes: [{ id: 'A', name: 'Annual' }],
+        available_only: true,
+        query_end_period: '1990-Q1',
+        observation_count: 1,
+      });
+      expect(second.structuredContent).not.toHaveProperty('query_start_period');
+      expect(textOf(second)).toContain('Period: through 1990-Q1');
+      expect(page.structuredContent).toMatchObject({ codes: [{ id: 'M', name: 'Monthly' }] });
+      expect(textOf(page)).toContain('| M | Monthly |');
+      expect(pastEnd.structuredContent).toMatchObject({
+        codes: [],
+        code_count: 0,
+        available_only: true,
+      });
+    } finally {
+      http.restore();
+    }
+  });
+
+  it('discloses an unpinned availability response for a different edition and keeps the codelist', async () => {
+    const datastructure = structuredClone(DSD_RESPONSE);
+    Object.assign(datastructure.data, { dataflows: [{ version: '1.0' }] });
+    const availability = structuredClone(ALL_SERIES) as {
+      data: { contentConstraints: Record<string, unknown>[] };
+    };
+    const [agency, id] = FLOW_REF.split(',');
+    Object.assign(availability.data.contentConstraints[0]!, {
+      constraintAttachment: {
+        dataflows: [`urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow=${agency}:${id}(1.1)`],
+      },
+    });
+    const http = serve({ availability: json(availability), datastructure: json(datastructure) });
+    const result = await runToolContract(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      start_period: '1950',
+    });
+    const clause = 'OECD returned availability for edition 1.1 instead of 1.0';
+    expect(result.structuredContent).toMatchObject({
+      version: '1.0',
+      available_only: false,
+      notice: expect.stringContaining(clause),
+    });
+    expect(result.structuredContent).not.toHaveProperty('observation_count');
+    expect(result.structuredContent).not.toHaveProperty('query_start_period');
+    expect(renderedOf(result)).toContain(clause);
+    expect(http.requestsTo('/availableconstraint/')).toHaveLength(1);
+  });
+
+  it('distinguishes an empty period result with OECD coverage metadata from a failed read', async () => {
+    const http = serve({
+      availability: json(availabilityOf({}, 0, { start: '1990-01-01', end: '2024-12-31' })),
+    });
+    const input = {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      key: 'Q.',
+      start_period: '1950',
+      end_period: '1950',
+    };
+    const empty = await runToolContract(oecdGetDimensionValues, input);
+
+    expect(http.requestsTo('/availableconstraint/').map(({ url }) => url)).toEqual([
+      `${availabilityUrl('Q.')}&startPeriod=1950&endPeriod=1950`,
+    ]);
+    expect(empty.structuredContent).toMatchObject({
+      available_only: true,
+      codes: [],
+      observation_count: 0,
+      query_start_period: '1950',
+      query_end_period: '1950',
+      notice: 'OECD records no observations for the requested period under this key.',
+    });
+    expect(textOf(empty)).toContain('Period: 1950 to 1950');
+    expect(renderedOf(empty)).toContain('OECD records no observations for the requested period');
+
+    http.restore();
+    initStructureService();
+    serve({ availability: { body: 'Refused', kind: 'answer', status: 500 } });
+    const failed = await runToolContract(oecdGetDimensionValues, input);
+    expect(failed.structuredContent).toMatchObject({ available_only: false, code_count: 3 });
+    expect(failed.structuredContent).not.toHaveProperty('query_start_period');
+    expect(failed.structuredContent).not.toHaveProperty('query_end_period');
+    expect(failed.structuredContent).not.toHaveProperty('observation_count');
+    expect(renderedOf(failed)).toContain('Availability could not be read (OECD answered HTTP 500)');
+    expect(renderedOf(failed)).toContain('The requested period was not applied.');
+  });
+
+  it('rejects an impossible day in a single bound before making an upstream request', async () => {
+    const http = serve({});
+    const { error, text } = await toolWireFailure(oecdGetDimensionValues, {
+      flow_ref: FLOW_REF,
+      dimension_id: 'FREQ',
+      end_period: '1900-02-29',
+    });
+    expect(http.requests).toHaveLength(0);
+    expect(error.data.reason).toBe('invalid_period');
+    expect(error).toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      message: 'end_period "1900-02-29" is not a valid calendar date',
+      data: {
+        reason: 'invalid_period',
+        recovery: { hint: declaredRecovery(oecdGetDimensionValues, 'invalid_period') },
+      },
+    });
+    expect(text).toContain('1900-02-29');
+  });
+
   it('sends the codelist and availability reads together, so the call waits on the slower one', async () => {
     vi.useFakeTimers({ now: 0 });
     const http = serve({
@@ -998,6 +1234,7 @@ describe('oecdGetDimensionValues available_only and key', () => {
   it.each([
     ['neither available_only nor key', {}],
     ['a blank key', { key: '' }],
+    ['blank period bounds', { start_period: '', end_period: '  ' }],
   ])('sends no availability read for %s, only the usual two', async (_case, extra) => {
     const http = serve({});
 
@@ -1166,7 +1403,7 @@ describe('oecdGetDimensionValues available_only and key', () => {
     expect(error.message).toContain('3 segments');
     expect(error.message).toContain('2 dimensions');
     expect(error.message).toContain('time is not a key segment');
-    expect(error.message).toContain('on oecd_query_dataset');
+    expect(error.message).toContain('pass time filters via start_period / end_period');
   });
 
   it('lists a dimension with no codelist from availability, each code under its id', async () => {
@@ -1396,7 +1633,7 @@ describe('oecdGetDimensionValues available_only and key', () => {
     });
   });
 
-  it('ends the call as RequestCancelled when the caller aborts during the availability read', async () => {
+  it('ends the call as RequestCancelled when the caller aborts a period availability read', async () => {
     vi.useFakeTimers({ now: 0 });
     const caller = new AbortController();
     // The datastructure and the codelist are cached, so the availability read is the only one in flight.
@@ -1424,7 +1661,7 @@ describe('oecdGetDimensionValues available_only and key', () => {
           oecdGetDimensionValues.input.parse({
             flow_ref: FLOW_REF,
             dimension_id: 'FREQ',
-            available_only: true,
+            start_period: '2024-S1',
           }),
           createMockContext({ errors: oecdGetDimensionValues.errors, signal: caller.signal }),
         ),
@@ -1434,7 +1671,7 @@ describe('oecdGetDimensionValues available_only and key', () => {
     await vi.advanceTimersByTimeAsync(60_000);
 
     expect(warmed).toBe(2);
-    expect(fake.requests.map((r) => r.url)).toEqual([availabilityUrl()]);
+    expect(fake.requests.map((r) => r.url)).toEqual([`${availabilityUrl()}&startPeriod=2024-S1`]);
     expect(call.settledAtMs).toBe(0);
     expect(await rejectionOf(call)).toMatchObject({ code: JsonRpcErrorCode.RequestCancelled });
   });
@@ -1485,66 +1722,78 @@ describe('oecdGetDimensionValues available_only and key', () => {
     }
   });
 
-  it('reads a delegated dataflow’s availability on the root that defines it, never the configured one', async () => {
-    const delegatedRoot = `${FAKE_BASE}/sti-public/rest`;
-    const tivaRef = 'OECD.STI.PIE,DSD_TIVA_MAINLV@DF_MAINLV';
-    const tivaAvailability = `${delegatedRoot}/availableconstraint/OECD.STI.PIE,DSD_TIVA_MAINLV%40DF_MAINLV/all/all/all?mode=available`;
-    const http = createFetchMock();
-    http.route(
-      {
-        match: `${FAKE_BASE}/dataflow/OECD.STI.PIE/DSD_TIVA_MAINLV@DF_MAINLV?references=datastructure`,
-        respond: () =>
-          Response.json({
-            data: {
-              dataStructures: [],
-              dataflows: [
-                {
-                  agencyID: 'OECD.STI.PIE',
-                  id: 'DSD_TIVA_MAINLV@DF_MAINLV',
-                  isExternalReference: true,
-                  links: [
-                    {
-                      rel: 'external',
-                      href: `${delegatedRoot}/dataflow/OECD.STI.PIE/DSD_TIVA_MAINLV@DF_MAINLV/1.2`,
-                    },
-                  ],
-                },
-              ],
-            },
-          }),
-      },
-      {
-        match: `${FAKE_BASE}/datastructure/OECD.STI.PIE/DSD_TIVA_MAINLV`,
-        respond: () => new Response('Could not find requested structures', { status: 404 }),
-      },
-      {
-        match: `${delegatedRoot}/dataflow/OECD.STI.PIE/DSD_TIVA_MAINLV@DF_MAINLV?references=datastructure`,
-        respond: () => Response.json(DSD_RESPONSE),
-      },
-      {
-        match: `${delegatedRoot}/codelist/OECD/CL_FREQ/1.0`,
-        respond: () => Response.json(CODELIST_RESPONSE),
-      },
-      { match: tivaAvailability, respond: () => Response.json(ALL_SERIES) },
-    );
-    http.install();
+  it.each([undefined, '1.1'])(
+    'reads delegated availability for edition %s on its owning root',
+    async (version) => {
+      const delegatedRoot = `${FAKE_BASE}/sti-public/rest`;
+      const tivaRef = 'OECD.STI.PIE,DSD_TIVA_MAINLV@DF_MAINLV';
+      const suffix = version === undefined ? '' : `/${version}`;
+      const dataflowPath = `/dataflow/OECD.STI.PIE/DSD_TIVA_MAINLV@DF_MAINLV${suffix}?references=datastructure`;
+      const tivaAvailability = `${delegatedRoot}/availableconstraint/OECD.STI.PIE,DSD_TIVA_MAINLV%40DF_MAINLV${version === undefined ? '' : `,${version}`}/all/all/all?mode=available`;
+      const http = createFetchMock();
+      http.route(
+        {
+          match: `${FAKE_BASE}${dataflowPath}`,
+          respond: () =>
+            Response.json({
+              data: {
+                dataStructures: [],
+                dataflows: [
+                  {
+                    agencyID: 'OECD.STI.PIE',
+                    id: 'DSD_TIVA_MAINLV@DF_MAINLV',
+                    isExternalReference: true,
+                    links: [
+                      {
+                        rel: 'external',
+                        href: `${delegatedRoot}/dataflow/OECD.STI.PIE/DSD_TIVA_MAINLV@DF_MAINLV/1.2`,
+                      },
+                    ],
+                  },
+                ],
+              },
+            }),
+        },
+        {
+          match: `${FAKE_BASE}/datastructure/OECD.STI.PIE/DSD_TIVA_MAINLV`,
+          respond: () => new Response('Could not find requested structures', { status: 404 }),
+        },
+        {
+          match: `${delegatedRoot}${dataflowPath}`,
+          respond: () => Response.json(DSD_RESPONSE),
+        },
+        {
+          match: `${delegatedRoot}/codelist/OECD/CL_FREQ/1.0`,
+          respond: () => Response.json(CODELIST_RESPONSE),
+        },
+        { match: tivaAvailability, respond: () => Response.json(ALL_SERIES) },
+      );
+      http.install();
 
-    try {
-      const result = await runToolContract(oecdGetDimensionValues, {
-        flow_ref: tivaRef,
-        dimension_id: 'FREQ',
-        available_only: true,
-      });
+      try {
+        const result = await runToolContract(oecdGetDimensionValues, {
+          flow_ref: tivaRef,
+          dimension_id: 'FREQ',
+          available_only: true,
+          ...(version === undefined ? {} : { version }),
+        });
 
-      const urls = http.calls.map((c) => c.request.url);
-      expect(urls.filter((url) => url.includes('/availableconstraint/'))).toEqual([
-        tivaAvailability,
-      ]);
-      expect(result.structuredContent).toMatchObject({ available_only: true, code_count: 3 });
-    } finally {
-      http.restore();
-    }
-  });
+        const urls = http.calls.map((c) => c.request.url);
+        expect(urls.filter((url) => url.includes('/availableconstraint/'))).toEqual([
+          tivaAvailability,
+        ]);
+        expect(result.structuredContent).toMatchObject({ available_only: true, code_count: 3 });
+        if (version !== undefined) {
+          expect(result.structuredContent).toMatchObject({ version });
+          expect(result.content[0]).toMatchObject({
+            text: expect.stringContaining('Edition: 1.1'),
+          });
+        }
+      } finally {
+        http.restore();
+      }
+    },
+  );
 
   /**
    * The configured root's datastructure route 404s for a dataflow only its

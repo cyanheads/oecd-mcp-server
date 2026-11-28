@@ -203,4 +203,28 @@ describe('applyCountLimit', () => {
 
     expect(recorded.adds.map((add) => add.value)).toEqual([1, 1]);
   });
+
+  it('names a non-defaulted count input in its notice and log and uses the same counter', () => {
+    const ctx = createMockContext();
+    const cap = { cap: 100_000, tool: 'oecd_query_dataset', parameter: 'last_n_observations' };
+
+    expect(applyCountLimit(100_001, cap, ctx)).toEqual({
+      applied: 100_000,
+      notice:
+        '`last_n_observations` 100001 is above the per-call maximum of 100000; served 100000.',
+    });
+    expect((ctx.log as MockContextLogger).calls).toEqual([
+      {
+        data: { applied: 100_000, requested: 100_001, tool: 'oecd_query_dataset' },
+        level: 'info',
+        msg: 'Served last_n_observations at its per-call cap',
+      },
+    ]);
+    expect(recorded.adds).toEqual([
+      {
+        attributes: { 'mcp.tool.name': 'oecd_query_dataset', 'oecd.count_input.cap': 100_000 },
+        value: 1,
+      },
+    ]);
+  });
 });

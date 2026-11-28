@@ -866,6 +866,50 @@ describe('oecdDataframeQuery against a real canvas', () => {
     await rm(scratch, { recursive: true, force: true });
   });
 
+  it.each([
+    ['NULL::VARCHAR', null],
+    ["''", ''],
+  ])('keeps an unambiguous %s column in a table', async (sqlValue, value) => {
+    const { canvas, canvasId } = await stage(10_000, 1);
+    try {
+      const result = await runToolContract(oecdDataframeQuery, {
+        canvas_id: canvasId,
+        sql: `SELECT ${sqlValue} AS x FROM t`,
+      });
+      expect(structuredOf(result).rows).toEqual([{ x: value }]);
+      expect(tableRowsOf(result)).toEqual(['|  |']);
+    } finally {
+      await canvas.shutdown(ctx);
+    }
+  });
+
+  it.each([
+    {
+      sql: "SELECT NULL::VARCHAR AS missing, '' AS empty, 'NULL' AS literal FROM t",
+      columns: ['missing', 'empty', 'literal'],
+      rows: [{ missing: null, empty: '', literal: 'NULL' }],
+    },
+    {
+      sql: "SELECT CASE n WHEN 0 THEN NULL WHEN 1 THEN '' ELSE 'null' END AS x FROM t ORDER BY n",
+      columns: ['x'],
+      rows: [{ x: null }, { x: '' }, { x: 'null' }],
+    },
+  ])(
+    'distinguishes null, empty text, and literal NULL on both surfaces',
+    async ({ sql, columns, rows }) => {
+      const { canvas, canvasId } = await stage(10_000, rows.length);
+      try {
+        const result = await runToolContract(oecdDataframeQuery, { canvas_id: canvasId, sql });
+        expect(structuredOf(result).rows).toEqual(rows);
+        expect(textOf(result)).toContain(
+          `\`\`\`json\n${JSON.stringify({ columns, rows }, null, 2)}\n\`\`\``,
+        );
+      } finally {
+        await canvas.shutdown(ctx);
+      }
+    },
+  );
+
   it('forwards truncated from the canvas, and omits it at and under the limit', async () => {
     const { canvas, canvasId } = await stage(10_000, 150);
     try {

@@ -5,6 +5,7 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
 import { UpstreamBudget } from '@/services/oecd-http/upstream-budget.js';
 import {
@@ -44,6 +45,10 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
           .describe('An agency, its directorate, and its dataflow count.'),
       )
       .describe('Agencies and their dataflow counts, sorted descending by count.'),
+    directorate_lookup_failed_for: z
+      .array(z.string().describe('Agency ID whose directorate lookup failed.'))
+      .optional()
+      .describe('Agencies affected when the OECD agency scheme could not be read.'),
     total_agencies: z.number().describe('Total number of distinct agencies.'),
     total_dataflows: z.number().describe('Total number of dataflows across all agencies.'),
     source: z.literal('OECD').describe('Data source attribution — always "OECD".'),
@@ -108,18 +113,22 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
     // Independent of the catalog fetch, and not load-bearing: the agency list
     // stands on its own, so a degraded scheme costs the directorate labels
     // rather than the whole call. Both reads spend the same budget.
-    const directoratesPromise = getStructureService()
-      .fetchDirectorates(budget)
-      .catch((err: unknown) => {
-        ctx.log.warning('OECD agency scheme unavailable — listing agencies without directorates', {
-          error: err instanceof Error ? err.message : String(err),
-        });
-        return new Map<string, string>();
+    const service = getStructureService();
+    const directoratesPromise = service.fetchDirectorates(budget).catch((err: unknown) => {
+      if (ctx.signal?.aborted) throw err;
+      ctx.log.warning('OECD agency scheme unavailable — listing agencies without directorates', {
+        error: err instanceof Error ? err.message : String(err),
       });
+      return null;
+    });
 
     let dataflows: OecdDataflow[];
+    let directorates: Map<string, string> | null;
     try {
-      dataflows = await getStructureService().fetchDataflows(budget);
+      [dataflows, directorates] = await Promise.all([
+        service.fetchDataflows(budget),
+        directoratesPromise,
+      ]);
     } catch (err) {
       const refusal = upstreamRefusal(err);
       if (refusal) {
@@ -127,8 +136,6 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
       }
       throw err;
     }
-
-    const directorates = await directoratesPromise;
 
     // Aggregate by agency
     const counts = new Map<string, number>();
@@ -139,10 +146,14 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
     const agencies = [...counts.entries()]
       .map(([agency_id, dataflow_count]) => {
         const code = directorateCode(agency_id);
-        const directorate = code ? directorates.get(code) : undefined;
+        const directorate = code ? directorates?.get(code) : undefined;
         return { agency_id, ...(directorate ? { directorate } : {}), dataflow_count };
       })
       .sort((a, b) => b.dataflow_count - a.dataflow_count);
+
+    const failedFor = directorates
+      ? []
+      : agencies.map((agency) => agency.agency_id).filter(directorateCode);
 
     ctx.log.info('Agency list built', {
       agencyCount: agencies.length,
@@ -151,6 +162,7 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
 
     return {
       agencies,
+      ...(failedFor.length > 0 ? { directorate_lookup_failed_for: failedFor } : {}),
       total_agencies: agencies.length,
       total_dataflows: dataflows.length,
       source: 'OECD' as const,
@@ -165,6 +177,12 @@ export const oecdListAgencies = tool('oecd_list_agencies', {
         ['Agency', 'Directorate', 'Dataflows'],
         result.agencies.map((a) => [a.agency_id, a.directorate ?? '—', String(a.dataflow_count)]),
       ),
+      ...(result.directorate_lookup_failed_for
+        ? [
+            '',
+            `Directorate lookup failed for ${result.directorate_lookup_failed_for.map(escapeMarkdownInline).join(', ')}.`,
+          ]
+        : []),
       '',
       `Source: ${result.source}`,
     ];

@@ -41,8 +41,8 @@
     },
     "OECD_CLAMP_LIMITS": {
       "type": "boolean",
-      "title": "Serve an over-the-cap limit at the cap",
-      "description": "Serve a limit above a tool's per-call cap at the cap, with a notice. When off, such a limit is rejected and the cap is advertised as its maximum.",
+      "title": "Clamp oversized count inputs",
+      "description": "Cap oversized limit and last_n_observations values with a notice. When off, clients see the caps as maxima and larger values are rejected.",
       "required": false,
       "default": true
     }

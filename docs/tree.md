@@ -1,6 +1,6 @@
 # oecd-mcp-server - Directory Structure
 
-Generated on: 2026-11-26 03:26:13
+Generated on: 2026-11-28 08:28:07
 
 ```text
 oecd-mcp-server/
@@ -180,11 +180,14 @@ oecd-mcp-server/
 │   │   │   └── upstream-budget.ts
 │   │   └── oecd-structure/
 │   │       ├── availability.ts
+│   │       ├── dataflow-description.ts
+│   │       ├── dataflow-version.ts
 │   │       ├── oecd-structure-service.ts
 │   │       ├── response-cache.ts
 │   │       └── types.ts
 │   ├── utils/
 │   │   ├── count-limit.ts
+│   │   ├── format-dataflow-description.ts
 │   │   ├── format-table.ts
 │   │   └── word-start-text.ts
 │   └── index.ts
@@ -208,6 +211,7 @@ oecd-mcp-server/
 │   │   │   └── upstream-budget.test.ts
 │   │   └── oecd-structure/
 │   │       ├── availability.test.ts
+│   │       ├── description-blocks.test.ts
 │   │       ├── oecd-structure-service.test.ts
 │   │       └── response-cache.test.ts
 │   ├── tools/

@@ -238,14 +238,21 @@ export function upstreamRefusal(
  * One of OECD's responses is otherwise taken at face value and shouldn't be: a
  * throttled request comes back `429 Retry-After: 0`, and the honored hint
  * collapses the backoff so all three attempts fire inside a few milliseconds
- * and every one is refused. Dropping the empty hint puts the throttle back on
- * the exponential backoff, which is what clears OECD's seconds-long window.
+ * and every one is refused. Moving it outside the scheduler's `retryAfter`
+ * field restores exponential backoff while retaining the received header.
  */
 export function retryableUpstreamFailure(err: unknown): unknown {
   if (!(err instanceof McpError)) return err;
   const { retryAfter, ...withoutHint } = err.data ?? {};
   if (typeof retryAfter !== 'string' || !/^0+$/.test(retryAfter.trim())) return err;
-  return new McpError(err.code, err.message, withoutHint, { cause: err });
+  return new McpError(
+    err.code,
+    err.message,
+    { ...withoutHint, receivedRetryAfter: retryAfter },
+    {
+      cause: err,
+    },
+  );
 }
 
 /**
@@ -355,11 +362,9 @@ export function parseJsonBody(text: string, headers: Headers): unknown {
  * Run a decoder over a JSON body OECD sent, restating a mistyped field as the
  * unreadable answer it is.
  *
- * The decoders read the parsed body through casts, so a field of the wrong type
- * — a map where SDMX puts a list, a null entry — surfaces as the `TypeError` the
- * first operation on it raises, with that operation's wording (`rawFlows.map is
- * not a function`). Nothing else a decoder does can raise one, so it is the
- * same failure as a body that is not JSON at all: `SerializationError`, after
+ * The decoders raise a `TypeError` when the body lacks a required collection
+ * or puts a field in the wrong shape. Treat it like a body that is not JSON:
+ * `SerializationError`, after
  * the one request, which {@link upstreamRefusal} names `upstream_unreadable`.
  * Every other throw — a decoder's deliberate not-found included — passes
  * through as it was.
@@ -375,6 +380,20 @@ export function decodeUpstream<T>(decode: () => T): T {
       { cause: err },
     );
   }
+}
+
+/** Require a JSON object at the SDMX decode boundary. */
+export function sdmxRecord(value: unknown, field: string): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError(`Expected SDMX object at ${field}`);
+  }
+  return value as Record<string, unknown>;
+}
+
+/** Require an SDMX collection of objects, allowing an explicitly empty collection. */
+export function sdmxRecords(value: unknown, field: string): Record<string, unknown>[] {
+  if (!Array.isArray(value)) throw new TypeError(`Expected SDMX array at ${field}`);
+  return value.map((entry) => sdmxRecord(entry, field));
 }
 
 /**

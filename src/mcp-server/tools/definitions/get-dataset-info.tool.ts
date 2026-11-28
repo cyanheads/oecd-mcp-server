@@ -8,12 +8,14 @@ import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline, markdownLink } from '@cyanheads/mcp-ts-core/utils';
 import { upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
 import { UpstreamBudget } from '@/services/oecd-http/upstream-budget.js';
+import { dataflowVersionInput } from '@/services/oecd-structure/dataflow-version.js';
 import {
   getStructureService,
   isDataflowNotFound,
   parseFlowRef,
 } from '@/services/oecd-structure/oecd-structure-service.js';
 import type { OecdDataStructure } from '@/services/oecd-structure/types.js';
+import { formatDataflowDescription } from '@/utils/format-dataflow-description.js';
 import { formatTable } from '@/utils/format-table.js';
 
 export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
@@ -34,9 +36,15 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
           '"OECD.SDD.NAD,DSD_NAAG@DF_NAAG_I" — or the bare {agencyID},{df_id} form OECD uses for ' +
           'the few dataflows published without a datastructure prefix. Obtain from oecd_search_datasets.',
       ),
+    version: dataflowVersionInput,
   }),
   output: z.object({
     flow_ref: z.string().describe('The resolved flow reference.'),
+    version: z.string().optional().describe('Resolved dataflow edition.'),
+    published_versions: z
+      .array(z.string().describe('Published dataflow edition.'))
+      .optional()
+      .describe('Published editions when the OECD edition catalog could be read.'),
     name: z
       .string()
       .optional()
@@ -58,7 +66,7 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
               .string()
               .describe(
                 'Concept name for the dimension — e.g. "Reference area" for REF_AREA. ' +
-                  'Repeats the id when OECD publishes no concept for it.',
+                  'Repeats the id when no concept name was resolved.',
               ),
             position: z
               .number()
@@ -81,13 +89,19 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
         name: z
           .string()
           .describe(
-            'Concept name for the time dimension, repeating the id when none is published.',
+            'Concept name for the time dimension, repeating the id when no name was resolved.',
           ),
         position: z.number().describe('Position after all regular dimensions.'),
       })
       .optional()
       .describe(
         'Time dimension — used for start_period/end_period filtering in oecd_query_dataset.',
+      ),
+    concept_lookup_failed_for: z
+      .array(z.string().describe('Dimension ID whose concept scheme could not be read.'))
+      .optional()
+      .describe(
+        'Dimensions affected by a failed concept-name lookup, including time when affected.',
       ),
     key_example: z
       .string()
@@ -192,15 +206,17 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
 
     ctx.log.info('Fetching OECD datastructure', { flowRef: input.flow_ref });
 
+    const budget = new UpstreamBudget(ctx.signal);
+    const service = getStructureService();
     let dsd: OecdDataStructure;
     try {
-      dsd = await getStructureService().fetchDataStructure(
-        new UpstreamBudget(ctx.signal),
-        input.flow_ref,
-      );
+      dsd = await service.fetchDataStructure(budget, input.flow_ref, input.version);
     } catch (err) {
-      if (isDataflowNotFound(err as Error)) {
-        throw ctx.fail('dataflow_not_found', `Dataflow not found: ${input.flow_ref}`);
+      if (err instanceof Error && isDataflowNotFound(err)) {
+        throw ctx.fail(
+          'dataflow_not_found',
+          input.version === undefined ? `Dataflow not found: ${input.flow_ref}` : err.message,
+        );
       }
       const refusal = upstreamRefusal(err);
       if (refusal) {
@@ -213,6 +229,13 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
       throw ctx.fail('dataflow_not_found', `Dataflow ${input.flow_ref} returned no dimensions`);
     }
 
+    // Edition discovery is an independent enrichment. Keep its failure from
+    // blocking a structure that has already resolved successfully.
+    const editions =
+      dsd.version === undefined
+        ? undefined
+        : await service.fetchDataflowVersions(budget.within(1500), input.flow_ref, dsd.dataRoot);
+
     // Build a wildcard key example
     const keyExample = dsd.dimensions.map(() => '').join('.');
 
@@ -223,6 +246,8 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
 
     return {
       flow_ref: input.flow_ref,
+      ...(dsd.version === undefined ? {} : { version: dsd.version }),
+      ...(editions === undefined ? {} : { published_versions: editions }),
       ...(dsd.name !== undefined ? { name: dsd.name } : {}),
       ...(dsd.description !== undefined ? { description: dsd.description } : {}),
       dimensions: dsd.dimensions.map((d) => ({
@@ -239,6 +264,9 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
           }
         : undefined,
       key_example: keyExample,
+      ...(dsd.conceptLookupFailedFor
+        ? { concept_lookup_failed_for: dsd.conceptLookupFailedFor }
+        : {}),
       ...(dsd.resources !== undefined ? { resources: dsd.resources } : {}),
       source: 'OECD' as const,
     };
@@ -262,10 +290,20 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
 
     const lines = [
       `**Dataflow: ${escapeMarkdownInline(result.flow_ref)}**`,
+      ...(result.version ? [`Edition: ${result.version}`] : []),
+      ...(result.published_versions
+        ? [`Published editions: ${result.published_versions.join(', ')}`]
+        : []),
       ...(result.name ? [`**Name:** ${escapeMarkdownInline(result.name)}`] : []),
-      ...(result.description ? ['', formatDescriptionMarkdown(result.description)] : []),
+      ...(result.description ? ['', formatDataflowDescription(result.description)] : []),
       '',
       formatTable(['Pos', 'Dimension ID', 'Name', 'Codelist'], dimRows),
+      ...(result.concept_lookup_failed_for
+        ? [
+            '',
+            `Concept-name lookup failed for ${result.concept_lookup_failed_for.map(escapeMarkdownInline).join(', ')}.`,
+          ]
+        : []),
       '',
       `**Key example (all wildcards):** ${escapeMarkdownInline(result.key_example || '.')}`,
       'Replace empty segments with codes from oecd_get_dimension_values.',
@@ -282,149 +320,3 @@ export const oecdGetDatasetInfo = tool('oecd_get_dataset_info', {
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });
-
-/** Whether a Markdown link destination uses an allowed scheme (`http:`, `https:`, or `mailto:`). */
-function isAllowedDescriptionUrl(url: string): boolean {
-  if (!url || /[\s<>()]/.test(url)) return false;
-  if (/^mailto:/i.test(url)) return url.length > 7;
-  const protocol = URL.parse(url)?.protocol;
-  return protocol === 'http:' || protocol === 'https:';
-}
-
-/**
- * Escape a prose run adjacent to a link without turning internal spaces at
- * link boundaries into `&#32;`, while still escaping line-start and line-end
- * edges and a trailing `!` before `[label](url)` (which would form an image).
- */
-function escapeProseChunk(
-  text: string,
-  atStart: boolean,
-  atEnd: boolean,
-  beforeLink: boolean,
-): string {
-  if (!text) return '';
-  let lead = '';
-  let core = text;
-  let trail = '';
-  if (!atStart) {
-    let s = 0;
-    while (s < core.length && core[s] === ' ') s++;
-    lead = core.slice(0, s);
-    core = core.slice(s);
-  }
-  if (!atEnd) {
-    let e = core.length;
-    while (e > 0 && core[e - 1] === ' ') e--;
-    trail = core.slice(e);
-    core = core.slice(0, e);
-  }
-  let escaped = core ? escapeMarkdownInline(core) : '';
-  if (beforeLink && trail === '' && escaped.endsWith('!')) {
-    escaped = `${escaped.slice(0, -1)}\\!`;
-  }
-  return `${lead}${escaped}${trail}`;
-}
-
-/**
- * Render a dataflow description for `content[]` in linear time: valid
- * `[label](url)` links (`http:`, `https:`, `mailto:`) stay clickable Markdown
- * links with escaped labels, while surrounding prose is escaped via
- * {@link escapeMarkdownInline} so upstream punctuation never corrupts into
- * unintended emphasis, raw HTML, headings, or unsafe links.
- */
-function formatDescriptionMarkdown(text: string): string {
-  const tokens: Array<
-    { kind: 'link'; label: string; url: string } | { kind: 'prose'; value: string }
-  > = [];
-  const len = text.length;
-  let proseStart = 0;
-  let i = 0;
-
-  const pushProse = (end: number) => {
-    if (end <= proseStart) return;
-    const slice = text.slice(proseStart, end);
-    const prev = tokens.at(-1);
-    if (prev?.kind === 'prose') prev.value += slice;
-    else tokens.push({ kind: 'prose', value: slice });
-    proseStart = end;
-  };
-
-  while (i < len) {
-    const open = text.indexOf('[', i);
-    if (open < 0) break;
-
-    // Scan label linearly; an unescaped nested `[` invalidates the outer candidate.
-    let j = open + 1;
-    let nestedOpen = -1;
-    let closeBracket = -1;
-    while (j < len) {
-      const ch = text[j];
-      if (ch === '\\' && j + 1 < len) {
-        j += 2;
-        continue;
-      }
-      if (ch === '[') {
-        nestedOpen = j;
-        break;
-      }
-      if (ch === ']') {
-        closeBracket = j;
-        break;
-      }
-      j++;
-    }
-
-    if (nestedOpen >= 0) {
-      i = nestedOpen;
-      continue;
-    }
-    if (closeBracket < 0) break;
-
-    if (text[closeBracket + 1] !== '(') {
-      i = closeBracket + 1;
-      continue;
-    }
-
-    // Scan URL linearly; stop early on whitespace or disallowed chars.
-    let k = closeBracket + 2;
-    let closeParen = -1;
-    while (k < len) {
-      const ch = text[k];
-      if (ch === ')') {
-        closeParen = k;
-        break;
-      }
-      if (ch === '(' || ch === '<' || ch === '>' || /\s/.test(ch ?? '')) break;
-      k++;
-    }
-
-    if (closeParen < 0) {
-      i = closeBracket + 1;
-      continue;
-    }
-
-    const url = text.slice(closeBracket + 2, closeParen);
-    const rawLabel = text.slice(open + 1, closeBracket).replace(/\\([\\[\]])/g, '$1');
-    if (!rawLabel || !isAllowedDescriptionUrl(url)) {
-      i = closeBracket + 1;
-      continue;
-    }
-
-    pushProse(open);
-    tokens.push({ kind: 'link', label: rawLabel, url });
-    proseStart = closeParen + 1;
-    i = closeParen + 1;
-  }
-
-  pushProse(len);
-
-  return tokens
-    .map((tok, idx) => {
-      if (tok.kind === 'link') {
-        return `[${escapeMarkdownInline(tok.label)}](${tok.url})`;
-      }
-      const nextIsLink = tokens[idx + 1]?.kind === 'link';
-      return escapeProseChunk(tok.value, idx === 0, idx === tokens.length - 1, nextIsLink);
-    })
-    .join('');
-}

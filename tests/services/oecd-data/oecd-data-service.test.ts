@@ -584,6 +584,37 @@ describe('OecdDataService.fetchData — codes and row order', () => {
       'TIME_PERIOD',
     ]);
   });
+
+  it('keeps the full non-time key positions across dataset and observation dimensions', async () => {
+    const { data } = DATASET_DIMENSION_RESPONSE;
+    const structure = data.structures[0]!;
+    const [frequency] = structure.dimensions.dataSet;
+    const [area, time] = structure.dimensions.observation;
+    respondOnce(
+      JSON.stringify({
+        data: {
+          dataSets: [{ observations: { '1:0': [20] } }],
+          structures: [
+            {
+              ...structure,
+              dimensions: {
+                dataSet: [{ ...frequency, keyPosition: 2 }],
+                observation: [
+                  { ...area, keyPosition: 0 },
+                  { ...time, keyPosition: 3 },
+                ],
+              },
+            },
+          ],
+        },
+      }),
+    );
+
+    const result = await service().fetchData(budget(), FLOW_REF, 'A.USA..');
+
+    expect(result.keyDimensionIds).toEqual(['REF_AREA', undefined, 'FREQ']);
+    expect(result.rows[0]).toMatchObject({ REF_AREA_code: 'DEU', FREQ_code: 'A' });
+  });
 });
 
 describe('OecdDataService.fetchData — attributes above the observation level', () => {
@@ -1008,6 +1039,7 @@ describe('OecdDataService.fetchData — upstream failures', () => {
 
     expect(result).toEqual({
       columns: [],
+      keyDimensionIds: [],
       rowCount: 0,
       rows: [],
       serviceRoot: BASE,
@@ -1024,6 +1056,7 @@ describe('OecdDataService.fetchData — upstream failures', () => {
 
     expect(result).toEqual({
       columns: [],
+      keyDimensionIds: [],
       rowCount: 0,
       rows: [],
       serviceRoot: BASE,
@@ -1043,6 +1076,23 @@ describe('OecdDataService.fetchData — upstream failures', () => {
     expect(http.calls).toHaveLength(1);
     expect(error).toMatchObject({ code: JsonRpcErrorCode.NotFound });
   });
+
+  it('keeps explicitly empty datasets and structures as zero rows', async () => {
+    respondOnce(JSON.stringify({ data: { dataSets: [], structures: [] } }));
+    const result = await service().fetchData(budget(), FLOW_REF, 'A.USA..');
+    expect(result).toMatchObject({ rowCount: 0, rows: [] });
+  });
+
+  it.each([{}, { data: { dataSets: [] } }, { data: { dataSets: [{}], structures: [{}] } }])(
+    'reports observations JSON missing a required collection as unreadable: %j',
+    async (body) => {
+      respondOnce(JSON.stringify(body));
+      await expect(service().fetchData(budget(), FLOW_REF, 'A.USA..')).rejects.toMatchObject({
+        code: JsonRpcErrorCode.SerializationError,
+      });
+      expect(http.calls).toHaveLength(1);
+    },
+  );
 
   it('reports observations JSON with a mistyped field as unreadable after one request', async () => {
     respondOnce(JSON.stringify(MISTYPED_RESPONSE));
@@ -1192,6 +1242,59 @@ describe('OecdDataService.fetchData — delegated service roots', () => {
   const DELEGATED_ROOT = `${BASE}/sti-public/rest`;
   const DELEGATED_DATA_URL = `${DELEGATED_ROOT}/data/OECD.SDD.NAD,DSD_NAAG%40DF_NAAG_I/A.USA..?dimensionAtObservation=AllDimensions`;
 
+  it('queries an exact edition directly on a known data root', async () => {
+    const url = DELEGATED_DATA_URL.replace('/A.USA..', ',1.1/A.USA..');
+    const response = structuredClone(DATA_RESPONSE);
+    Object.assign(response.data.structures[0]!, {
+      links: [
+        {
+          rel: 'datastructure',
+          urn: 'urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow=OECD.SDD.NAD:DSD_NAAG@DF_NAAG_I(1.1)',
+        },
+      ],
+    });
+    http.route({ match: url, respond: () => Response.json(response) });
+
+    const result = await service().fetchData(
+      budget(),
+      FLOW_REF,
+      'A.USA..',
+      undefined,
+      undefined,
+      undefined,
+      {
+        dataRoot: DELEGATED_ROOT,
+        version: '1.1',
+      },
+    );
+    expect(result).toMatchObject({ serviceRoot: DELEGATED_ROOT, version: '1.1' });
+    expect(http.calls.map((call) => call.request.url)).toEqual([url]);
+  });
+
+  it('reads the latest edition from the matching Dataflow link without fetching metadata', async () => {
+    const response = structuredClone(DATA_RESPONSE);
+    Object.assign(response.data.structures[0]!, {
+      links: [
+        {
+          rel: 'datastructure',
+          urn: 'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=OECD.SDD.NAD:DSD_NAAG(9.0)',
+        },
+        {
+          rel: 'datastructure',
+          urn: 'urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow=OTHER:FLOW(8.0)',
+        },
+        {
+          rel: 'datastructure',
+          urn: 'urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow=OECD.SDD.NAD:DSD_NAAG@DF_NAAG_I(1.2)',
+        },
+      ],
+    });
+    http.route({ match: DATA_URL, respond: () => Response.json(response) });
+    const result = await service().fetchData(budget(), FLOW_REF, 'A.USA..');
+    expect(result.version).toBe('1.2');
+    expect(http.calls.map((call) => call.request.url)).toEqual([DATA_URL]);
+  });
+
   /** The catalog entry for the flow, delegating to `href`. */
   function delegatingEntry(href: string): Response {
     return Response.json({
@@ -1317,6 +1420,7 @@ describe('OecdDataService.fetchData — delegated service roots', () => {
     // The delegated root answered, so a read that follows this result goes there.
     expect(result).toEqual({
       columns: [],
+      keyDimensionIds: [],
       rowCount: 0,
       rows: [],
       serviceRoot: DELEGATED_ROOT,

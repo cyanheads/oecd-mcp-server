@@ -5,6 +5,7 @@
  * @module tests/tools/query-dataset.tool.test
  */
 
+import { z } from '@cyanheads/mcp-ts-core';
 import type { ColumnSchema, RegisterTableOptions } from '@cyanheads/mcp-ts-core/canvas';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import {
@@ -214,8 +215,7 @@ function recordingCanvas(canvasId: string): {
 
 describe('oecdQueryDataset', () => {
   beforeEach(() => {
-    process.env.OECD_BASE_URL = FAKE_BASE;
-    process.env.OECD_TIMEOUT_MS = '5000';
+    Object.assign(getServerConfig(), { baseUrl: FAKE_BASE, timeoutMs: 5000 });
     initDataService();
     initStructureService();
     setCanvas(undefined);
@@ -229,6 +229,35 @@ describe('oecdQueryDataset', () => {
   });
 
   // ── Rows, attributes, scaling ───────────────────────────────────────────────
+
+  it('keeps a missing attribute absent when null and empty cells require JSON', async () => {
+    respond({
+      data: {
+        structures: [
+          {
+            dimensions: STRUCTURE.dimensions,
+            attributes: {
+              observation: [{ id: 'NOTE', values: [{ value: '' }, { value: 'NULL' }] }],
+            },
+          },
+        ],
+        dataSets: [{ observations: { '0:0:37': [null, 0], '0:0:38': [1], '0:0:39': [2, 1] } }],
+      },
+    });
+
+    const result = await runToolContract(oecdQueryDataset, { flow_ref: FLOW_REF, key: 'all' });
+    const columns = ['value', 'value_scale', 'TIME_PERIOD', 'NOTE'];
+    const rows = [
+      { value: null, value_scale: 1, TIME_PERIOD: '2020', NOTE: '' },
+      { value: 1, value_scale: 1, TIME_PERIOD: '2021' },
+      { value: 2, value_scale: 1, TIME_PERIOD: '2022', NOTE: 'NULL' },
+    ];
+    expect(result.structuredContent).toMatchObject({ rows });
+    expect(result.structuredContent).not.toHaveProperty('rows.1.NOTE');
+    expect(textOf(result.content)).toContain(
+      `\`\`\`json\n${JSON.stringify({ columns, rows }, null, 2)}\n\`\`\``,
+    );
+  });
 
   it('returns inline rows when result fits and no canvas is configured', async () => {
     respond(DATA_RESPONSE);
@@ -895,11 +924,11 @@ describe('oecdQueryDataset', () => {
     expect(textOf(output.content)).toContain('exceeded the number of requests');
   }, 15_000);
 
-  it('maps a download-size throttle to download_limit with a shrink-the-query recovery', async () => {
+  it('reports a download quota wait and the oversized-query remedy without spending another attempt', async () => {
     respond(
       'You have exceeded the number of requests for data downloads or very large data ranges permitted in the OECD Data API.',
       // A wait longer than the retry budget fails fast rather than burning attempts.
-      { headers: { 'Retry-After': '120' }, status: 429 },
+      { headers: { 'Retry-After': '7200' }, status: 429 },
     );
 
     const output = await runToolContract(oecdQueryDataset, { flow_ref: FLOW_REF, key: '' });
@@ -907,31 +936,45 @@ describe('oecdQueryDataset', () => {
 
     expect(failure.code).toBe(JsonRpcErrorCode.RateLimited);
     expect(failure.reason).toBe('download_limit');
+    expect(failure.hint).toContain('hourly download quota');
+    expect(failure.hint).toContain('7200 seconds');
     expect(failure.hint).toContain('fewer values per key segment');
-    // Waiting is the wrong advice for this one.
-    expect(failure.hint).not.toContain('Wait several seconds');
+    expect(output.structuredContent).toMatchObject({
+      error: { data: { reason: 'download_limit', retryable: true, retryAfter: '7200' } },
+    });
+    expect(textOf(output.content)).toContain(failure.hint);
+    expect(http.calls).toHaveLength(1);
   });
 
-  /**
-   * Two throttles share the `RateLimited` code and differ only in whether
-   * waiting clears them. `structuredContent` has carried `retryable` all along;
-   * the text surface carries it too, so a client reading only `content[]` can
-   * tell them apart without parsing the recovery prose.
-   */
-  it('renders reason and retryability into content[], not just structuredContent', async () => {
-    respond(
-      'You have exceeded the number of requests for data downloads or very large data ranges permitted in the OECD Data API.',
-      { headers: { 'Retry-After': '120' }, status: 429 },
-    );
-
-    const output = await runToolContract(oecdQueryDataset, { flow_ref: FLOW_REF, key: '' });
-    const structured = output.structuredContent as {
-      error: { data?: { reason?: string; retryable?: boolean } };
-    };
-
-    expect(structured.error.data).toMatchObject({ reason: 'download_limit', retryable: false });
-    expect(textOf(output.content)).toContain('(reason download_limit · not retryable)');
-  });
+  it.each([undefined, '0'])(
+    'reports only a received wait header (%s) after ordinary retries',
+    async (retryAfter) => {
+      vi.useFakeTimers();
+      try {
+        respond(
+          'You have exceeded the number of requests for data downloads or very large data ranges permitted in the OECD Data API.',
+          { headers: retryAfter === undefined ? {} : { 'Retry-After': retryAfter }, status: 429 },
+        );
+        const pending = runToolContract(oecdQueryDataset, { flow_ref: FLOW_REF, key: '' });
+        await vi.runAllTimersAsync();
+        const output = await pending;
+        const failure = failureOf(output);
+        const { error } = output.structuredContent as { error: { data: Record<string, unknown> } };
+        expect(error.data).toMatchObject({ reason: 'download_limit', retryable: true });
+        expect(textOf(output.content)).toContain('reason download_limit · retryable');
+        expect(failure.hint).toContain('hourly download quota');
+        if (retryAfter === undefined) {
+          expect(error.data).not.toHaveProperty('retryAfter');
+        } else {
+          expect(error.data.retryAfter).toBe(retryAfter);
+          expect(failure.hint).toContain('0 seconds');
+        }
+        expect(http.calls).toHaveLength(3);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it('marks a wait-it-out throttle retryable on the same surface', async () => {
     respond('You have exceeded the number of requests currently permitted in the OECD Data API.', {
@@ -1261,8 +1304,7 @@ describe('oecdQueryDataset upstream failure wiring', () => {
   }
 
   beforeEach(() => {
-    process.env.OECD_BASE_URL = FAKE_BASE;
-    process.env.OECD_TIMEOUT_MS = '5000';
+    Object.assign(getServerConfig(), { baseUrl: FAKE_BASE, timeoutMs: 5000 });
     const config = getServerConfig();
     configured = { baseUrl: config.baseUrl, timeoutMs: config.timeoutMs };
     // The default OECD_TIMEOUT_MS: a stalled ladder runs into the budget, not out of attempts.
@@ -1588,8 +1630,7 @@ describe('oecdQueryDataset no_results diagnosis', () => {
   }
 
   beforeEach(() => {
-    process.env.OECD_BASE_URL = FAKE_BASE;
-    process.env.OECD_TIMEOUT_MS = '5000';
+    Object.assign(getServerConfig(), { baseUrl: FAKE_BASE, timeoutMs: 5000 });
     const config = getServerConfig();
     configured = { baseUrl: config.baseUrl, timeoutMs: config.timeoutMs };
     Object.assign(config, { baseUrl: FAKE_BASE, timeoutMs: 5000 });
@@ -1647,6 +1688,38 @@ describe('oecdQueryDataset no_results diagnosis', () => {
 
     expect(error).toMatchObject({ data: { reason: 'no_results' }, message });
     expect(text).toContain(message);
+  });
+
+  it('does not diagnose missing codes from a different availability edition', async () => {
+    const metadata = structuredClone(NAMAIN_DSD) as { data: object };
+    Object.assign(metadata.data, { dataflows: [{ version: '1.0' }] });
+    const [agency, id] = FLOW.split(',');
+    const upstream = serve({
+      [DATAFLOW_URL]: cacheable(metadata),
+      [SCHEME_URL]: cacheable(SCHEME),
+      [availabilityUrl(US_KEY)]: cacheable({
+        data: {
+          contentConstraints: [
+            {
+              constraintAttachment: {
+                dataflows: [
+                  `urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow=${agency}:${id}(1.1)`,
+                ],
+              },
+              cubeRegions: [{ keyValues: [{ id: 'REF_AREA', values: ['USA'] }] }],
+            },
+          ],
+        },
+      }),
+      [dataUrl(US_KEY)]: NO_MATCH,
+    });
+    const { error, text } = await toolWireFailure(oecdQueryDataset, {
+      flow_ref: FLOW,
+      key: US_KEY,
+    });
+    expect(error).toMatchObject({ data: { reason: 'no_results' }, message: plainMessage(US_KEY) });
+    expect(text).not.toContain('has no data given the other segments');
+    expect(upstream.requestsTo('/availableconstraint/')).toHaveLength(1);
   });
 
   it('says so when OECD lists no code for any pinned segment given the others', async () => {
@@ -1975,6 +2048,41 @@ describe('oecdQueryDataset no_results diagnosis', () => {
     expect(upstream.requests.slice(2).map((r) => r.url)).toEqual([dataUrl(USA_KEY)]);
   });
 
+  it.each([true, false])(
+    'uses the selected edition for observations and diagnosis (has rows: %s)',
+    async (hasRows) => {
+      const versionedReference = DATAFLOW_URL.replace('?', '/1.1?');
+      const versioned = (url: string) =>
+        url.replace('%40DF_QNA_EXPENDITURE_GROWTH_OECD/', '%40DF_QNA_EXPENDITURE_GROWTH_OECD,1.1/');
+      const expectedData = versioned(dataUrl(USA_KEY));
+      const expectedAvailability = versioned(availabilityUrl(USA_KEY));
+      expect(expectedData).toContain(',1.1/');
+      expect(expectedAvailability).toContain(',1.1/');
+      const upstream = serve({
+        [versionedReference]: cacheable(NAMAIN_DSD),
+        [SCHEME_URL]: cacheable(SCHEME),
+        [expectedData]: hasRows ? cacheable(DATA_RESPONSE) : NO_MATCH,
+        [expectedAvailability]: USA_RECORD,
+      });
+      const input = { flow_ref: FLOW, key: USA_KEY, version: '1.1' };
+
+      if (hasRows) {
+        const result = await runToolContract(oecdQueryDataset, input);
+        expect(result.isError).toBeFalsy();
+        expect(result.structuredContent).toMatchObject({ version: '1.1' });
+        expect(result.content[0]).toMatchObject({ text: expect.stringContaining('Edition: 1.1') });
+        expect(upstream.requests.map((r) => r.url)).toEqual([versionedReference, expectedData]);
+      } else {
+        const { error } = await toolWireFailure(oecdQueryDataset, input);
+        expect(error).toMatchObject({ data: { reason: 'no_results' } });
+        expect(error.message).toContain('edition 1.1');
+        expect(upstream.requestsTo('/availableconstraint/').map((r) => r.url)).toEqual([
+          expectedAvailability,
+        ]);
+      }
+    },
+  );
+
   /**
    * A dataflow the configured root catalogues as a pointer: its data and its
    * datastructure live on the root the catalog entry names, and so does its
@@ -2009,9 +2117,7 @@ describe('oecdQueryDataset no_results diagnosis', () => {
       'FREQ',
     ]);
     const upstream = serve({
-      // The query: the configured root answers 500, its catalog entry points on.
-      [`${FAKE_BASE}${DATA}`]: { body: 'Object reference not set', kind: 'answer', status: 500 },
-      [`${FAKE_BASE}${DATAFLOW}`]: pointer,
+      // Key validation already carries the configured catalog's routing decision.
       [`${DELEGATED}${DATA}`]: NO_MATCH,
       // The datastructure, which the configured root holds only as the same pointer.
       [`${FAKE_BASE}${DATAFLOW}?references=datastructure`]: pointer,
@@ -2037,6 +2143,7 @@ describe('oecdQueryDataset no_results diagnosis', () => {
     expect(upstream.requestsTo('/availableconstraint/').map((r) => r.url)).toEqual([
       `${DELEGATED}${AVAILABILITY}`,
     ]);
+    expect(upstream.requestsTo('/data/').map((r) => r.url)).toEqual([`${DELEGATED}${DATA}`]);
   });
 
   /**
@@ -2071,9 +2178,7 @@ describe('oecdQueryDataset no_results diagnosis', () => {
       },
     });
     const upstream = serve({
-      // The query: the configured root answers 500, its catalog entry points on.
-      [`${FAKE_BASE}${DATA}`]: { body: 'Object reference not set', kind: 'answer', status: 500 },
-      [`${FAKE_BASE}${DATAFLOW}`]: pointer,
+      // The lookup establishes delegation even when the primary root supplies the structure.
       [`${DELEGATED}${DATA}`]: NO_MATCH,
       // The datastructure: the same pointer, then the configured root's own copy.
       [`${FAKE_BASE}${DATAFLOW}?references=datastructure`]: pointer,
@@ -2097,8 +2202,6 @@ describe('oecdQueryDataset no_results diagnosis', () => {
     expect(upstream.requests.map((r) => r.url)).toEqual([
       `${FAKE_BASE}${DATAFLOW}?references=datastructure`,
       `${FAKE_BASE}/datastructure/OECD.SDD.TPS/DSD_ITIC`,
-      `${FAKE_BASE}${DATA}`,
-      `${FAKE_BASE}${DATAFLOW}`,
       `${DELEGATED}${DATA}`,
       `${DELEGATED}${AVAILABILITY}`,
     ]);
@@ -2109,8 +2212,7 @@ describe('oecdQueryDataset no_results diagnosis', () => {
 
 describe('oecdQueryDataset #53 DataCanvas-off parity and short spilled preview', () => {
   beforeEach(() => {
-    process.env.OECD_BASE_URL = FAKE_BASE;
-    process.env.OECD_TIMEOUT_MS = '5000';
+    Object.assign(getServerConfig(), { baseUrl: FAKE_BASE, timeoutMs: 5000 });
     initDataService();
     initStructureService();
     setCanvas(undefined);
@@ -2161,6 +2263,22 @@ describe('oecdQueryDataset #53 DataCanvas-off parity and short spilled preview',
     expect(structured.rows).toHaveLength(25);
     expect(tableRowCount(text)).toBe(25);
     expect(text).toContain(`Truncated — showing the first 25 of ${SPILL_ROWS} rows`);
+  });
+
+  it('combines the latest-N reduction and DataCanvas guidance in one spill notice', async () => {
+    respond(seriesResponse(SPILL_ROWS));
+    setCanvas(recordingCanvas('canvas-025') as never);
+
+    const output = await runToolContract(oecdQueryDataset, {
+      flow_ref: FLOW_REF,
+      key: 'all',
+      last_n_observations: 100_001,
+    });
+    const structured = output.structuredContent as { notice: string };
+    expect(structured).toMatchObject({ query_last_n_observations: 100_000, truncated: true });
+    expect(structured.notice).toContain('`last_n_observations` 100001');
+    expect(structured.notice).toContain('on canvas `canvas-025`');
+    expect(textOf(output.content)).toContain(structured.notice);
   });
 
   it('caps a spilled DataCanvas preview at shown (< 25) when fewer than 25 rows fit the 100k inline budget', async () => {
@@ -2234,8 +2352,7 @@ describe('oecdQueryDataset #54 key-length validation and inverted-period rejecti
   };
 
   beforeEach(() => {
-    process.env.OECD_BASE_URL = FAKE_BASE;
-    process.env.OECD_TIMEOUT_MS = '5000';
+    Object.assign(getServerConfig(), { baseUrl: FAKE_BASE, timeoutMs: 5000 });
     initDataService();
     initStructureService();
     setCanvas(undefined);
@@ -2247,6 +2364,233 @@ describe('oecdQueryDataset #54 key-length validation and inverted-period rejecti
     http.restore();
     setCanvas(undefined);
   });
+
+  const dataUrl = (key: string, filters = '') =>
+    `${FAKE_BASE}/data/OECD.SDD.NAD,DSD_NAMAIN1%40DF_QNA_EXPENDITURE_GROWTH_OECD/${key}?dimensionAtObservation=AllDimensions${filters}`;
+
+  function growth(rows: number, areas: (index: number) => number) {
+    const ids = [
+      'FREQ',
+      'ADJUSTMENT',
+      'REF_AREA',
+      'SECTOR',
+      'COUNTERPART_SECTOR',
+      'TRANSACTION',
+      'INSTR_ASSET',
+      'ACTIVITY',
+      'EXPENDITURE',
+      'UNIT_MEASURE',
+      'PRICE_BASE',
+      'TRANSFORMATION',
+      'TABLE_IDENTIFIER',
+      'TIME_PERIOD',
+    ];
+    const codes = ['Q', 'Y', '', 'S1', 'S1', 'B1GQ', '_Z', '_Z', '_Z', 'PC', 'L', 'G1', 'T0102'];
+    const observations = Object.fromEntries(
+      Array.from({ length: rows }, (_, i) => [`0:0:${areas(i)}:0:0:0:0:0:0:0:0:0:0:${i}`, [i + 1]]),
+    );
+    return {
+      data: {
+        dataSets: [{ observations }],
+        structures: [
+          {
+            dimensions: {
+              observation: ids.map((id, keyPosition) => ({
+                id,
+                keyPosition,
+                values:
+                  id === 'REF_AREA'
+                    ? [
+                        { id: 'CAN', name: 'Canada' },
+                        { id: 'USA', name: 'United States' },
+                        { id: 'MEX', name: 'Mexico' },
+                      ]
+                    : id === 'TIME_PERIOD'
+                      ? Array.from({ length: rows }, (_, i) => ({ id: String(1950 + i) }))
+                      : [{ id: codes[keyPosition] }],
+              })),
+            },
+          },
+        ],
+      },
+    };
+  }
+
+  it('selects all observations for an exact dot alias without a mismatch notice or a structure lookup', async () => {
+    http.route({
+      match: `${FAKE_BASE}/data/OECD.SDD.NAD,DSD_NAAG%40DF_NAAG_I/all?dimensionAtObservation=AllDimensions`,
+      respond: () => Response.json(DATA_RESPONSE),
+    });
+    const result = await runToolContract(oecdQueryDataset, { flow_ref: FLOW_REF, key: '.' });
+    expect(result.structuredContent).toMatchObject({ query_key: '.', row_count: 2 });
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it.each([
+    ['.', 2],
+    ['%2e%2E', 3],
+  ])('notices a legacy dot alias %s with %i segments on both surfaces', async (key, segments) => {
+    http.route({ match: dataUrl('all'), respond: () => Response.json(growth(1, () => 0)) });
+    const result = await runToolContract(oecdQueryDataset, { flow_ref: FLOW, key });
+    const notice = `The dot-only key has ${segments} segments; this dataflow has 13 dimensions. Selected all series.`;
+    expect(result.structuredContent).toMatchObject({ query_key: key, row_count: 1, notice });
+    expect(textOf(result.content)).toContain(notice);
+    expect(http.calls.map(({ request }) => request.url)).toEqual([dataUrl('all')]);
+  });
+
+  it('keeps a full-width dot key on its positional route without a mismatch notice', async () => {
+    const key = '.'.repeat(12);
+    http.route(
+      { match: DATAFLOW_URL, respond: () => Response.json(NAMAIN_DSD) },
+      { match: dataUrl(key), respond: () => Response.json(growth(1, () => 0)) },
+    );
+    const result = await runToolContract(oecdQueryDataset, { flow_ref: FLOW, key });
+    expect(result.structuredContent).toMatchObject({ query_key: key, row_count: 1 });
+    expect(result.structuredContent).not.toHaveProperty('notice');
+    expect(http.calls.map(({ request }) => request.url)).toEqual([DATAFLOW_URL, dataUrl(key)]);
+  });
+
+  it('reports requested countries absent from observed coordinates and clears the notice when they appear', async () => {
+    const key = 'Q..CAN+USA...B1GQ......G1.';
+    const historical = dataUrl(key, '&startPeriod=1950&endPeriod=1950');
+    const recent = dataUrl(key, '&startPeriod=2024&endPeriod=2024');
+    http.route(
+      {
+        match: DATAFLOW_URL,
+        respond: () =>
+          Response.json(NAMAIN_DSD, { headers: { 'cache-control': 'public,max-age=86400' } }),
+      },
+      { match: historical, respond: () => Response.json(growth(4, () => 1)) },
+      { match: recent, respond: () => Response.json(growth(8, (i) => i % 2)) },
+    );
+    const old = await runToolContract(oecdQueryDataset, {
+      flow_ref: FLOW,
+      key,
+      start_period: '1950',
+      end_period: '1950',
+    });
+    const notice = 'No observations returned for `REF_AREA` codes `CAN`.';
+    expect(old.structuredContent).toMatchObject({
+      row_count: 4,
+      constant_columns: { REF_AREA: { code: 'USA' } },
+      notice,
+    });
+    expect(textOf(old.content)).toContain(notice);
+    const both = await runToolContract(oecdQueryDataset, {
+      flow_ref: FLOW,
+      key,
+      start_period: '2024',
+      end_period: '2024',
+    });
+    expect(both.structuredContent).toMatchObject({ row_count: 8 });
+    expect(both.structuredContent).not.toHaveProperty('notice');
+    expect(http.calls.map(({ request }) => request.url)).toEqual([
+      DATAFLOW_URL,
+      historical,
+      recent,
+    ]);
+  });
+
+  it('uses complete observation coordinates when the cached DSD belongs to an older edition', async () => {
+    const key = 'Q..CAN+USA...B1GQ......G1.';
+    const metadata = structuredClone(NAMAIN_DSD) as {
+      data: {
+        dataStructures: {
+          dataStructureComponents: {
+            dimensionList: { dimensions: { id: string; position: number }[] };
+          };
+        }[];
+      };
+    };
+    const dimensions =
+      metadata.data.dataStructures[0]!.dataStructureComponents.dimensionList.dimensions;
+    [dimensions[0]!.position, dimensions[2]!.position] = [
+      dimensions[2]!.position,
+      dimensions[0]!.position,
+    ];
+    Object.assign(metadata.data, { dataflows: [{ version: '1.0' }] });
+    const observations = growth(4, () => 1);
+    Object.assign(observations.data.structures[0]!, {
+      links: [
+        {
+          urn: 'urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow=OECD.SDD.NAD:DSD_NAMAIN1@DF_QNA_EXPENDITURE_GROWTH_OECD(1.1)',
+        },
+      ],
+    });
+    http.route(
+      { match: DATAFLOW_URL, respond: () => Response.json(metadata) },
+      { match: dataUrl(key), respond: () => Response.json(observations) },
+    );
+    const result = await runToolContract(oecdQueryDataset, { flow_ref: FLOW, key });
+    const notice = 'No observations returned for `REF_AREA` codes `CAN`.';
+    expect(result.structuredContent).toMatchObject({ version: '1.1', row_count: 4, notice });
+    expect(textOf(result.content)).toContain(notice);
+  });
+
+  it('combines coverage and spill notices, and counts a country present only after the preview', async () => {
+    const key = 'Q..CAN+USA+MEX...B1GQ+P3......G1.';
+    http.route(
+      { match: DATAFLOW_URL, respond: () => Response.json(NAMAIN_DSD) },
+      {
+        match: dataUrl(key),
+        respond: () => Response.json(growth(SPILL_ROWS, (i) => Number(i === SPILL_ROWS - 1))),
+      },
+    );
+    setCanvas(recordingCanvas('canvas-061') as never);
+    const result = await runToolContract(oecdQueryDataset, { flow_ref: FLOW, key });
+    const notice =
+      'No observations returned for `REF_AREA` codes `MEX`. No observations returned for `TRANSACTION` codes `P3`.';
+    expect(result.structuredContent).toMatchObject({
+      truncated: true,
+      notice: expect.stringContaining(notice),
+    });
+    expect(result.structuredContent).toHaveProperty(
+      'notice',
+      expect.stringContaining('The full result is in table'),
+    );
+    expect(textOf(result.content)).toContain(notice);
+    expect(textOf(result.content)).toContain('The full result is in table');
+    expect(http.calls.map(({ request }) => request.url)).toEqual([DATAFLOW_URL, dataUrl(key)]);
+  });
+
+  it('omits a blank start bound from the request and echo while keeping the end bound', async () => {
+    const url = dataUrl('all', '&endPeriod=2024-Q1');
+    http.route({ match: url, respond: () => Response.json(DATA_RESPONSE) });
+    const result = await runToolContract(oecdQueryDataset, {
+      flow_ref: FLOW,
+      key: 'all',
+      start_period: '',
+      end_period: '2024-Q1',
+    });
+    expect(http.calls.map(({ request }) => request.url)).toEqual([url]);
+    expect(result.structuredContent).toMatchObject({ query_end_period: '2024-Q1' });
+    expect(result.structuredContent).not.toHaveProperty('query_start_period');
+    expect(textOf(result.content)).toContain('Period: … – 2024-Q1');
+  });
+
+  it.each([undefined, '2024-02-29'])(
+    'rejects an impossible day with end bound %s before requests',
+    async (end) => {
+      http.route({ match: () => true, respond: () => Response.json(DATA_RESPONSE) });
+      const { error, text } = await toolWireFailure(oecdQueryDataset, {
+        flow_ref: FLOW,
+        key: 'all',
+        start_period: '2024-02-31',
+        ...(end !== undefined && { end_period: end }),
+      });
+      expect(http.calls).toHaveLength(0);
+      expect(error).toMatchObject({
+        code: JsonRpcErrorCode.ValidationError,
+        message: 'start_period "2024-02-31" is not a valid calendar date',
+        data: {
+          reason: 'invalid_period',
+          recovery: { hint: declaredRecovery(oecdQueryDataset, 'invalid_period') },
+        },
+      });
+      expect(text).toContain('2024-02-31');
+    },
+  );
 
   it.each([
     ['2024', '2020'],
@@ -2282,6 +2626,7 @@ describe('oecdQueryDataset #54 key-length validation and inverted-period rejecti
   it.each([
     ['2024', '2024-Q1'],
     ['2024-Q1', '2024'],
+    ['2024-02-29', '2024-02'],
   ])(
     'allows overlapping mixed-granularity period range %s to %s',
     async (startPeriod, endPeriod) => {
@@ -2451,8 +2796,7 @@ describe('oecdQueryDataset #54 key-length validation and inverted-period rejecti
 
 describe('oecdQueryDataset #55 last_n_observations', () => {
   beforeEach(() => {
-    process.env.OECD_BASE_URL = FAKE_BASE;
-    process.env.OECD_TIMEOUT_MS = '5000';
+    Object.assign(getServerConfig(), { baseUrl: FAKE_BASE, timeoutMs: 5000 });
     initDataService();
     initStructureService();
     setCanvas(undefined);
@@ -2465,7 +2809,7 @@ describe('oecdQueryDataset #55 last_n_observations', () => {
     setCanvas(undefined);
   });
 
-  it.each([0, -1, 1.5, 100_001])(
+  it.each([0, -1, 1.5])(
     'rejects invalid last_n_observations %s at schema validation with zero upstream requests',
     async (value) => {
       http.route({ match: () => true, respond: () => Response.json(DATA_RESPONSE) });
@@ -2484,6 +2828,51 @@ describe('oecdQueryDataset #55 last_n_observations', () => {
     },
   );
 
+  it('clamps the optional latest-N at the cap before the upstream request and echoes the reduction', async () => {
+    const schema = z.toJSONSchema(oecdQueryDataset.input, { io: 'input' });
+    expect(schema.properties?.last_n_observations).not.toHaveProperty('maximum');
+    expect(schema.required).not.toContain('last_n_observations');
+    const expectedUrl = `${FAKE_BASE}/data/OECD.SDD.NAD,DSD_NAAG%40DF_NAAG_I/all?dimensionAtObservation=AllDimensions&lastNObservations=100000`;
+    http.route({ match: expectedUrl, respond: () => Response.json(DATA_RESPONSE) });
+
+    const output = await runToolContract(oecdQueryDataset, {
+      flow_ref: FLOW_REF,
+      key: 'all',
+      last_n_observations: 100_001,
+    });
+    const notice =
+      '`last_n_observations` 100001 is above the per-call maximum of 100000; served 100000.';
+
+    expect(output.isError).toBeUndefined();
+    expect(http.calls.map((c) => c.request.url)).toEqual([expectedUrl]);
+    expect(output.structuredContent).toMatchObject({ query_last_n_observations: 100_000, notice });
+    expect(textOf(output.content)).toContain(' | Last N: 100000');
+    expect(textOf(output.content)).toContain(notice);
+  });
+
+  it('advertises the maximum and rejects an oversized latest-N before reading OECD in strict mode', async () => {
+    const config = getServerConfig();
+    const original = config.clampLimits;
+    config.clampLimits = false;
+    try {
+      expect(
+        z.toJSONSchema(oecdQueryDataset.input, { io: 'input' }).properties?.last_n_observations,
+      ).toMatchObject({ type: 'integer', minimum: 1, maximum: 100_000 });
+      const output = await runToolContract(oecdQueryDataset, {
+        flow_ref: FLOW_REF,
+        key: 'all',
+        last_n_observations: 100_001,
+      });
+      expect(output.structuredContent).toMatchObject({
+        error: { code: JsonRpcErrorCode.InvalidParams, data: { reason: 'invalid_arguments' } },
+      });
+      expect(textOf(output.content)).toContain('last_n_observations');
+      expect(http.calls).toHaveLength(0);
+    } finally {
+      config.clampLimits = original;
+    }
+  });
+
   it.each([1, 2, 100_000])(
     'forwards lastNObservations=%i, echoes query_last_n_observations, and renders it in format()',
     async (n) => {
@@ -2499,6 +2888,7 @@ describe('oecdQueryDataset #55 last_n_observations', () => {
       expect(output.isError).toBeUndefined();
       expect(http.calls.map((c) => c.request.url)).toEqual([expectedUrl]);
       expect(output.structuredContent).toMatchObject({ query_last_n_observations: n });
+      expect(output.structuredContent).not.toHaveProperty('notice');
       expect(textOf(output.content)).toContain(` | Last N: ${n}`);
     },
   );

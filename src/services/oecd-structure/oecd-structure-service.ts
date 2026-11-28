@@ -19,8 +19,12 @@ import {
   fetchOecd,
   parseJsonBody,
   type RequestWindow,
+  sdmxRecord,
+  sdmxRecords,
 } from '@/services/oecd-http/oecd-http.js';
 import { isBudgetExpiry, UpstreamBudget } from '@/services/oecd-http/upstream-budget.js';
+import { htmlToMarkdown, isHttpUrl, stripHtml } from './dataflow-description.js';
+import { sdmxVersion } from './dataflow-version.js';
 import { type LoadedResponse, ResponseCache } from './response-cache.js';
 import type {
   OecdCode,
@@ -46,19 +50,6 @@ const STRUCTURE_ACCEPT = 'application/vnd.sdmx.structure+json;version=1.0';
  * endpoint it was addressed to.
  */
 const SDMX_ID_SAFE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-
-/**
- * Allowed shape of an SDMX artefact version, which is a dot-separated run of
- * digits (`1.0`, `1.7`). Versions arrive inside upstream URNs and land in a URL
- * path segment, so anything else is dropped at parse time and the reference is
- * carried unversioned rather than pinned to something unfetchable.
- */
-const SDMX_VERSION_SAFE = /^\d+(?:\.\d+)*$/;
-
-/** The version an upstream URN pins a reference to, or undefined when it names none this server will address. */
-function safeVersion(version: string): string | undefined {
-  return SDMX_VERSION_SAFE.test(version) ? version : undefined;
-}
 
 /**
  * Parse a flow ref into its parts.
@@ -234,10 +225,14 @@ function dataflowIdOf(parts: { dfId: string; dsdId?: string }): string {
 function structureRoutes(
   root: string,
   parts: { agencyId: string; dfId: string; dsdId?: string },
+  version?: string,
 ): { direct: string | undefined; reference: string } {
   return {
-    direct: parts.dsdId ? `${root}/datastructure/${parts.agencyId}/${parts.dsdId}` : undefined,
-    reference: `${root}/dataflow/${parts.agencyId}/${dataflowIdOf(parts)}?references=datastructure`,
+    direct:
+      parts.dsdId && version === undefined
+        ? `${root}/datastructure/${parts.agencyId}/${parts.dsdId}`
+        : undefined,
+    reference: `${root}/dataflow/${parts.agencyId}/${dataflowIdOf(parts)}${version === undefined ? '' : `/${version}`}?references=datastructure`,
   };
 }
 
@@ -408,9 +403,44 @@ export class OecdStructureService {
    * Every route and every concept-scheme read spends the one budget it is
    * given, so the whole cascade ends when the budget does.
    */
-  async fetchDataStructure(budget: UpstreamBudget, flowRef: string): Promise<OecdDataStructure> {
-    const { conceptRefs, structure } = await this.resolveDataStructure(budget, flowRef);
-    return this.applyConceptNames(budget, structure, conceptRefs);
+  async fetchDataStructure(
+    budget: UpstreamBudget,
+    flowRef: string,
+    version?: string,
+  ): Promise<OecdDataStructure> {
+    const { conceptRefs, structure } = await this.resolveDataStructure(budget, flowRef, version);
+    return this.applyConceptNames(budget, structure, conceptRefs, version !== undefined);
+  }
+
+  /** Read the edition catalogue on the root whose dataflow owns it, within the existing budget. */
+  async fetchDataflowVersions(
+    budget: UpstreamBudget,
+    flowRef: string,
+    root: string = this.baseUrl,
+  ): Promise<string[] | undefined> {
+    const parts = parseFlowRef(flowRef);
+    if (!parts) throw new Error(`Invalid flow_ref format: ${flowRef}`);
+    const flowId = dataflowIdOf(parts);
+    try {
+      return await this.readStructure(budget, {
+        attempts: 'once',
+        decode: (payload) => {
+          const data = sdmxRecord(sdmxRecord(payload, 'response').data, 'data');
+          const versions = new Set<string>();
+          for (const entry of sdmxRecords(data.dataflows, 'dataflows')) {
+            if (entry.agencyID !== parts.agencyId || entry.id !== flowId) continue;
+            const edition = sdmxVersion(entry.version);
+            if (edition !== undefined) versions.add(edition);
+          }
+          return versions.size > 0 ? [...versions] : undefined;
+        },
+        failureMessage: `Failed to fetch OECD dataflow editions for ${flowRef}`,
+        url: `${root}/dataflow/${parts.agencyId}/${flowId}/all`,
+      });
+    } catch (err) {
+      if (budget.signal?.aborted || !(err instanceof McpError)) throw err;
+      return;
+    }
   }
 
   /**
@@ -422,12 +452,26 @@ export class OecdStructureService {
    * @throws {McpError} `NotFound` when the dataflow does not resolve to a
    *   datastructure or declares zero dimensions.
    */
-  async fetchDimensionCount(budget: UpstreamBudget, flowRef: string): Promise<number> {
-    const { structure } = await this.resolveDataStructure(budget, flowRef);
+  async fetchQueryStructure(
+    budget: UpstreamBudget,
+    flowRef: string,
+    version?: string,
+  ): Promise<{
+    dimensionCount: number;
+    dimensionIds: string[];
+    dataRoot: string;
+    version?: string;
+  }> {
+    const { structure } = await this.resolveDataStructure(budget, flowRef, version);
     if (structure.dimensions.length === 0) {
       throw notFound(`Dataflow ${flowRef} returned no dimensions`, { flowRef });
     }
-    return structure.dimensions.length;
+    return {
+      dimensionCount: structure.dimensions.length,
+      dimensionIds: structure.dimensions.map((dimension) => dimension.id),
+      dataRoot: structure.dataRoot,
+      ...(structure.version === undefined ? {} : { version: structure.version }),
+    };
   }
 
   /**
@@ -437,14 +481,34 @@ export class OecdStructureService {
   private async resolveDataStructure(
     budget: UpstreamBudget,
     flowRef: string,
+    version?: string,
   ): Promise<{ conceptRefs: ConceptRef[]; structure: OecdDataStructure }> {
     const parts = parseFlowRef(flowRef);
     if (!parts) {
       throw new Error(`Invalid flow_ref format: ${flowRef}`);
     }
 
-    const configured = structureRoutes(this.baseUrl, parts);
-    const reference = await this.readDataStructure(budget, configured.reference, flowRef);
+    if (version !== undefined && sdmxVersion(version) === undefined) {
+      throw new Error(`Invalid dataflow version: ${version}`);
+    }
+    const configured = structureRoutes(this.baseUrl, parts, version);
+    const reference = await this.readDataStructure(
+      budget,
+      configured.reference,
+      flowRef,
+      version,
+    ).catch(async (err: unknown) => {
+      if (version === undefined) throw err;
+      swallowNotFound(err);
+      // Older editions may be absent from the public catalog entirely. Its
+      // latest entry can establish a root, but cannot answer this edition.
+      const latest = structureRoutes(this.baseUrl, parts);
+      const current = await this.readDataStructure(budget, latest.reference, flowRef).catch(
+        swallowNotFound,
+      );
+      if (current?.kind === 'delegated') return current;
+      throw await this.missingEdition(budget, flowRef, version, this.baseUrl);
+    });
 
     /**
      * Root that answered. Codelists and concept schemes are versioned per root
@@ -456,7 +520,7 @@ export class OecdStructureService {
     let parsed = reference.kind === 'structure' ? reference.parsed : undefined;
 
     if (!parsed && reference.kind === 'delegated') {
-      parsed = this.cachedDataStructure(reference.root, parts);
+      parsed = this.cachedDataStructure(reference.root, parts, version);
       if (parsed) serviceRoot = reference.root;
     }
 
@@ -470,17 +534,37 @@ export class OecdStructureService {
     if (!parsed) {
       // No delegation to follow means the ref genuinely resolves nowhere.
       if (reference.kind !== 'delegated') {
+        if (version !== undefined) {
+          throw await this.missingEdition(budget, flowRef, version, this.baseUrl);
+        }
         throw notFound(`DataStructure not found for ${flowRef}`, { flowRef });
       }
-      parsed = await this.loadDelegatedDataStructure(budget, reference.root, parts, flowRef);
+      parsed = await this.loadDelegatedDataStructure(
+        budget,
+        reference.root,
+        parts,
+        flowRef,
+        version,
+      );
       serviceRoot = reference.root;
     }
 
     // Prefer the resolved response's own `dataflows[0]` metadata (e.g. from the
     // delegated root's reference response), falling back to the configured
     // root's stub when a `/datastructure/...` route answered without `dataflows[]`.
-    const fallbackMeta = reference.kind !== 'structure' ? reference.meta : undefined;
+    const fallbackMeta =
+      reference.kind !== 'structure' &&
+      (version === undefined || reference.meta?.version === version)
+        ? reference.meta
+        : undefined;
     const meta = parsed.meta ?? fallbackMeta;
+    const resolvedVersion = parsed.meta?.version ?? fallbackMeta?.version;
+    if (version !== undefined && resolvedVersion !== undefined && resolvedVersion !== version) {
+      throw serializationError(
+        `OECD returned dataflow edition ${resolvedVersion} for a request for edition ${version}`,
+      );
+    }
+    const edition = resolvedVersion ?? version;
 
     return {
       conceptRefs: parsed.conceptRefs,
@@ -493,6 +577,7 @@ export class OecdStructureService {
         ...(meta?.name !== undefined ? { name: meta.name } : {}),
         ...(meta?.description !== undefined ? { description: meta.description } : {}),
         ...(meta?.resources !== undefined ? { resources: meta.resources } : {}),
+        ...(edition === undefined ? {} : { version: edition }),
       },
     };
   }
@@ -512,17 +597,23 @@ export class OecdStructureService {
     serviceRoot: string,
     parts: { agencyId: string; dfId: string; dsdId?: string },
     flowRef: string,
+    version?: string,
   ): Promise<ParsedDataStructure> {
-    const routes = structureRoutes(serviceRoot, parts);
-    const reference = await this.readDataStructure(budget, routes.reference, flowRef).catch(
-      swallowNotFound,
-    );
+    const routes = structureRoutes(serviceRoot, parts, version);
+    const reference = await this.readDataStructure(
+      budget,
+      routes.reference,
+      flowRef,
+      version,
+    ).catch(swallowNotFound);
     if (reference?.kind === 'structure') return reference.parsed;
 
     const direct = routes.direct
       ? await this.readDataStructure(budget, routes.direct, flowRef)
       : undefined;
     if (direct?.kind === 'structure') return direct.parsed;
+    if (version !== undefined)
+      throw await this.missingEdition(budget, flowRef, version, serviceRoot);
     throw notFound(`DataStructure not found for ${flowRef}`, { flowRef });
   }
 
@@ -541,8 +632,9 @@ export class OecdStructureService {
   private cachedDataStructure(
     serviceRoot: string,
     parts: { agencyId: string; dfId: string; dsdId?: string },
+    version?: string,
   ): ParsedDataStructure | undefined {
-    const routes = structureRoutes(serviceRoot, parts);
+    const routes = structureRoutes(serviceRoot, parts, version);
     for (const url of [routes.reference, routes.direct]) {
       if (url === undefined) continue;
       const stored = this.#cache.peek<StructureResponse>(structureCacheKey(url));
@@ -551,15 +643,29 @@ export class OecdStructureService {
     return;
   }
 
+  private async missingEdition(
+    budget: UpstreamBudget,
+    flowRef: string,
+    version: string,
+    root: string,
+  ): Promise<McpError> {
+    const known = await this.fetchDataflowVersions(budget, flowRef, root);
+    const alternatives = known?.length ? ` Published editions: ${known.join(', ')}.` : '';
+    return notFound(
+      `OECD did not return a datastructure for ${flowRef} edition ${version}.${alternatives}`,
+    );
+  }
+
   /** Read one datastructure or dataflow-reference response. */
   private readDataStructure(
     budget: UpstreamBudget,
     url: string,
     flowRef: string,
+    version?: string,
   ): Promise<StructureResponse> {
     return this.readStructure(budget, {
       attempts: 'retry',
-      decode: (payload) => parseStructureResponse(payload, this.baseUrl),
+      decode: (payload) => parseStructureResponse(payload, this.baseUrl, version !== undefined),
       failureMessage: `Failed to fetch OECD datastructure for ${flowRef}`,
       url,
     });
@@ -577,7 +683,7 @@ export class OecdStructureService {
    * `version` pins the scheme to the revision the datastructure references, for
    * the reason {@link fetchCodelist} pins a codelist. Pass a
    * {@link ConceptRef.version}; anything else has not been through
-   * {@link SDMX_VERSION_SAFE} and this parameter becomes a URL path segment.
+   * {@link sdmxVersion} and this parameter becomes a URL path segment.
    */
   async fetchConceptScheme(
     budget: UpstreamBudget,
@@ -585,6 +691,7 @@ export class OecdStructureService {
     schemeId: string,
     serviceRoot: string = this.baseUrl,
     version?: string,
+    onMissingVersion: 'latest' | 'fail' = 'latest',
   ): Promise<Map<string, string>> {
     // Both IDs come from a datastructure URN, but validate as a safety net
     // before embedding in the URL path. One outside the SDMX character set is a
@@ -599,12 +706,14 @@ export class OecdStructureService {
     const label = `OECD concept scheme ${agencyId}/${schemeId}`;
 
     if (version !== undefined) {
-      const pinned = await this.readStructure(budget, {
+      const read = this.readStructure(budget, {
         attempts: 'retry',
         decode: parseConceptScheme,
         failureMessage: `Failed to fetch ${label} version ${version}`,
         url: `${url}/${version}`,
-      }).catch(swallowNotFound);
+      });
+      if (onMissingVersion === 'fail') return read;
+      const pinned = await read.catch(swallowNotFound);
       if (pinned !== undefined) return pinned;
     }
 
@@ -637,7 +746,8 @@ export class OecdStructureService {
    * Best-effort by design: OECD's datastructure response carries no name on a
    * dimension, so the names live one request away in the concept scheme. A
    * scheme that fails to fetch, or one that omits a concept, leaves the
-   * dimension on its id. A missing label is a tolerable gap; failing the whole
+   * dimension on its id. Failed reads also mark the dimensions they affect.
+   * A missing label is a tolerable gap; failing the whole
    * dataset-info call over one is not. A budget that runs out during the
    * scheme reads is one more way for a scheme to fail to arrive, so the
    * structure comes back on its ids. The caller's own abort is not a scheme
@@ -649,6 +759,7 @@ export class OecdStructureService {
     budget: UpstreamBudget,
     structure: OecdDataStructure,
     conceptRefs: ConceptRef[],
+    exactEdition: boolean,
   ): Promise<OecdDataStructure> {
     // Every dimension of a datastructure shares one scheme in practice; keying
     // by scheme collapses them to the single request that fact implies.
@@ -665,9 +776,10 @@ export class OecdStructureService {
                 ref.schemeId,
                 structure.serviceRoot,
                 ref.version,
+                exactEdition ? 'fail' : 'latest',
               ).catch((err: unknown) => {
                 if (budget.signal?.aborted) throw err;
-                return new Map<string, string>();
+                return null;
               }),
             ] as const,
         ),
@@ -675,14 +787,18 @@ export class OecdStructureService {
     );
 
     const names = new Map<string, string>();
+    const failedFor = new Set<string>();
     for (const ref of conceptRefs) {
-      const name = bySchemeKey.get(schemeKey(ref))?.get(ref.conceptId);
+      const scheme = bySchemeKey.get(schemeKey(ref));
+      if (scheme === null) failedFor.add(ref.dimensionId);
+      const name = scheme?.get(ref.conceptId);
       if (name) names.set(ref.dimensionId, name);
     }
-    if (names.size === 0) return structure;
+    if (names.size === 0 && failedFor.size === 0) return structure;
 
     return {
       ...structure,
+      ...(failedFor.size > 0 ? { conceptLookupFailedFor: [...failedFor] } : {}),
       dimensions: structure.dimensions.map((d) => ({ ...d, name: names.get(d.id) ?? d.name })),
       ...(structure.timeDimension
         ? {
@@ -715,8 +831,10 @@ export class OecdStructureService {
    * `DSD_TIVA_EXGRVA` references 1.7 (560). A version the root no longer serves
    * 404s, and that falls back to latest: an outdated list is a better answer
    * than none, and the fallback costs a request only on a reference gone stale.
+   * Explicitly selected editions pass `onMissingVersion: 'fail'` to avoid
+   * mixing a different codelist revision into the requested edition.
    * Pass an {@link OecdDimension.codelistVersion}; anything else has not been
-   * through {@link SDMX_VERSION_SAFE} and this parameter becomes a URL path
+   * through {@link sdmxVersion} and this parameter becomes a URL path
    * segment.
    */
   async fetchCodelist(
@@ -725,6 +843,7 @@ export class OecdStructureService {
     codelistId: string,
     serviceRoot: string = this.baseUrl,
     version?: string,
+    onMissingVersion: 'latest' | 'fail' = 'latest',
   ): Promise<OecdCode[]> {
     // Both IDs are derived from upstream DSD responses, but validate as a safety
     // net before embedding in the URL path. One outside the SDMX character set
@@ -739,12 +858,14 @@ export class OecdStructureService {
     const label = `OECD codelist ${agencyId}/${codelistId}`;
 
     if (version !== undefined) {
-      const pinned = await this.readStructure(budget, {
+      const read = this.readStructure(budget, {
         attempts: 'retry',
         decode: parseCodelist,
         failureMessage: `Failed to fetch ${label} version ${version}`,
         url: `${url}/${version}`,
-      }).catch(swallowNotFound);
+      });
+      if (onMissingVersion === 'fail') return read;
+      const pinned = await read.catch(swallowNotFound);
       if (pinned !== undefined) return pinned;
     }
 
@@ -768,422 +889,6 @@ export function getStructureService(): OecdStructureService {
 }
 
 // ── Parsers ──────────────────────────────────────────────────────────────────
-
-/**
- * Named character references that appear in OECD dataflow descriptions, plus the
- * partners of the ones that do (`lt`, `mdash`). Numeric references do not occur
- * in the catalog and are left alone.
- */
-const HTML_ENTITIES: Record<string, string> = {
-  amp: '&',
-  apos: "'",
-  bull: '•',
-  deg: '°',
-  eacute: 'é',
-  gt: '>',
-  laquo: '«',
-  ldquo: '“',
-  lsquo: '‘',
-  lt: '<',
-  mdash: '—',
-  nbsp: ' ',
-  ndash: '–',
-  ocirc: 'ô',
-  quot: '"',
-  raquo: '»',
-  rdquo: '”',
-  rsquo: '’',
-  uuml: 'ü',
-};
-
-/** Inline formatting tags whose removal should not insert a synthetic word break. */
-const INLINE_HTML_TAGS = new Set([
-  'a',
-  'abbr',
-  'b',
-  'cite',
-  'code',
-  'em',
-  'font',
-  'i',
-  'mark',
-  'small',
-  'span',
-  'strong',
-  'sub',
-  'sup',
-  'u',
-]);
-
-/** Elements whose contents are stripped along with their tags. */
-const IGNORED_BLOCK_TAGS = new Set(['head', 'script', 'style']);
-
-function isAsciiAlpha(code: number): boolean {
-  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
-}
-
-function isAsciiAlnum(code: number): boolean {
-  return isAsciiAlpha(code) || (code >= 48 && code <= 57);
-}
-
-function isAsciiSpace(code: number): boolean {
-  return code === 32 || code === 9 || code === 10 || code === 13 || code === 12;
-}
-
-/** Whether `<` at `ltIndex` opens a tag, closing tag, comment, doctype, or PI rather than literal `< 5`. */
-function isHtmlTagOpener(html: string, ltIndex: number): boolean {
-  if (ltIndex + 1 >= html.length) return false;
-  const next = html.charCodeAt(ltIndex + 1);
-  return isAsciiAlpha(next) || next === 47 || next === 33 || next === 63;
-}
-
-/** Decode the named HTML entities OECD descriptions use. */
-function decodeHtmlEntities(text: string): string {
-  return text.replace(
-    /&([a-zA-Z]+);/g,
-    (match, name: string) => HTML_ENTITIES[name.toLowerCase()] ?? match,
-  );
-}
-
-/** Collapse all runs of whitespace to single spaces and trim edges. */
-function collapseWhitespace(text: string): string {
-  return text.replace(/\s+/g, ' ').trim();
-}
-
-/** Read an ASCII tag name starting at `from`, lowercased, plus the index after it. */
-function readAsciiTagName(
-  html: string,
-  from: number,
-  limit: number,
-): { end: number; name: string } {
-  let i = from;
-  while (i < limit && isAsciiAlnum(html.charCodeAt(i))) i++;
-  return { end: i, name: html.slice(from, i).toLowerCase() };
-}
-
-/**
- * Scan forward from `from` for a matching closing block tag (`</head>`,
- * `</style>`, `</script>`), returning the index right after its `>` or `-1` if
- * unclosed. Single-pass linear scan.
- */
-function findClosingBlockTag(html: string, from: number, tagName: string): number {
-  const len = html.length;
-  let pos = from;
-  while (pos < len) {
-    const lt = html.indexOf('<', pos);
-    if (lt < 0 || lt + 2 + tagName.length >= len) return -1;
-    if (html.charCodeAt(lt + 1) === 47) {
-      let matches = true;
-      for (let k = 0; k < tagName.length; k++) {
-        const ch = html.charCodeAt(lt + 2 + k);
-        const lower = ch >= 65 && ch <= 90 ? ch + 32 : ch;
-        if (lower !== tagName.charCodeAt(k)) {
-          matches = false;
-          break;
-        }
-      }
-      if (matches) {
-        let j = lt + 2 + tagName.length;
-        while (j < len && isAsciiSpace(html.charCodeAt(j))) j++;
-        if (j < len && html.charCodeAt(j) === 62) return j + 1;
-      }
-    }
-    pos = lt + 1;
-  }
-  return -1;
-}
-
-/**
- * Extract the `href` attribute value from the attribute slice of an `<a ...>`
- * tag. Handles double-quoted, single-quoted, and unquoted values, whitespace
- * around `=`, attributes before `href`, and HTML entities inside `href`.
- */
-function extractAnchorHref(attrs: string): string | undefined {
-  const len = attrs.length;
-  let i = 0;
-  while (i < len) {
-    while (i < len && isAsciiSpace(attrs.charCodeAt(i))) i++;
-    if (i >= len || attrs.charCodeAt(i) === 47) break;
-
-    const nameStart = i;
-    while (i < len) {
-      const c = attrs.charCodeAt(i);
-      if (isAsciiSpace(c) || c === 61 || c === 47) break;
-      i++;
-    }
-    const name = attrs.slice(nameStart, i).toLowerCase();
-
-    while (i < len && isAsciiSpace(attrs.charCodeAt(i))) i++;
-    if (i >= len || attrs.charCodeAt(i) !== 61) continue;
-    i++; // '='
-    while (i < len && isAsciiSpace(attrs.charCodeAt(i))) i++;
-    if (i >= len) break;
-
-    let rawValue: string;
-    const quote = attrs.charCodeAt(i);
-    if (quote === 34 || quote === 39) {
-      const valueStart = i + 1;
-      const close = attrs.indexOf(quote === 34 ? '"' : "'", valueStart);
-      if (close < 0) {
-        rawValue = attrs.slice(valueStart);
-        i = len;
-      } else {
-        rawValue = attrs.slice(valueStart, close);
-        i = close + 1;
-      }
-    } else {
-      const valueStart = i;
-      while (i < len && !isAsciiSpace(attrs.charCodeAt(i))) i++;
-      rawValue = attrs.slice(valueStart, i);
-    }
-
-    if (name === 'href') return decodeHtmlEntities(rawValue).trim();
-  }
-  return;
-}
-
-/** Validate an `http:` or `https:` URL with no line breaks. */
-function isHttpUrl(url: string): boolean {
-  if (/[\r\n]/.test(url)) return false;
-  const protocol = URL.parse(url)?.protocol;
-  return protocol === 'http:' || protocol === 'https:';
-}
-
-/** Percent-encode characters that break CommonMark link destinations. */
-function encodeLinkUrlChars(value: string): string {
-  return value.replace(/[\s()<>]/g, (ch) => {
-    switch (ch) {
-      case '(':
-        return '%28';
-      case ')':
-        return '%29';
-      case '<':
-        return '%3C';
-      case '>':
-        return '%3E';
-      default:
-        return '%20';
-    }
-  });
-}
-
-/**
- * Normalize an anchor `href` into a CommonMark-safe `http:`, `https:`, or
- * `mailto:` destination, or `undefined` when empty or using another scheme.
- */
-function normalizeAnchorHref(rawHref: string | undefined): string | undefined {
-  if (!rawHref) return;
-  const trimmed = rawHref.trim();
-  if (!trimmed || /[\r\n]/.test(trimmed)) return;
-
-  if (/^mailto:/i.test(trimmed)) {
-    const recipient = trimmed.slice(7).trim();
-    if (!recipient || /\s/.test(recipient)) return;
-    return `mailto:${encodeLinkUrlChars(recipient)}`;
-  }
-
-  const encoded = encodeLinkUrlChars(trimmed);
-  return isHttpUrl(encoded) ? encoded : undefined;
-}
-
-/**
- * Find the `>` closing a tag whose name starts at `start`, where `lastGt` is
- * the input's last `>` and lies at or after `start`. A quote opens a quoted
- * attribute value only right after `=`, as in the HTML tokenizer; anywhere
- * else it is a literal character. A quoted value that runs past a `>` and then
- * a tag opener is read as a broken quote (OECD descriptions carry typographic
- * closing quotes, as in `href="…FDI”>Portal</a>`), so the tag ends at the
- * first `>` after the quote. Linear: each quoted value's scan stops at its
- * closing quote or that tag opener, and the tag consumes what it scanned.
- */
-function findTagClose(html: string, start: number, lastGt: number): number {
-  let at: 'name' | 'valueStart' | 'unquotedValue' = 'name';
-  for (let p = start; p < lastGt; p++) {
-    const ch = html.charCodeAt(p);
-    if (ch === 62) return p; // `>`
-    if (at === 'valueStart' && (ch === 34 || ch === 39)) {
-      const close = html.indexOf(ch === 34 ? '"' : "'", p + 1);
-      if (close < 0 || close > lastGt || crossesTagEnd(html, p + 1, close)) {
-        return html.indexOf('>', p + 1);
-      }
-      p = close;
-      at = 'name';
-    } else if (isAsciiSpace(ch)) {
-      if (at === 'unquotedValue') at = 'name';
-    } else if (at === 'valueStart') {
-      at = 'unquotedValue';
-    } else if (at === 'name' && ch === 61) {
-      at = 'valueStart'; // `=`
-    }
-  }
-  return lastGt;
-}
-
-/** Whether `[from, end)` holds a `>` followed by a tag opener (see {@link isHtmlTagOpener}). */
-function crossesTagEnd(html: string, from: number, end: number): boolean {
-  let gtSeen = false;
-  for (let k = from; k < end; k++) {
-    const ch = html.charCodeAt(k);
-    if (ch === 62) gtSeen = true;
-    else if (gtSeen && ch === 60 && isHtmlTagOpener(html, k)) return true;
-  }
-  return false;
-}
-
-/**
- * Index just past the end of the comment whose `<!--` starts at `lt`, or -1
- * when it never closes. As in the HTML tokenizer, `-->` may reuse the opener's
- * dashes (`<!-->`, `<!--->`), while `--!>` needs both dashes after the opener.
- */
-function commentEnd(html: string, lt: number): number {
-  for (let k = html.indexOf('--', lt + 2); k >= 0; k = html.indexOf('--', k + 1)) {
-    if (html.charCodeAt(k + 2) === 62) return k + 3;
-    if (k >= lt + 4 && html.startsWith('!>', k + 2)) return k + 4;
-  }
-  return -1;
-}
-
-/**
- * Single-pass linear-time HTML scanner powering both {@link stripHtml} and
- * {@link htmlToMarkdown}. Strips `<head>`, `<style>`, and `<script>` blocks
- * including their contents, preserves bare `<` comparisons (e.g. `< 3 months`),
- * decodes `HTML_ENTITIES` on text runs only so decoded `&lt;` can never form a
- * tag, and optionally turns valid `<a>` elements into Markdown `[label](url)`.
- */
-function scanHtml(html: string, preserveLinks: boolean): string {
-  const len = html.length;
-  const lastGt = html.lastIndexOf('>');
-  const out: string[] = [];
-  let anchor: { chunks: string[]; href: string | undefined } | null = null;
-  let i = 0;
-
-  const pushText = (raw: string) => {
-    if (!raw) return;
-    const decoded = decodeHtmlEntities(raw);
-    if (anchor) anchor.chunks.push(decoded);
-    else out.push(decoded);
-  };
-
-  const pushSpace = () => {
-    if (anchor) anchor.chunks.push(' ');
-    else out.push(' ');
-  };
-
-  const flushAnchorAsPlainText = () => {
-    if (!anchor) return;
-    for (const chunk of anchor.chunks) out.push(chunk);
-    anchor = null;
-  };
-
-  while (i < len) {
-    const lt = html.indexOf('<', i);
-    if (lt < 0) {
-      pushText(html.slice(i));
-      break;
-    }
-    if (lt > i) pushText(html.slice(i, lt));
-
-    // A bare `<` followed by a digit or space (e.g. "< 3 months", "<6 months") is text.
-    if (!isHtmlTagOpener(html, lt)) {
-      pushText('<');
-      i = lt + 1;
-      continue;
-    }
-
-    // No closing `>` anywhere past this point: emit remainder literally in O(1).
-    if (lt >= lastGt) {
-      pushText(html.slice(lt));
-      break;
-    }
-
-    const next = html.charCodeAt(lt + 1);
-    // Comments (an unclosed one runs to the end), doctypes, and processing instructions (`<!DOCTYPE`, `<?...`)
-    if (next === 33 || next === 63) {
-      pushSpace();
-      if (next === 33 && html.startsWith('<!--', lt)) {
-        const end = commentEnd(html, lt);
-        if (end < 0) break;
-        i = end;
-      } else {
-        i = html.indexOf('>', lt + 1) + 1;
-      }
-      continue;
-    }
-
-    const isClosing = next === 47;
-    const nameStart = isClosing ? lt + 2 : lt + 1;
-    const gt = findTagClose(html, nameStart, lastGt);
-    const { end: nameEnd, name: tagName } = readAsciiTagName(html, nameStart, gt);
-    const beforeSlash = gt - 2 >= nameEnd ? html.charCodeAt(gt - 2) : -1;
-    // Unquoted attribute values can end in `/` (e.g. `<a href=https://oecd.org/x/>`),
-    // so only a standalone `/` (after tag name, whitespace, or a closing quote) self-closes.
-    const selfClosing =
-      !isClosing &&
-      gt > nameEnd &&
-      html.charCodeAt(gt - 1) === 47 &&
-      (gt - 1 === nameEnd || isAsciiSpace(beforeSlash) || beforeSlash === 34 || beforeSlash === 39);
-
-    // Skip `<head>...</head>`, `<style>...</style>`, and `<script>...</script>` in full.
-    if (!isClosing && !selfClosing && IGNORED_BLOCK_TAGS.has(tagName)) {
-      const closeEnd = findClosingBlockTag(html, gt + 1, tagName);
-      pushSpace();
-      if (closeEnd < 0) break;
-      i = closeEnd;
-      continue;
-    }
-
-    if (preserveLinks && tagName === 'a') {
-      if (isClosing) {
-        if (anchor) {
-          const label = collapseWhitespace(anchor.chunks.join(''));
-          if (anchor.href !== undefined && label.length > 0) {
-            const escapedLabel = label.replace(/[\\[\]]/g, '\\$&');
-            if (out.at(-1)?.endsWith('!')) out.push(' ');
-            out.push(`[${escapedLabel}](${anchor.href})`);
-          } else if (label.length > 0) {
-            out.push(label);
-          }
-          anchor = null;
-        }
-      } else {
-        // An unclosed outer `<a>` or a malformed `<a/>` flushes any open anchor as plain text.
-        flushAnchorAsPlainText();
-        if (!selfClosing) {
-          const rawHref = extractAnchorHref(html.slice(nameEnd, gt));
-          anchor = { chunks: [], href: normalizeAnchorHref(rawHref) };
-        }
-      }
-      i = gt + 1;
-      continue;
-    }
-
-    if (!INLINE_HTML_TAGS.has(tagName)) {
-      pushSpace();
-    }
-    i = gt + 1;
-  }
-
-  flushAnchorAsPlainText();
-  return collapseWhitespace(out.join(''));
-}
-
-/**
- * Reduce an OECD description to plain text. Strips `<head>`, `<style>`, and
- * `<script>` blocks including their contents, strips remaining HTML tags, and
- * resolves the named entities OECD uses.
- */
-function stripHtml(html: string): string {
-  return scanHtml(html, false);
-}
-
-/**
- * Convert an OECD HTML dataflow description to Markdown-safe plain text in
- * linear time, stripping `<head>`, `<style>`, and `<script>` blocks and
- * preserving valid `http:`, `https:`, and `mailto:` anchors as `[label](url)`.
- */
-export function htmlToMarkdown(html: string): string {
-  return scanHtml(html, true);
-}
 
 /** Read an OECD localized string field, which is either a plain string or a `{lang: text}` map. */
 function localizedString(value: unknown): string | undefined {
@@ -1242,7 +947,7 @@ function conceptRefFromUrn(urn: unknown, dimensionId: string): ConceptRef | unde
     conceptId,
     dimensionId,
     schemeId,
-    version: safeVersion(tail.slice(paren + 1, close)),
+    version: sdmxVersion(tail.slice(paren + 1, close)),
   };
 }
 
@@ -1267,7 +972,7 @@ function codelistRefFromUrn(
   const codelistId = agencyCl.slice(colon + 1);
   if (!agencyId || !codelistId) return;
   const version =
-    paren >= 0 && close > paren ? safeVersion(rest.slice(paren + 1, close)) : undefined;
+    paren >= 0 && close > paren ? sdmxVersion(rest.slice(paren + 1, close)) : undefined;
   return { ref: `${agencyId},${codelistId}`, version };
 }
 
@@ -1294,9 +999,8 @@ function dsdIdFromStructureUrn(urn: string): string | undefined {
 }
 
 function parseDataflows(data: unknown): OecdDataflow[] {
-  const root = data as Record<string, unknown>;
-  const structures = root?.data as Record<string, unknown> | undefined;
-  const rawFlows = (structures?.dataflows ?? []) as Array<Record<string, unknown>>;
+  const structures = sdmxRecord(sdmxRecord(data, 'response').data, 'data');
+  const rawFlows = sdmxRecords(structures.dataflows, 'dataflows');
 
   return rawFlows.map((f): OecdDataflow => {
     const agencyId = String(f.agencyID ?? '');
@@ -1345,6 +1049,7 @@ interface DataflowMeta {
   description?: string | undefined;
   name?: string | undefined;
   resources?: OecdExternalResource[] | undefined;
+  version?: string;
 }
 
 /** Parse `EXT_RESOURCE` annotations (`label|url` or `label|url|icon_url`, `http:`/`https:` only). */
@@ -1368,27 +1073,27 @@ function parseExternalResources(annotations: unknown): OecdExternalResource[] | 
 }
 
 /** Extract `name`, full Markdown `description`, and `EXT_RESOURCE` links from `data.dataflows[0]`. */
-function parseDataflowMeta(data: unknown): DataflowMeta | undefined {
-  const root = data as Record<string, unknown>;
-  const structures = root?.data as Record<string, unknown> | undefined;
-  const rawFlows = structures?.dataflows;
-  if (!Array.isArray(rawFlows) || rawFlows.length === 0) return;
-  const flow = rawFlows[0];
-  if (!flow || typeof flow !== 'object') return;
-  const record = flow as Record<string, unknown>;
-
+function parseDataflowMeta(record: Record<string, unknown>): DataflowMeta | undefined {
   const name = nonEmptyLocalizedString(record.name, record.names);
 
   const rawDesc = nonEmptyLocalizedString(record.description, record.descriptions);
   const description = (rawDesc ? htmlToMarkdown(rawDesc) : '') || undefined;
 
   const resources = parseExternalResources(record.annotations);
+  const version = sdmxVersion(record.version);
 
-  if (name === undefined && description === undefined && resources === undefined) return;
+  if (
+    name === undefined &&
+    description === undefined &&
+    resources === undefined &&
+    version === undefined
+  )
+    return;
   return {
     ...(name !== undefined ? { name } : {}),
     ...(description !== undefined ? { description } : {}),
     ...(resources !== undefined ? { resources } : {}),
+    ...(version === undefined ? {} : { version }),
   };
 }
 
@@ -1406,7 +1111,14 @@ interface ParsedDataStructure {
    */
   structure: Omit<
     OecdDataStructure,
-    'agencyId' | 'dataRoot' | 'description' | 'flowRef' | 'name' | 'resources' | 'serviceRoot'
+    | 'agencyId'
+    | 'conceptLookupFailedFor'
+    | 'dataRoot'
+    | 'description'
+    | 'flowRef'
+    | 'name'
+    | 'resources'
+    | 'serviceRoot'
   >;
 }
 
@@ -1425,9 +1137,25 @@ type StructureResponse =
  * are read only from a response that carries no datastructure — the one case
  * that needs them.
  */
-function parseStructureResponse(data: unknown, baseUrl: string): StructureResponse {
-  const meta = parseDataflowMeta(data);
-  const parsed = parseDataStructure(data, meta);
+function parseStructureResponse(
+  data: unknown,
+  baseUrl: string,
+  exactEdition: boolean,
+): StructureResponse {
+  const structures = sdmxRecord(sdmxRecord(data, 'response').data, 'data');
+  const { dataflows, dataStructures } = structures;
+  if (dataflows === undefined && dataStructures === undefined) {
+    throw new TypeError('Expected SDMX dataflows or dataStructures');
+  }
+  const flow = dataflows === undefined ? undefined : sdmxRecords(dataflows, 'dataflows')[0];
+  const candidates =
+    dataStructures === undefined ? [] : sdmxRecords(dataStructures, 'dataStructures');
+  const dsd =
+    exactEdition && candidates.length > 0
+      ? referencedDataStructure(candidates, flow?.structure)
+      : candidates[0];
+  const meta = flow && parseDataflowMeta(flow);
+  const parsed = dsd && parseDataStructure(dsd, meta);
   if (parsed) return { kind: 'structure', parsed };
   const root = externalServiceRootOf(data, baseUrl);
   return root
@@ -1435,21 +1163,60 @@ function parseStructureResponse(data: unknown, baseUrl: string): StructureRespon
     : { kind: 'absent', ...(meta ? { meta } : {}) };
 }
 
-/** The first datastructure a response carries, or undefined for an empty `dataStructures`. */
-function parseDataStructure(data: unknown, meta?: DataflowMeta): ParsedDataStructure | undefined {
-  const root = data as Record<string, unknown>;
-  const structures = root?.data as Record<string, unknown> | undefined;
-  const rawDsds = (structures?.dataStructures ?? []) as Array<Record<string, unknown>>;
+/** Prefer the DSD named by the flow's URN. Sparse identity fields do not contradict it. */
+function referencedDataStructure(
+  candidates: Record<string, unknown>[],
+  urn: unknown,
+): Record<string, unknown> | undefined {
+  if (typeof urn !== 'string') return candidates[0];
+  const reference =
+    /^urn:sdmx:org\.sdmx\.infomodel\.datastructure\.DataStructure=([^:]+):([^(]+?)(?:\(([^)]+)\))?$/.exec(
+      urn,
+    );
+  if (!reference) return candidates[0];
+  const fields = [
+    ['agencyID', reference[1]],
+    ['id', reference[2]],
+    ['version', reference[3]],
+  ] as const;
+  let best: Record<string, unknown> | undefined;
+  let bestMatch = -1;
+  for (const candidate of candidates) {
+    if (
+      fields.some(
+        ([key, value]) =>
+          value !== undefined && candidate[key] !== undefined && candidate[key] !== value,
+      )
+    )
+      continue;
+    const matches = fields.filter(
+      ([key, value]) => value !== undefined && candidate[key] === value,
+    ).length;
+    if (matches > bestMatch) {
+      best = candidate;
+      bestMatch = matches;
+    }
+  }
+  if (best === undefined)
+    throw serializationError(
+      'OECD returned a different datastructure than the dataflow edition references',
+    );
+  return best;
+}
 
-  const dsd = rawDsds[0];
-  if (!dsd) return;
-
-  const components = dsd.dataStructureComponents as Record<string, unknown> | undefined;
-  const dimList = components?.dimensionList as Record<string, unknown> | undefined;
-
-  const rawDims = (dimList?.dimensions ?? []) as Array<Record<string, unknown>>;
+/** Decode the selected datastructure in a structure response. */
+function parseDataStructure(
+  dsd: Record<string, unknown>,
+  meta?: DataflowMeta,
+): ParsedDataStructure {
+  const components = sdmxRecord(dsd.dataStructureComponents, 'dataStructureComponents');
+  const dimList = sdmxRecord(components.dimensionList, 'dimensionList');
+  const rawDims = sdmxRecords(dimList.dimensions, 'dimensions');
   // API uses "timeDimensions" (plural, array) — not "timeDimension" (singular)
-  const rawTimeDims = (dimList?.timeDimensions ?? []) as Array<Record<string, unknown>>;
+  const rawTimeDims =
+    dimList.timeDimensions === undefined
+      ? []
+      : sdmxRecords(dimList.timeDimensions, 'timeDimensions');
   const rawTimeDim = rawTimeDims[0];
 
   const conceptRefs: ConceptRef[] = [];
@@ -1503,10 +1270,10 @@ function parseDataStructure(data: unknown, meta?: DataflowMeta): ParsedDataStruc
 
 /** Read a concept scheme into a `concept id → name` map. */
 function parseConceptScheme(data: unknown): Map<string, string> {
-  const root = data as Record<string, unknown>;
-  const structures = root?.data as Record<string, unknown> | undefined;
-  const rawSchemes = (structures?.conceptSchemes ?? []) as Array<Record<string, unknown>>;
-  const rawConcepts = (rawSchemes[0]?.concepts ?? []) as Array<Record<string, unknown>>;
+  const structures = sdmxRecord(sdmxRecord(data, 'response').data, 'data');
+  const [scheme] = sdmxRecords(structures.conceptSchemes, 'conceptSchemes');
+  const rawConcepts =
+    scheme?.concepts === undefined ? [] : sdmxRecords(scheme.concepts, 'concepts');
 
   const names = new Map<string, string>();
   for (const concept of rawConcepts) {
@@ -1519,10 +1286,10 @@ function parseConceptScheme(data: unknown): Map<string, string> {
 
 /** Read the OECD agency scheme into a `directorate code → name` map. */
 function parseAgencyScheme(data: unknown): Map<string, string> {
-  const root = data as Record<string, unknown>;
-  const structures = root?.data as Record<string, unknown> | undefined;
-  const rawSchemes = (structures?.agencySchemes ?? []) as Array<Record<string, unknown>>;
-  const rawAgencies = (rawSchemes[0]?.agencies ?? []) as Array<Record<string, unknown>>;
+  const structures = sdmxRecord(sdmxRecord(data, 'response').data, 'data');
+  const [scheme] = sdmxRecords(structures.agencySchemes, 'agencySchemes');
+  const rawAgencies =
+    scheme?.agencies === undefined ? [] : sdmxRecords(scheme.agencies, 'agencies');
 
   const names = new Map<string, string>();
   for (const agency of rawAgencies) {
@@ -1534,13 +1301,11 @@ function parseAgencyScheme(data: unknown): Map<string, string> {
 }
 
 function parseCodelist(data: unknown): OecdCode[] {
-  const root = data as Record<string, unknown>;
-  const structures = root?.data as Record<string, unknown> | undefined;
-  const rawCls = (structures?.codelists ?? []) as Array<Record<string, unknown>>;
-  const cl = rawCls[0];
+  const structures = sdmxRecord(sdmxRecord(data, 'response').data, 'data');
+  const [cl] = sdmxRecords(structures.codelists, 'codelists');
   if (!cl) return [];
 
-  const rawCodes = (cl.codes ?? []) as Array<Record<string, unknown>>;
+  const rawCodes = cl.codes === undefined ? [] : sdmxRecords(cl.codes, 'codes');
   return rawCodes.map((c): OecdCode => {
     const parent = typeof c.parent === 'string' && c.parent.length > 0 ? c.parent : undefined;
     return {

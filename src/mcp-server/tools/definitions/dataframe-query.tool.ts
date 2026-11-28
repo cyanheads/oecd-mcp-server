@@ -15,7 +15,7 @@ import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
 import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getCanvas } from '@/services/canvas-accessor/canvas-accessor.js';
 import { applyCountLimit, type CountLimit, capOf, countLimitSchema } from '@/utils/count-limit.js';
-import { formatTable } from '@/utils/format-table.js';
+import { formatRecordTable } from '@/utils/format-table.js';
 
 /** Most rows one call returns, whatever `limit` asks for. */
 const MAX_ROWS_PER_CALL = 1000;
@@ -56,12 +56,6 @@ function relayedEngineMessage(message: string): string {
   const end =
     last >= 0xd800 && last <= 0xdbff ? ENGINE_MESSAGE_MAX_CHARS - 1 : ENGINE_MESSAGE_MAX_CHARS;
   return `${message.slice(0, end)}… [cut at ${ENGINE_MESSAGE_MAX_CHARS} characters]`;
-}
-
-/** A cell as the table shows it: nested values as JSON, null as empty. */
-function cellText(value: unknown): string {
-  if (value === null || value === undefined) return '';
-  return typeof value === 'object' ? JSON.stringify(value) : String(value);
 }
 
 export const oecdDataframeQuery = tool('oecd_dataframe_query', {
@@ -302,10 +296,7 @@ export const oecdDataframeQuery = tool('oecd_dataframe_query', {
     lines.push(
       '',
       result.rows.length > 0
-        ? formatTable(
-            cols,
-            result.rows.map((r) => cols.map((c) => cellText(r[c]))),
-          )
+        ? formatRecordTable(cols, result.rows)
         : `Columns: ${cols.map(escapeMarkdownInline).join(', ')}`,
     );
     return [{ type: 'text', text: lines.join('\n') }];

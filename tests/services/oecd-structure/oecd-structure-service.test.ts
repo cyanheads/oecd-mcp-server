@@ -10,11 +10,11 @@ import { getServerConfig } from '@/config/server-config.js';
 import { OecdDataService } from '@/services/oecd-data/oecd-data-service.js';
 import { upstreamRefusal } from '@/services/oecd-http/oecd-http.js';
 import { isBudgetExpiry, UpstreamBudget } from '@/services/oecd-http/upstream-budget.js';
+import { htmlToMarkdown } from '@/services/oecd-structure/dataflow-description.js';
 import {
   directorateCode,
   fetchExternalServiceRoot,
   getStructureService,
-  htmlToMarkdown,
   initStructureService,
   isDataflowNotFound,
   OecdStructureService,
@@ -268,7 +268,7 @@ describe('OecdStructureService.fetchDataflows', () => {
 
     // HTML tags become whitespace and named entities are decoded.
     expect(flows[0]?.description).toBe(
-      'Quarterly national accounts. See the OECD methodology & notes – updated 2026.',
+      'Quarterly national accounts.\n\nSee the OECD methodology & notes – updated 2026.',
     );
     // Localized-map form is read the same way as the plain-string form.
     expect(flows[1]?.description).toBe('Employment indicators by region.');
@@ -1189,6 +1189,102 @@ describe('OecdStructureService.fetchDataStructure — delegated service roots', 
     expect(dsd.dataRoot).toBe('https://fake.oecd.test/sti-public/rest');
   });
 
+  it('resolves an older edition on the owning root when the public root does not list it', async () => {
+    const exactPublic = EXT_DATAFLOW_URL.replace('?', '/1.0?');
+    const exactDelegated = DELEGATED_REFERENCE_URL.replace('?', '/1.0?');
+    http.route(
+      { match: exactPublic, respond: noResultsFound },
+      { match: EXT_DATAFLOW_URL, respond: () => Response.json(delegatingDataflow(DELEGATED_HREF)) },
+      {
+        match: exactDelegated,
+        respond: () =>
+          Response.json({
+            data: {
+              ...NAMELESS_DSD_RESPONSE.data,
+              dataflows: [
+                { agencyID: 'OECD.STI.PIE', id: 'DSD_TIVA_MAINLV@DF_MAINLV', version: '1.0' },
+              ],
+            },
+          }),
+      },
+      { match: DELEGATED_SCHEME_URL, respond: () => Response.json(CONCEPT_SCHEME_RESPONSE) },
+    );
+
+    const svc = new OecdStructureService('https://fake.oecd.test');
+    const dsd = await svc.fetchDataStructure(budget(), EXT_FLOW_REF, '1.0');
+    expect(dsd).toMatchObject({
+      version: '1.0',
+      dataRoot: 'https://fake.oecd.test/sti-public/rest',
+    });
+    expect(http.calls.map((c) => c.request.url)).toEqual([
+      exactPublic,
+      EXT_DATAFLOW_URL,
+      exactDelegated,
+      DELEGATED_SCHEME_URL,
+    ]);
+  });
+
+  it('rejects a DSD revision that contradicts the exact edition’s structure reference', async () => {
+    const dsd = NAMELESS_DSD_RESPONSE.data.dataStructures[0]!;
+    const flow = {
+      agencyID: 'OECD.STI.PIE',
+      id: 'DSD_TIVA_MAINLV@DF_MAINLV',
+      version: '1.1',
+      structure:
+        'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=OECD.SDD.NAD:DSD_NAMAIN1(2.9)',
+    };
+    http.route(
+      {
+        match: EXT_DATAFLOW_URL.replace('?', '/1.1?'),
+        respond: () =>
+          Response.json({
+            data: {
+              dataflows: [flow],
+              dataStructures: [{ ...dsd, agencyID: 'OECD.SDD.NAD', version: '1.0' }],
+            },
+          }),
+      },
+      { match: SCHEME_URL, respond: () => Response.json(CONCEPT_SCHEME_RESPONSE) },
+    );
+    const error = await new OecdStructureService('https://fake.oecd.test')
+      .fetchDataStructure(budget(), EXT_FLOW_REF, '1.1')
+      .catch((err: unknown) => err);
+    expect(upstreamRefusal(error)).toMatchObject({ reason: 'upstream_unreadable' });
+    expect(http.calls).toHaveLength(1);
+  });
+
+  it('selects the referenced DSD away from the first entry, independently of the flow edition', async () => {
+    const dsd = NAMELESS_DSD_RESPONSE.data.dataStructures[0]!;
+    const flow = {
+      version: '1.1',
+      structure:
+        'urn:sdmx:org.sdmx.infomodel.datastructure.DataStructure=OECD.SDD.NAD:DSD_NAMAIN1(2.9)',
+    };
+    http.route(
+      {
+        match: EXT_DATAFLOW_URL.replace('?', '/1.1?'),
+        respond: () =>
+          Response.json({
+            data: {
+              dataflows: [flow],
+              dataStructures: [
+                { ...dsd, id: 'DSD_WRONG', agencyID: 'OECD.SDD.NAD', version: '2.9' },
+                { ...dsd, agencyID: 'OTHER.AGENCY', version: '2.9' },
+                { ...dsd, agencyID: 'OECD.SDD.NAD', version: '2.9' },
+              ],
+            },
+          }),
+      },
+      { match: SCHEME_URL, respond: () => Response.json(CONCEPT_SCHEME_RESPONSE) },
+    );
+    const structure = await new OecdStructureService('https://fake.oecd.test').fetchDataStructure(
+      budget(),
+      EXT_FLOW_REF,
+      '1.1',
+    );
+    expect(structure).toMatchObject({ version: '1.1', dsdId: 'DSD_NAMAIN1' });
+  });
+
   it('reads dimension names from the delegating root, not the configured one', async () => {
     routeDelegation(DELEGATED_HREF);
     http.route(
@@ -1304,7 +1400,10 @@ describe('OecdStructureService.fetchDataStructure — delegated service roots', 
       root: 'answers 404 there',
       reference: () => new Response('Could not find requested structures', { status: 404 }),
     },
-    { root: 'carries no datastructure there', reference: () => Response.json({ data: {} }) },
+    {
+      root: 'carries no datastructure there',
+      reference: () => Response.json({ data: { dataStructures: [] } }),
+    },
   ])(
     'falls back to the datastructure route on the delegating root when the dataflow’s reference $root',
     async ({ reference }) => {
@@ -1334,7 +1433,10 @@ describe('OecdStructureService.fetchDataStructure — delegated service roots', 
   it('reports not-found when neither route on the delegating root carries the datastructure', async () => {
     routeDelegation(DELEGATED_HREF);
     http.route(
-      { match: DELEGATED_REFERENCE_URL, respond: () => Response.json({ data: {} }) },
+      {
+        match: DELEGATED_REFERENCE_URL,
+        respond: () => Response.json({ data: { dataStructures: [] } }),
+      },
       {
         match: DELEGATED_DIRECT_URL,
         respond: () => new Response('Could not find requested structures', { status: 404 }),
@@ -2897,7 +2999,7 @@ describe('htmlToMarkdown', () => {
       htmlToMarkdown(
         '<a href=https://oecd.org/it\'s>L</a> don\'t <td width=5">cell</td> <p data-x\'y=1>text</p> x</b "y>z" w',
       ),
-    ).toBe("[L](https://oecd.org/it's) don't cell text xz\" w");
+    ).toBe("[L](https://oecd.org/it's) don't cell\n\ntext\n\nxz\" w");
   });
 
   it('closes comments at `-->`, `--!>`, and the abrupt `<!-->` and `<!--->` forms', () => {
@@ -3291,9 +3393,9 @@ describe('OecdStructureService.fetchDataStructure — dataflow metadata', () => 
   });
 });
 
-// ── fetchDimensionCount (#54) ─────────────────────────────────────────────────
+// ── Observation query structure ───────────────────────────────────────────
 
-describe('OecdStructureService.fetchDimensionCount', () => {
+describe('OecdStructureService.fetchQueryStructure', () => {
   const http = createFetchMock();
 
   beforeEach(() => {
@@ -3358,8 +3460,8 @@ describe('OecdStructureService.fetchDimensionCount', () => {
     );
 
     const svc = new OecdStructureService(BASE);
-    const coldCount = await svc.fetchDimensionCount(budget(), FLOW_REF);
-    const warmCount = await svc.fetchDimensionCount(budget(), FLOW_REF);
+    const { dimensionCount: coldCount } = await svc.fetchQueryStructure(budget(), FLOW_REF);
+    const { dimensionCount: warmCount } = await svc.fetchQueryStructure(budget(), FLOW_REF);
 
     expect(coldCount).toBe(3);
     expect(warmCount).toBe(3);
@@ -3396,10 +3498,10 @@ describe('OecdStructureService.fetchDimensionCount', () => {
 
     const svc = new OecdStructureService(BASE);
     const missingErr = await svc
-      .fetchDimensionCount(budget(), 'OECD.SDD.NAD,DSD_NONE@DF_NONE')
+      .fetchQueryStructure(budget(), 'OECD.SDD.NAD,DSD_NONE@DF_NONE')
       .catch((e: Error) => e);
     const zeroErr = await svc
-      .fetchDimensionCount(budget(), 'OECD.SDD.NAD,DSD_ZERO@DF_ZERO')
+      .fetchQueryStructure(budget(), 'OECD.SDD.NAD,DSD_ZERO@DF_ZERO')
       .catch((e: Error) => e);
 
     expect(isDataflowNotFound(missingErr as Error)).toBe(true);
@@ -3410,7 +3512,7 @@ describe('OecdStructureService.fetchDimensionCount', () => {
     http.route({ match: () => true, respond: () => Response.json(DSD_WITH_CONCEPTS) });
     const svc = new OecdStructureService(BASE);
 
-    await expect(svc.fetchDimensionCount(budget(), 'BAD_REF')).rejects.toThrow(/Invalid flow_ref/);
+    await expect(svc.fetchQueryStructure(budget(), 'BAD_REF')).rejects.toThrow(/Invalid flow_ref/);
     expect(http.calls).toHaveLength(0);
   });
 });

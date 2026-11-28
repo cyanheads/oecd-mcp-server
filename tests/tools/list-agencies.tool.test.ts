@@ -257,6 +257,7 @@ describe('oecdListAgencies directorates', () => {
     const estat = result.agencies.find((a) => a.agency_id === 'ESTAT');
     expect(estat).toEqual({ agency_id: 'ESTAT', dataflow_count: 1 });
     expect(estat).not.toHaveProperty('directorate');
+    expect(result).not.toHaveProperty('directorate_lookup_failed_for');
   });
 
   it('still returns the agency list when the agency scheme is unreachable', async () => {
@@ -271,6 +272,12 @@ describe('oecdListAgencies directorates', () => {
 
     expect(result.total_agencies).toBe(3);
     expect(result.agencies.every((a) => a.directorate === undefined)).toBe(true);
+    expect(result).toMatchObject({
+      directorate_lookup_failed_for: ['OECD.SDD.NAD', 'OECD.EDU.IMEP'],
+    });
+    expect(oecdListAgencies.format!(result)[0]).toMatchObject({
+      text: expect.stringContaining('Directorate lookup failed for OECD.SDD.NAD, OECD.EDU.IMEP.'),
+    });
   });
 });
 
@@ -311,6 +318,28 @@ describe('oecdListAgencies upstream failure wiring', () => {
     const installed = fake;
     fake = undefined;
     installed?.restore();
+  });
+
+  it('keeps a genuine empty catalog as a successful zero count', async () => {
+    serve(json({ data: { dataflows: [] } }));
+    const result = await oecdListAgencies.handler(
+      {},
+      createMockContext({ errors: oecdListAgencies.errors }),
+    );
+    expect(result).toEqual({ agencies: [], total_agencies: 0, total_dataflows: 0, source: 'OECD' });
+  });
+
+  it('reports a missing catalog envelope as unreadable without retrying', async () => {
+    const http = serve(json({}));
+    const hint = declaredRecovery(oecdListAgencies, 'upstream_unreadable');
+    const { error, text } = await toolWireFailure(oecdListAgencies, {});
+    expect(http.requestsTo('/dataflow')).toHaveLength(1);
+    expect(error.data).toMatchObject({
+      reason: 'upstream_unreadable',
+      retryable: false,
+      recovery: { hint },
+    });
+    expect(text).toContain(hint);
   });
 
   it('names a catalog body that is not JSON upstream_unreadable, after one request', async () => {

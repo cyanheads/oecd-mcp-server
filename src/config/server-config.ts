@@ -25,7 +25,7 @@ const ServerConfigSchema = z.object({
     .stringbool()
     .default(true)
     .describe(
-      'Serve a count input (limit) above its per-call cap at the cap, with a notice; false rejects it and advertises the cap as its maximum',
+      'Serve limit and last_n_observations at their caps with a notice; false advertises the caps as maxima and rejects larger values',
     ),
 });
 

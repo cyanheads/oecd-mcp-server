@@ -372,6 +372,7 @@ describe('retryableUpstreamFailure', () => {
     expect(restated).not.toBe(throttled);
     expect(restated.code).toBe(JsonRpcErrorCode.RateLimited);
     expect(restated.data?.retryAfter).toBeUndefined();
+    expect(restated.data?.receivedRetryAfter).toBe('0');
     expect(restated.data?.status).toBe(429);
     expect(restated.cause).toBe(throttled);
   });

@@ -52,7 +52,7 @@ it.each([
 ])('$name', async ({ envFile, overrides, drop, reason }) => {
   const cwd = await mkdtemp(join(tmpdir(), 'oecd-startup-test-'));
   await writeFile(join(cwd, '.env'), envFile);
-  const child = spawn(process.execPath, [entry], {
+  const child = spawn('node', [entry], {
     cwd,
     env: {
       PATH: process.env.PATH,

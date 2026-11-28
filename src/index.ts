@@ -5,21 +5,17 @@
  */
 
 import { createApp } from '@cyanheads/mcp-ts-core';
-import { normalizeEnv, parseConfig, resetConfig } from '@cyanheads/mcp-ts-core/config';
+import { normalizeEnv } from '@cyanheads/mcp-ts-core/config';
 import { getServerConfig } from './config/server-config.js';
 import { allPromptDefinitions } from './mcp-server/prompts/index.js';
 import { allResourceDefinitions } from './mcp-server/resources/index.js';
+import { allToolDefinitions } from './mcp-server/tools/index.js';
 import { setCanvas } from './services/canvas-accessor/canvas-accessor.js';
 import { initDataService } from './services/oecd-data/oecd-data-service.js';
 import { initStructureService } from './services/oecd-structure/oecd-structure-service.js';
 
-parseConfig();
 // DataCanvas defaults on; set CANVAS_PROVIDER_TYPE=none to disable it.
 process.env.CANVAS_PROVIDER_TYPE = normalizeEnv(process.env).CANVAS_PROVIDER_TYPE ?? 'duckdb';
-resetConfig();
-
-// Tool registration reads server settings, so load .env before evaluating the definitions.
-const { allToolDefinitions } = await import('./mcp-server/tools/index.js');
 
 await createApp({
   name: 'oecd-mcp-server',
@@ -39,7 +35,7 @@ await createApp({
   instructions:
     'OECD Statistics MCP server — keyless access to 1,500+ OECD dataflows via SDMX 2.1.\n' +
     'Workflow: oecd_list_agencies → oecd_search_datasets → oecd_get_dataset_info ' +
-    '→ oecd_get_dimension_values (available_only lists only the codes with data) → oecd_query_dataset.\n' +
+    '→ oecd_get_dimension_values (use available_only for codes with data, or pass period bounds for a historical window) → oecd_query_dataset.\n' +
     'Each coded component carries <ID>_code beside its label; components that hold one value across a result arrive once in constant_columns.\n' +
     'Large results (multi-country time-series) spill to DataCanvas; ' +
     'use oecd_dataframe_describe + oecd_dataframe_query for SQL analytics.\n' +
