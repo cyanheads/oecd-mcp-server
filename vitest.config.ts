@@ -17,9 +17,6 @@ export default mergeConfig(
   defineConfig({
     resolve: { alias },
     test: {
-      // Vitest 5.1.1's forks pool calls child.channel.unref(), which Bun lacks;
-      // use threads under Bun while keeping Node's default fork isolation.
-      ...(typeof Bun !== 'undefined' ? { pool: 'threads' } : {}),
       projects: [
         {
           extends: true,
