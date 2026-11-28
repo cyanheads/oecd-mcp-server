@@ -2,6 +2,10 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [0.8.1](changelog/0.8.x/0.8.1.md) — 2026-11-28
+
+Select a published OECD dataflow edition and check which dimension codes have data in the period you plan to query.
+
 ## [0.8.0](changelog/0.8.x/0.8.0.md) — 2026-11-25 · ⚠️ Breaking
 
 oecd_query_dataset gains last_n_observations, drops content_table_capped and content_table_rows, and caps a spilled preview at 25 rows; oecd_get_dimension_values returns code parents; oecd_get_dataset_info returns the dataflow description; oecd_search_datasets lists without a query; over-long keys fail up front.
